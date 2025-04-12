@@ -36,7 +36,7 @@ from transformers.image_utils import (
 import gc # For garbage collection
 
 # Import utilities from the parent utils directory
-from utils.data_utils import load_image, find_image_token_spans
+from utils.data_utils import load_image, find_image_token_spans, get_image_token_spans, get_token_masks
 from utils.visual_utils import visualize_token_probabilities
 
 
@@ -433,7 +433,8 @@ class LLaVANextLogitLensAnalyzer:
             print(f"  Inputs processed by processor. Input IDs shape: {input_ids.shape}")
 
             # Find image tokens and create mapping
-            image_spans, image_mask = find_image_token_spans(input_ids, self.image_token_id) # Use util
+            image_spans = get_image_token_spans(input_ids, self.image_token_id)
+            _, image_mask = get_token_masks(input_ids, self.image_token_id)
             feature_mapping = self.create_feature_mapping(image_spans, original_size_hw)
             if not feature_mapping: raise ValueError("Failed to create feature mapping.")
 

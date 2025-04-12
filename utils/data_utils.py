@@ -289,3 +289,96 @@ def find_image_token_spans(input_ids: torch.Tensor, image_token_id: int) -> List
         print("Warning: Found image tokens, but could not form valid contiguous spans.")
 
     return spans
+
+
+def get_token_masks(
+    input_ids: torch.Tensor,
+    image_token_id: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Generates boolean masks identifying text and image tokens in the input sequence.
+    """
+    # --- Input Validation ---
+    if input_ids.dim() != 2 or input_ids.shape[0] != 1:
+        raise ValueError(f"Expected input_ids tensor with shape [1, sequence_length], but got {input_ids.shape}")
+
+    input_ids_1d = input_ids[0] # Flatten to 1D
+
+    # --- Calculate Masks ---
+    image_mask = (input_ids_1d == image_token_id)
+    text_mask = ~image_mask
+
+    # --- Count Tokens ---
+    # num_text = text_mask.sum().item()
+    # num_image = image_mask.sum().item()
+    # print(f"Mask generation: Found {num_text} text and {num_image} image tokens using ID {image_token_id}.")
+
+    return text_mask, image_mask
+
+def get_token_indices(
+    input_ids: torch.Tensor,
+    image_token_id: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Gets the 1D tensors containing the indices of text and image tokens.
+    """
+    text_mask, image_mask = get_token_masks(input_ids, image_token_id)
+
+    # --- Calculate Indices from Masks ---
+    text_indices = torch.where(text_mask)[0]
+    image_indices = torch.where(image_mask)[0]
+
+    print(f"Indices generation: Found {len(text_indices)} text tokens and {len(image_indices)} image tokens using ID {image_token_id}.")
+
+    return text_indices, image_indices
+
+def get_image_token_spans(
+    input_ids: torch.Tensor,
+    image_token_id: int
+) -> List[Tuple[int, int]]:
+    """
+    Finds contiguous spans (start and end indices) of image tokens.
+    """
+    # --- Get the image mask first ---
+    _, image_mask = get_token_masks(input_ids, image_token_id)
+    device = input_ids.device # Get device from original tensor
+
+    num_image_tokens = image_mask.sum().item()
+    if num_image_tokens == 0:
+        return []
+
+    print(f"Span generation: Found {num_image_tokens} image tokens. Identifying spans...")
+
+    # --- Calculate Spans from the image_mask ---
+    spans = []
+    padded_mask = torch.cat([
+        torch.tensor([False], device=device),
+        image_mask,
+        torch.tensor([False], device=device)
+    ])
+
+    # Find indices where the mask value changes
+    diff = padded_mask[1:].int() - padded_mask[:-1].int()
+    change_indices = torch.where(diff != 0)[0]
+
+    # Iterate through change indices in pairs
+    for i in range(0, len(change_indices), 2):
+        if i + 1 < len(change_indices):
+            start_idx = change_indices[i].item()      # Position of False->True transition
+            end_idx = change_indices[i+1].item() - 1 # Position *before* True->False transition
+
+            # Sanity check for valid transitions and span length
+            if diff[start_idx] == 1 and (end_idx + 1 >= len(diff) or diff[end_idx + 1] == -1): # Adjusted boundary check for diff
+                span_len = end_idx - start_idx + 1
+                if span_len > 0:
+                    spans.append((start_idx, end_idx))
+                    print(f"  Detected image token span: Indices {start_idx} to {end_idx} (Length: {span_len})")
+                # else: # Warning for zero-length span already handled if needed
+                #     print(f"  Warning: Detected zero-length span at index {start_idx}. Ignoring.")
+            else:
+                print(f"  Warning: Unexpected transition pattern detected near index {start_idx} for spans. Check input_ids.")
+
+    if num_image_tokens > 0 and not spans:
+        print("Warning: Found image tokens, but could not form valid contiguous spans based on transitions.")
+
+    return spans

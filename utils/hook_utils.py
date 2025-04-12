@@ -305,7 +305,7 @@ class GradientAttentionCapture:
         """
         self.clear() # Clear previous state
         self._hooked_layers = set(layer_names)
-        print(f"Registering gradient capture hooks for {len(layer_names)} layers...")
+        # print(f"Registering gradient capture hooks for {len(layer_names)} layers...")
 
         hook_count = 0
         for name in layer_names:
@@ -322,7 +322,7 @@ class GradientAttentionCapture:
             else:
                 print(f"Warning: Module '{name}' not found or is not an nn.Module. Cannot register hooks.")
 
-        print(f"Registered {hook_count * 2} hooks ({hook_count} forward, {hook_count} backward).")
+        # print(f"Registered {hook_count * 2} hooks ({hook_count} forward, {hook_count} backward).")
         if hook_count != len(layer_names):
              print(f"Warning: Expected to register hooks for {len(layer_names)} layers, but only did for {hook_count}.")
         return self
@@ -341,13 +341,13 @@ class GradientAttentionCapture:
             Dict[str, torch.Tensor]: Dictionary mapping layer names to saliency score tensors.
                                     Tensors are on CPU if `cpu_offload` is True.
         """
-        print("Computing saliency scores (|Attention * Gradient|)...")
+        # print("Computing saliency scores (|Attention * Gradient|)...")
         self.saliency_scores = {} # Clear previous scores
         processed_layers = set()
 
         # Iterate through layers for which gradients were captured
         captured_grad_layers = list(self.attention_grads.keys()) # Iterate over copy of keys
-        print(f"Found gradients for {len(captured_grad_layers)} layers.")
+        # print(f"Found gradients for {len(captured_grad_layers)} layers.")
 
         for layer_name in captured_grad_layers:
             if layer_name in self.attention_weights:
@@ -388,7 +388,7 @@ class GradientAttentionCapture:
                 print(f"Warning: Gradient found for layer '{layer_name}', but no corresponding attention weights were captured. Cannot compute saliency.")
 
 
-        print(f"Computed saliency scores for {len(self.saliency_scores)} layers.")
+        #print(f"Computed saliency scores for {len(self.saliency_scores)} layers.")
 
         # Final cleanup of any remaining weights/grads (should be empty if loop worked)
         self.attention_weights.clear()
@@ -404,7 +404,7 @@ class GradientAttentionCapture:
         """Removes all registered forward, backward, and tensor hooks."""
         if not self._forward_hooks and not self._backward_hooks and not self._tensor_grad_hooks:
              return
-        print(f"Removing gradient capture hooks ({len(self._forward_hooks)} Fwd, {len(self._backward_hooks)} Bwd, {len(self._tensor_grad_hooks)} Tensor)...")
+        # print(f"Removing gradient capture hooks ({len(self._forward_hooks)} Fwd, {len(self._backward_hooks)} Bwd, {len(self._tensor_grad_hooks)} Tensor)...")
         for handle in self._forward_hooks: handle.remove()
         for handle in self._backward_hooks: handle.remove()
         for handle in self._tensor_grad_hooks.values(): handle.remove() # Remove tensor hooks too!
@@ -413,19 +413,19 @@ class GradientAttentionCapture:
         self._backward_hooks = []
         self._tensor_grad_hooks = {}
         self._hooked_layers = set()
-        print("Gradient capture hooks removed.")
+        # print("Gradient capture hooks removed.")
 
 
     def clear_cache(self):
         """Clears stored attention weights, gradients, and computed saliency scores."""
-        print("Clearing gradient capture cache (weights, grads, saliency)...")
+        #print("Clearing gradient capture cache (weights, grads, saliency)...")
         self.attention_weights = {}
         self.attention_grads = {}
         self.saliency_scores = {}
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        print("Gradient capture cache cleared.")
+        #print("Gradient capture cache cleared.")
 
     def clear(self):
         """Clears hooks and all cached data."""

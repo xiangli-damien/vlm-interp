@@ -14,12 +14,14 @@ from analyzer.saliency_analyzer import (
     analyze_layerwise_saliency_flow,
     compute_flow_metrics_optimized
 )
+from analyzer.stepwise_logit_lens_workflow import run_stepwise_logit_lens_workflow
 
 # Workflow Functions
 from analyzer.workflows import (
     run_logit_lens_workflow,
     run_saliency_workflow
 )
+
 
 # Placeholder for the token-by-token logit lens analyzer (as per user request)
 # from .token_by_token_logit_lens import LLaVANextTokenLogitLensAnalyzer
@@ -33,5 +35,6 @@ __all__ = [
     # Workflows
     "run_logit_lens_workflow",
     "run_saliency_workflow",
+    "run_stepwise_logit_lens_workflow",
     # "LLaVANextTokenLogitLensAnalyzer", # Uncomment when implemented
 ]
