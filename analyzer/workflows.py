@@ -186,7 +186,7 @@ def run_logit_lens_workflow(
 # --- Workflow 2: Saliency Analysis ---
 
 def run_saliency_workflow(
-    model: torch.nn.Module, # Expects model with grads enabled
+    model: torch.nn.Module,
     processor: Any,
     image_source: Union[str, Image.Image],
     prompt_text: str,
@@ -254,7 +254,8 @@ def run_saliency_workflow(
                 logits = outputs_pred.logits[:, -1, :]; next_token_id = torch.argmax(logits, dim=-1)
                 log_probs = torch.log_softmax(logits.float(), dim=-1); loss_val = -log_probs[0, next_token_id].item()
                 del outputs_pred, logits, log_probs; gc.collect(); torch.cuda.empty_cache()
-            model.train(); grad_capture = GradientAttentionCapture(cpu_offload=True)
+            # model.train(); 
+            grad_capture = GradientAttentionCapture(cpu_offload=True)
             num_layers = len(all_attn_layer_names)
             for batch_start in range(0, num_layers, layer_batch_size):
                 batch_end = min(batch_start + layer_batch_size, num_layers); current_layer_batch_names = all_attn_layer_names[batch_start:batch_end]
