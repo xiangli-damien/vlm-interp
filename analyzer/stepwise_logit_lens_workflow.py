@@ -185,11 +185,45 @@ def run_stepwise_logit_lens_workflow(
                     step_results_this_token["token_probabilities_summary"] = {
                         k: f"Data shape: {type(v)}" for k, v in token_probs.items() # Basic summary
                     } if token_probs else "None"
+                    
+                    # Add debugging information about token probabilities and positions
+                    if token_probs:
+                        layer_indices = sorted(token_probs.keys())
+                        print(f"  Token probabilities extracted for layers: {layer_indices}")
+                        
+                        # Check the last layer as representative
+                        if layer_indices:
+                            last_layer = max(layer_indices)
+                            print(f"  Checking token coverage in last layer ({last_layer}):")
+                            
+                            # Check base feature positions
+                            base_feature = token_probs[last_layer].get("base_feature", {})
+                            if base_feature:
+                                positions = base_feature.get("positions", {})
+                                pos_min = min(positions.keys()) if positions else "N/A"
+                                pos_max = max(positions.keys()) if positions else "N/A"
+                                print(f"    Base feature position range: {pos_min} to {pos_max}")
+                                
+                                # Check if previously generated token is included
+                                if step > 0:  # Not the first step
+                                    prev_token_pos = new_token_position - 1
+                                    included = prev_token_pos in positions
+                                    print(f"    Previously generated token at position {prev_token_pos} included: {included}")
+                                    step_results_this_token["prev_token_included"] = included
+                            
+                            # Check patch feature positions
+                            patch_feature = token_probs[last_layer].get("patch_feature", {})
+                            if patch_feature:
+                                positions = patch_feature.get("positions", {})
+                                pos_min = min(positions.keys()) if positions else "N/A"
+                                pos_max = max(positions.keys()) if positions else "N/A"
+                                print(f"    Patch feature position range: {pos_min} to {pos_max}")
+                                
                 except Exception as e:
-                     print(f"  Error during probability extraction in step {step+1}: {e}")
-                     traceback.print_exc()
-                     # Continue to next step if possible, but log error
-                     step_results_this_token["probability_extraction_error"] = str(e)
+                    print(f"  Error during probability extraction in step {step+1}: {e}")
+                    traceback.print_exc()
+                    # Continue to next step if possible, but log error
+                    step_results_this_token["probability_extraction_error"] = str(e)
 
 
             # --- c) Visualize Probabilities ---
@@ -215,7 +249,8 @@ def run_stepwise_logit_lens_workflow(
                         input_data=viz_input_data,
                         selected_layers=selected_layers,
                         output_dir=step_output_dir, # Save to step-specific directory
-                        generate_composite=True # Explicitly request composite images
+                        generate_composite=True, # Explicitly request composite images
+                        only_composite=True # Only keep composite images
                     )
                     print(f"  Saved {len(step_viz_paths)} visualization files to {step_output_dir}")
                 except Exception as e:
@@ -244,6 +279,9 @@ def run_stepwise_logit_lens_workflow(
                 step_results_this_token["generated_token"] = token_text
                 step_results_this_token["generated_token_id"] = next_token_id.item()
                 print(f"  Predicted next token: '{token_text}' (ID: {next_token_id.item()})")
+                print(f"  Current sequence length: {current_input_ids.shape[1]}")
+                new_token_position = current_input_ids.shape[1]  # Position of token when added to sequence
+                print(f"  New token will be at position {new_token_position} after appending")
             except Exception as e:
                 print(f"  Error decoding token ID {next_token_id.item()}: {e}")
                 step_results_this_token["generated_token"] = "[Decoding Error]"

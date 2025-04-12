@@ -603,8 +603,8 @@ class LLaVANextLogitLensAnalyzer:
                             for concept, token_ids in valid_concepts.items():
                                 concept_probs = probs[0, token_idx, token_ids]
                                 base_grids[concept][r, c] = torch.max(concept_probs).item() # Max prob among concept's tokens
-                                for concept, grid in base_grids.items():
-                                    print(f"Layer {layer_idx} base_feature concept '{concept}': min {grid.min()}, max {grid.max()}, mean {grid.mean()}")
+                                #for concept, grid in base_grids.items():
+                                    #print(f"Layer {layer_idx} base_feature concept '{concept}': min {grid.min()}, max {grid.max()}, mean {grid.mean()}")
                     layer_results["base_feature"] = base_grids
 
                 # --- Patch Features ---

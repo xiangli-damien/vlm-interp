@@ -299,7 +299,8 @@ def visualize_token_probabilities(
     output_dir: str = "logit_lens_visualization",
     colormap: str = "jet", # Colormap for heatmaps
     heatmap_alpha: float = 0.6, # Alpha for heatmap overlay
-    generate_composite: bool = True # Flag to generate composite images
+    generate_composite: bool = True, # Flag to generate composite images
+    only_composite: bool = False # Flag to only keep composite images
 ):
     """
     Visualize token probability maps from logit lens analysis using heatmaps and line plots.
@@ -567,74 +568,7 @@ def visualize_token_probabilities(
 
 
     # --- 3. Visualize Newline Token Probabilities (Line Plots) ---
-    print("  Generating newline feature line plots...")
-    has_newline_data = any(
-        isinstance(token_probs.get(l, {}).get("newline_feature"), dict) and token_probs[l]["newline_feature"]
-        for l in layers_to_plot
-    )
-
-    if has_newline_data:
-        max_row_overall = 0
-        for layer_idx in layers_to_plot:
-            newline_layer_data = token_probs.get(layer_idx, {}).get("newline_feature", {})
-            if isinstance(newline_layer_data, dict):
-                for concept_probs_dict in newline_layer_data.values():
-                    if concept_probs_dict and isinstance(concept_probs_dict, dict):
-                        current_max = max(k for k in concept_probs_dict.keys() if isinstance(k, int)) if any(isinstance(k, int) for k in concept_probs_dict.keys()) else -1
-                        if current_max >= 0:
-                            max_row_overall = max(max_row_overall, current_max)
-
-        for concept in concepts:
-            pbar_newline = tqdm(layers_to_plot, desc=f"Newline '{concept}' Plot", leave=False, ncols=100)
-            plot_data_exists_for_concept = False # Track if any data plotted for this concept
-            for layer_idx in pbar_newline:
-                layer_data = token_probs.get(layer_idx, {}).get("newline_feature", {})
-                newline_probs_concept = layer_data.get(concept) # Expected: {row_idx: prob}
-
-                if not isinstance(newline_probs_concept, dict) or not newline_probs_concept:
-                    continue # Skip if no data or not a dict
-
-                # Filter for integer keys only and sort
-                rows_probs = sorted([(r, p) for r, p in newline_probs_concept.items() if isinstance(r, int)])
-                if not rows_probs:
-                    continue # Skip if no valid integer rows found
-
-                rows, probs = zip(*rows_probs) # Unzip into separate lists
-                plot_data_exists_for_concept = True
-
-                # --- Plotting ---
-                fig, ax = plt.subplots(figsize=(8, 4))
-                try:
-                    ax.plot(rows, probs, marker='o', linestyle='-', color='green')
-                    ax.set_xlabel("Row Index (Spatial Grid)")
-                    ax.set_ylabel("Max Probability")
-                    ax.set_title(f"Newline Feature Prob: '{concept}' - Layer {layer_idx}", fontsize=12)
-                    ax.set_ylim(-0.05, 1.05)
-                    # Set x-axis limits based on actual data or overall max
-                    current_max_row = max(rows) if rows else 0
-                    xlim_upper = max(max_row_overall, current_max_row) + 0.5
-                    ax.set_xlim(-0.5, xlim_upper)
-                    # Generate ticks up to the max relevant row index
-                    ax.set_xticks(np.arange(0, int(xlim_upper) + 1))
-                    ax.grid(True, linestyle=':', alpha=0.6)
-
-                    for r, p in zip(rows, probs):
-                        ax.text(r, p + 0.03, f"{p:.3f}", ha="center", va="bottom", fontsize=8)
-
-                    filepath = os.path.join(newline_dir, f"layer_{layer_idx:03d}_{concept}_newline_plot.png")
-                    plt.savefig(filepath, dpi=150, bbox_inches="tight")
-                    all_saved_paths.append(filepath)
-                except Exception as e:
-                    print(f"    Error plotting/saving newline plot layer {layer_idx} '{concept}': {e}")
-                finally:
-                    plt.close(fig) # Ensure figure is closed
-
-            # Optional: Print a message if no data was found for a concept across all layers
-            # if not plot_data_exists_for_concept:
-            #     print(f"  No valid newline data found to plot for concept '{concept}'.")
-
-    else:
-        print("  Skipping newline feature visualization: No valid newline data found for selected layers.")
+    print("  Skipping newline feature visualization.")
 
 
     # --- 4. Generate Composite Images (using helper function defined elsewhere) ---
@@ -686,8 +620,24 @@ def visualize_token_probabilities(
                     print(f"    Skipping composite patch image for concept '{concept}' (no individual images found/matched).")
 
     print(f"\n--- Logit Lens Visualizations Generated. Total files saved: {len(all_saved_paths)} ---")
-    # Optionally return the directory path as well or instead
-    # print(f"Visualizations saved in: {output_dir}")
+    # If only_composite is True and composites were generated, keep only composite images
+    if only_composite and generate_composite:
+        print("  Only keeping composite images as requested...")
+        # Identify composite images (paths)
+        composite_paths = [p for p in all_saved_paths if "composite" in os.path.basename(p)]
+        if composite_paths:
+            # Delete all non-composite images
+            for path in all_saved_paths:
+                if path not in composite_paths:
+                    try:
+                        os.remove(path)
+                    except Exception as e:
+                        print(f"    Warning: Failed to delete {path}: {e}")
+            # Update the list of saved paths to only include composites
+            all_saved_paths = composite_paths
+        else:
+            print("    Warning: No composite images found to keep.")
+    
     return all_saved_paths
 
 # ============================================
