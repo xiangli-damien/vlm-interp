@@ -24,7 +24,7 @@ from analyzer.saliency_analyzer import (
 )
 # Utils
 try:
-    from utils.data_utils import load_image, get_token_indices, build_conversation
+    from utils.data_utils import load_image, get_token_indices, build_conversation, find_token_indices, find_image_token_spans, get_image_token_spans
     from utils.model_utils import get_llm_attention_layer_names
     from utils.hook_utils import GradientAttentionCapture
     from utils.visual_utils import visualize_token_probabilities, visualize_information_flow
