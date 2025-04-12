@@ -297,8 +297,10 @@ def visualize_token_probabilities(
     input_data: Dict[str, Any],
     selected_layers: Optional[List[int]] = None,
     output_dir: str = "logit_lens_visualization",
-    colormap: str = "jet", # Colormap for heatmaps
-    heatmap_alpha: float = 0.6, # Alpha for heatmap overlay
+    colormap: str = "jet", # Colormap for heatmaps - use same for both types
+    heatmap_alpha: float = 0.6, # Alpha for heatmap overlay - use same for both types
+    interpolation: str = "nearest", # Use 'nearest' to maintain grid structure or 'bilinear' for smooth
+    add_gridlines: bool = True, # Add grid lines to show cell structure
     generate_composite: bool = True, # Flag to generate composite images
     only_composite: bool = False # Flag to only keep composite images
 ):
@@ -308,8 +310,7 @@ def visualize_token_probabilities(
     Generates individual visualizations per layer for 'base_feature' (grid heatmap overlaid
     on original image), 'patch_feature' (overlay on spatial preview image), and
     'newline_feature' (line plot). Optionally generates composite images combining all
-    layer visualizations for 'base' and 'patch' features using internally defined padding
-    via the `create_composite_image` helper function (assumed to be defined elsewhere).
+    layer visualizations for 'base' and 'patch' features.
 
     Args:
         token_probs (Dict[int, Dict[str, Any]]): Dictionary mapping layer index to probabilities.
@@ -319,11 +320,14 @@ def visualize_token_probabilities(
             'feature_mapping', 'original_image' (PIL), and 'spatial_preview_image' (PIL).
         selected_layers (Optional[List[int]]): List of layer indices to visualize. If None, visualizes all available layers.
         output_dir (str): Directory path to save the visualization images. Subdirectories will be created.
-                               This path is typically set by the calling analysis function.
+                           This path is typically set by the calling analysis function.
         colormap (str): Matplotlib colormap name for heatmaps.
         heatmap_alpha (float): Alpha blending value for heatmap overlays (0.0 to 1.0).
+        interpolation (str): Interpolation method for imshow ('nearest', 'bilinear', etc).
+        add_gridlines (bool): Whether to add grid lines to visualizations.
         generate_composite (bool): If True, creates composite images stitching together
                                    individual layer visualizations for base and patch features.
+        only_composite (bool): If True, only keeps composite images.
 
     Returns:
         List[str]: File paths of all saved visualization images (including composites).
@@ -449,12 +453,16 @@ def visualize_token_probabilities(
                         print(f"  Warning: Shape mismatch base layer {layer_idx}, '{concept}'. Expected {base_grid}, got {base_prob_map.shape}. Skipping.")
                         continue
 
-                    # --- Upscale Heatmap ---
+                    # --- Upscale Heatmap using the same method as patches ---
                     upscaled_heatmap_base: Optional[np.ndarray] = None
                     try:
                         if HAS_SKIMAGE:
-                            upscaled_heatmap_base = skimage_resize(base_prob_map, target_overlay_size, order=1, mode='constant', cval=0, anti_aliasing=True, preserve_range=True)
+                            # Use skimage for both base and patch features
+                            upscaled_heatmap_base = skimage_resize(base_prob_map, target_overlay_size, order=1, 
+                                                                 mode='constant', cval=0, anti_aliasing=True, 
+                                                                 preserve_range=True)
                         else: # Fallback numpy scaling
+                            # Modified to maintain grid structure
                             repeat_y = target_overlay_size[1] // base_grid_h
                             repeat_x = target_overlay_size[0] // base_grid_w
                             upscaled_heatmap_base = np.kron(base_prob_map, np.ones((repeat_y, repeat_x)))
@@ -467,7 +475,29 @@ def visualize_token_probabilities(
                     fig, ax = plt.subplots(figsize=(6, 6))
                     try:
                         ax.imshow(background_np, extent=(0, target_overlay_size[0], target_overlay_size[1], 0))
-                        im = ax.imshow(upscaled_heatmap_base, alpha=heatmap_alpha, cmap=colormap, vmin=0, vmax=1, extent=(0, target_overlay_size[0], target_overlay_size[1], 0))
+                        
+                        # Use the same interpolation setting as patch features for consistency
+                        im = ax.imshow(upscaled_heatmap_base, alpha=heatmap_alpha, cmap=colormap, 
+                                      vmin=0, vmax=1, 
+                                      extent=(0, target_overlay_size[0], target_overlay_size[1], 0),
+                                      interpolation=interpolation)  # Use consistent interpolation
+                        
+                        # Add grid lines if requested
+                        if add_gridlines:
+                            # Draw grid lines to emphasize the grid structure
+                            cell_height = target_overlay_size[1] / base_grid_h
+                            cell_width = target_overlay_size[0] / base_grid_w
+                            
+                            # Add horizontal grid lines
+                            for i in range(1, base_grid_h):
+                                y = i * cell_height
+                                ax.axhline(y=y, color='gray', linestyle='-', linewidth=0.5, alpha=0.5)
+                                
+                            # Add vertical grid lines
+                            for i in range(1, base_grid_w):
+                                x = i * cell_width
+                                ax.axvline(x=x, color='gray', linestyle='-', linewidth=0.5, alpha=0.5)
+                        
                         cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
                         cbar.set_label("Max Probability")
                         ax.set_title(f"Base Feature Overlay: '{concept}' - Layer {layer_idx}", fontsize=12)
@@ -522,14 +552,16 @@ def visualize_token_probabilities(
                 # --- Upscale and Resize Heatmap ---
                 resized_heatmap_patch: Optional[np.ndarray] = None
                 try:
-                    # Upscale probability map by raw patch size first
+                    # Upscale probability map by raw patch size first - Keep this approach for patches
                     heatmap_unpadded = np.repeat(np.repeat(patch_prob_map_unpadded, raw_patch_size, axis=0), raw_patch_size, axis=1)
                     heatmap_h_unpadded, heatmap_w_unpadded = heatmap_unpadded.shape
 
                     # Resize this large heatmap to match the actual content area dimensions
                     target_heatmap_size = (resized_h_actual, resized_w_actual)
                     if HAS_SKIMAGE:
-                        resized_heatmap_patch = skimage_resize(heatmap_unpadded, target_heatmap_size, order=1, mode='constant', cval=0, anti_aliasing=True, preserve_range=True)
+                        resized_heatmap_patch = skimage_resize(heatmap_unpadded, target_heatmap_size, order=1, 
+                                                             mode='constant', cval=0, anti_aliasing=True, 
+                                                             preserve_range=True)
                     else: # Fallback numpy scaling
                          scale_y = target_heatmap_size[0] / heatmap_h_unpadded if heatmap_h_unpadded > 0 else 1
                          scale_x = target_heatmap_size[1] / heatmap_w_unpadded if heatmap_w_unpadded > 0 else 1
@@ -547,7 +579,28 @@ def visualize_token_probabilities(
                     ax.imshow(spatial_preview_image, extent=(0, preview_w, preview_h, 0))
                     # Calculate extent for the overlay using padding and actual dimensions
                     extent = (pad_left, pad_left + resized_w_actual, pad_top + resized_h_actual, pad_top)
-                    im = ax.imshow(resized_heatmap_patch, alpha=heatmap_alpha, cmap=colormap, vmin=0, vmax=1, extent=extent)
+                    
+                    # Use the same interpolation parameter as for base features
+                    im = ax.imshow(resized_heatmap_patch, alpha=heatmap_alpha, cmap=colormap, 
+                                  vmin=0, vmax=1, extent=extent,
+                                  interpolation=interpolation)  # Use consistent interpolation
+                    
+                    # Add grid lines if requested
+                    if add_gridlines:
+                        # Calculate cell sizes for the patch grid
+                        cell_height = resized_h_actual / prob_grid_h
+                        cell_width = resized_w_actual / prob_grid_w
+                        
+                        # Add horizontal grid lines
+                        for i in range(1, prob_grid_h):
+                            y = pad_top + i * cell_height
+                            ax.axhline(y=y, color='gray', linestyle='-', linewidth=0.5, alpha=0.5)
+                            
+                        # Add vertical grid lines
+                        for i in range(1, prob_grid_w):
+                            x = pad_left + i * cell_width
+                            ax.axvline(x=x, color='gray', linestyle='-', linewidth=0.5, alpha=0.5)
+                    
                     cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
                     cbar.set_label("Max Probability")
                     ax.set_title(f"Patch Feature Overlay: '{concept}' - Layer {layer_idx}", fontsize=12)
@@ -572,6 +625,7 @@ def visualize_token_probabilities(
 
 
     # --- 4. Generate Composite Images (using helper function defined elsewhere) ---
+    # (Composite generation code remains the same)
     if generate_composite:
         print("\n  Generating composite overview images...")
         # Ensure the helper function is available in the scope
