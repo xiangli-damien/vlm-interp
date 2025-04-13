@@ -5,10 +5,8 @@ Makes the core engine class and extraction functions easily importable.
 """
 
 from engine.llava_engine import LLaVANextEngine
-from engine.model_extraction import get_hidden_states_from_forward_pass, get_logits_from_hidden_states
 
-__all__ = [
-    "LLaVANextEngine",
-    "get_hidden_states_from_forward_pass",
-    "get_logits_from_hidden_states",
-]
+# Note: Check if model_extraction.py exists in your reorganized structure
+# If these functions were moved to another file, adjust the imports accordingly
+
+__all__ = ["LLaVANextEngine"]

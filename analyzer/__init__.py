@@ -8,13 +8,19 @@ This module contains:
 """
 
 # Core Analyzer Components
-from analyzer.logit_lens_analyzer import LLaVANextLogitLensAnalyzer
-from analyzer.saliency_analyzer import (
+from analyzer.logit_lens import LLaVANextLogitLensAnalyzer
+from analyzer.saliency import (
     calculate_saliency_scores,
     analyze_layerwise_saliency_flow,
     compute_flow_metrics_optimized
 )
-from analyzer.stepwise_logit_lens_workflow import run_stepwise_logit_lens_workflow
+
+# Include stepwise_logit_lens_workflow as requested
+try:
+    from analyzer.stepwise_logit_lens_workflow import run_stepwise_logit_lens_workflow
+except ImportError:
+    print("Warning: analyzer.stepwise_logit_lens_workflow not found or has errors.")
+    run_stepwise_logit_lens_workflow = None
 
 # Workflow Functions
 from analyzer.workflows import (
@@ -23,18 +29,21 @@ from analyzer.workflows import (
 )
 
 
-# Placeholder for the token-by-token logit lens analyzer (as per user request)
-# from .token_by_token_logit_lens import LLaVANextTokenLogitLensAnalyzer
-
 __all__ = [
     # Analyzers & Components
     "LLaVANextLogitLensAnalyzer",
     "calculate_saliency_scores",
     "analyze_layerwise_saliency_flow",
     "compute_flow_metrics_optimized",
+    
     # Workflows
     "run_logit_lens_workflow",
     "run_saliency_workflow",
-    "run_stepwise_logit_lens_workflow",
-    # "LLaVANextTokenLogitLensAnalyzer", # Uncomment when implemented
 ]
+
+# Add stepwise_logit_lens_workflow if available
+if run_stepwise_logit_lens_workflow is not None:
+    __all__.append("run_stepwise_logit_lens_workflow")
+
+# Commented out as it's currently a placeholder
+# "LLaVANextTokenLogitLensAnalyzer",

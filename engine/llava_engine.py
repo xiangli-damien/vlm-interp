@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Defines the LLaVANextEngine class for interacting with LLaVA-Next models.
 """
@@ -7,17 +6,18 @@ import torch
 from PIL import Image
 from typing import Dict, Any, Optional, Union, List, Tuple
 
-# Assuming utils are structured as requested in the parent directory
+from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
+
 from utils.data_utils import load_image, build_conversation
 from utils.model_utils import load_model, get_llm_attention_layer_names
 
-# Import necessary classes from transformers
-# (Ensure these specific versions are handled by your environment setup)
-from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
 
 class LLaVANextEngine:
     """
     A VLM engine specifically designed for LLaVA-Next models.
+    
+    Handles model loading, input preparation, generation, and provides
+    access to lower-level model components for analysis.
     """
     def __init__(
         self,
@@ -27,28 +27,38 @@ class LLaVANextEngine:
         use_flash_attn: bool = False,
         enable_gradients: bool = False
     ):
+        """
+        Initialize the LLaVA-Next engine.
         
+        Args:
+            model_id: HuggingFace model ID
+            device: Device to use ('cuda', 'cpu', etc.)
+            load_in_4bit: Load model in 4-bit quantization
+            use_flash_attn: Use Flash Attention 2 for faster inference
+            enable_gradients: Enable gradients for the model
+        """
         self.model_id = model_id
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.processor: Optional[LlavaNextProcessor] = None
         self.model: Optional[LlavaNextForConditionalGeneration] = None
-        self.load_in_4bit = load_in_4bit if torch.cuda.is_available() else False # 4bit only works on CUDA
-        self.use_flash_attn = use_flash_attn if torch.cuda.is_available() else False # Flash Attn typically needs CUDA
+        self.load_in_4bit = load_in_4bit if torch.cuda.is_available() else False
+        self.use_flash_attn = use_flash_attn if torch.cuda.is_available() else False
         self.enable_gradients = enable_gradients
 
-        # Decide if 4bit loading overrides gradient request (common case)
+        # Decide if 4bit loading overrides gradient request
         _effective_enable_gradients = self.enable_gradients
         if self.load_in_4bit and self.enable_gradients:
             print("Warning: Requesting gradients with 4-bit loading. Gradient support is limited or unavailable with 4-bit quantization. Proceeding but expect potential issues.")
-            # We pass enable_gradients=True to load_model, but it might internally disable them if quantizing
-            # Or raise an error depending on the transformers version and setup.
 
         # Load model and processor upon initialization
         self._load_model(_effective_enable_gradients)
 
     def _load_model(self, enable_gradients: bool):
         """
-        Internal method to load the model and processor using the utility function.
+        Internal method to load the model and processor.
+        
+        Args:
+            enable_gradients: Whether to enable gradients
         """
         print(f"Engine attempting to load model '{self.model_id}'...")
         try:
@@ -57,21 +67,19 @@ class LLaVANextEngine:
                 model_id=self.model_id,
                 use_flash_attn=self.use_flash_attn,
                 load_in_4bit=self.load_in_4bit,
-                enable_gradients=enable_gradients # Pass the potentially adjusted flag
+                enable_gradients=enable_gradients
             )
-            # Ensure the model is on the correct device, especially if device_map wasn't used or effective
+            # Ensure the model is on the correct device
             if self.model is not None and hasattr(self.model, 'device') and self.model.device != torch.device(self.device):
-                 if 'device_map' not in self.model.config.to_dict(): # Only move if device_map wasn't used
+                 if 'device_map' not in self.model.config.to_dict():
                       try:
                           print(f"Manually moving model to configured device: {self.device}")
                           self.model.to(self.device)
                       except Exception as e:
                           print(f"Warning: Failed to manually move model to {self.device}. Error: {e}")
             elif self.model is not None:
-                 # If device_map was used, model parts might be on different devices.
-                 # The engine's self.device is less relevant in that case.
                  print(f"Model loaded with device_map='auto'. Main device may vary.")
-                 self.device = str(self.model.device) # Update engine device based on model's primary device
+                 self.device = str(self.model.device)
 
         except ImportError as e:
              print(f"ImportError during model loading: {e}. Make sure necessary libraries (like bitsandbytes, flash-attn) are installed if using quantization or flash attention.")
@@ -80,7 +88,7 @@ class LLaVANextEngine:
             print(f"Error loading model '{self.model_id}' in engine: {e}")
             self.model = None
             self.processor = None
-            raise # Re-raise the exception to indicate failure
+            raise
 
         if self.model is None or self.processor is None:
              raise RuntimeError(f"Failed to initialize model or processor for {self.model_id}")
@@ -96,29 +104,35 @@ class LLaVANextEngine:
     ) -> Dict[str, torch.Tensor]:
         """
         Build model inputs from an image and a text prompt.
+        
+        Args:
+            image: PIL Image object or path/URL to an image
+            prompt: Text prompt to accompany the image
+            conversation_format: Use conversation format for the prompt
+            
+        Returns:
+            Dictionary of model inputs
         """
         if self.model is None or self.processor is None:
             raise ValueError("Model and processor must be loaded before building inputs.")
 
         # Load image if a string path/URL is provided
-        # Use verbose=False to reduce console clutter from the utility function
-        loaded_image = load_image(image, resize_to=None, verbose=False) # Let processor handle resizing
+        loaded_image = load_image(image, resize_to=None, verbose=False)
 
-        # Build conversation structure using the utility function
+        # Build conversation structure
         conversation = build_conversation(prompt, conversation_format=conversation_format)
 
         # Format prompt using the processor's chat template
-        # The processor handles the image token placement correctly during __call__
         try:
              if hasattr(self.processor, "apply_chat_template") and self.processor.chat_template:
                  formatted_prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
              else:
-                 # Basic fallback if chat template isn't setup or applicable
+                 # Basic fallback
                  image_token = getattr(self.processor, "image_token", "<image>")
-                 if conversation_format and isinstance(conversation, list): # Use first user message
+                 if conversation_format and isinstance(conversation, list):
                      text_content = next((item['text'] for item in conversation[0]['content'] if item['type'] == 'text'), "")
                      formatted_prompt = f"USER: {image_token}\n{text_content} ASSISTANT:"
-                 else: # Simple string format
+                 else:
                       formatted_prompt = f"{prompt} {image_token}"
                  print("Warning: Using basic prompt formatting; chat template may not be applied.")
 
@@ -128,7 +142,6 @@ class LLaVANextEngine:
              formatted_prompt = f"USER: {image_token}\n{prompt} ASSISTANT:"
 
         # Prepare inputs using the processor
-        # The processor handles image resizing, normalization, and tokenization
         inputs = self.processor(
             images=loaded_image,
             text=formatted_prompt,
@@ -136,19 +149,16 @@ class LLaVANextEngine:
         )
 
         # Move inputs to the model's primary device
-        # This handles cases where device_map="auto" might place parts differently.
-        # We send inputs to the device where the computation likely starts (usually the embedding layer's device).
         try:
              model_device = self.model.device
              inputs = {k: v.to(model_device) for k, v in inputs.items()}
         except Exception as e:
              print(f"Warning: Failed to move inputs to model device {self.model.device}. Error: {e}")
-             # Fallback to engine's configured device if moving to model.device fails
+             # Fallback to engine's configured device
              try:
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
              except Exception as inner_e:
                   print(f"Warning: Also failed to move inputs to engine device {self.device}. Error: {inner_e}")
-
 
         return inputs
 
@@ -157,7 +167,7 @@ class LLaVANextEngine:
         image: Union[str, Image.Image],
         prompt: str = "Describe this image in detail.",
         max_new_tokens: int = 256,
-        num_beams: int = 3, # Adjusted default based on notebook usage
+        num_beams: int = 3,
         temperature: float = 1.0,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
@@ -170,25 +180,20 @@ class LLaVANextEngine:
         Generate a response based on an image and prompt.
 
         Args:
-            image (Union[str, Image.Image]): PIL Image object or path/URL to an image.
-            prompt (str): Text prompt to accompany the image.
-            max_new_tokens (int): Maximum number of new tokens to generate.
-            num_beams (int): Number of beams for beam search. Set to 1 for greedy decoding.
-            temperature (float): Temperature for sampling (used if num_beams=1 and do_sample=True).
-            top_p (Optional[float]): Top-p (nucleus) sampling threshold.
-            top_k (Optional[int]): Top-k sampling threshold.
-            return_dict_in_generate (bool): Whether the underlying `model.generate` should return a dictionary output. Defaults to True.
-            output_attentions (bool): Whether to include attention weights in the output dictionary (requires return_dict_in_generate=True).
-            output_hidden_states (bool): Whether to include hidden states in the output dictionary (requires return_dict_in_generate=True).
-            **generation_kwargs: Additional keyword arguments passed directly to `model.generate`.
+            image: PIL Image object or path/URL to an image
+            prompt: Text prompt to accompany the image
+            max_new_tokens: Maximum number of new tokens to generate
+            num_beams: Number of beams for beam search
+            temperature: Temperature for sampling
+            top_p: Top-p (nucleus) sampling threshold
+            top_k: Top-k sampling threshold
+            return_dict_in_generate: Return a dictionary of generation outputs
+            output_attentions: Include attention weights in the output
+            output_hidden_states: Include hidden states in the output
+            **generation_kwargs: Additional generation parameters
 
         Returns:
-            Tuple[str, Optional[Dict[str, Any]]]:
-                - The generated text response (cleaned).
-                - The full output dictionary from `model.generate` if return_dict_in_generate is True, otherwise None.
-
-        Raises:
-            ValueError: If the model or processor is not loaded.
+            Tuple of (generated_text, full_output_dict)
         """
         if self.model is None or self.processor is None:
             raise ValueError("Model and processor must be loaded before generation.")
@@ -203,14 +208,13 @@ class LLaVANextEngine:
         # Determine if sampling should be enabled based on parameters
         do_sample = False
         if temperature != 1.0 or top_p is not None or top_k is not None:
-             if num_beams == 1: # Sampling is typically used with greedy decoding (num_beams=1)
+             if num_beams == 1:
                   do_sample = True
                   print(f"  Sampling enabled (temp={temperature}, top_p={top_p}, top_k={top_k})")
              else:
-                  print(f"  Warning: Sampling parameters (temp/top_p/top_k) provided but num_beams > 1. Beam search will be used.")
+                  print(f"  Warning: Sampling parameters provided but num_beams > 1. Beam search will be used.")
 
-
-        with torch.inference_mode(): # Use inference_mode for potentially better performance than no_grad
+        with torch.inference_mode():
             try:
                 outputs = self.model.generate(
                     **inputs,
@@ -223,38 +227,26 @@ class LLaVANextEngine:
                     return_dict_in_generate=return_dict_in_generate,
                     output_attentions=output_attentions,
                     output_hidden_states=output_hidden_states,
-                    eos_token_id=self.processor.tokenizer.eos_token_id, # Help generation stop cleanly
-                    pad_token_id=self.processor.tokenizer.pad_token_id, # Important for batching if used, good practice otherwise
+                    eos_token_id=self.processor.tokenizer.eos_token_id,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
                     **generation_kwargs
                 )
             except Exception as e:
                  print(f"Error during model.generate: {e}")
-                 # Attempt to get more info if possible
                  if 'CUDA out of memory' in str(e):
                       print("CUDA OOM Error detected. Try reducing batch size, sequence length, or using quantization/offloading.")
                  elif 'Input type' in str(e) and 'CPU' in str(e) and 'CUDA' in str(e):
                       print("Device mismatch error detected. Ensure model and inputs are on the same device.")
-                 raise # Re-raise the exception
+                 raise
 
-
-        # Decode generated sequence(s)
-        # `outputs.sequences` contains the full sequence (input + generated)
-        # We typically decode the first sequence in the batch (index 0)
+        # Decode generated sequence
         raw_generated_text = self.processor.decode(outputs.sequences[0], skip_special_tokens=True)
 
         # Clean the generated text to remove the prompt/input part
         cleaned_text = raw_generated_text
-        # Use common separators related to chat templates to find the start of the response
-        separators = ["ASSISTANT:", "[/INST]", "GPT:", "\n "] # Add more as needed
-        original_prompt_text = prompt # Use the original prompt text for a more robust split if possible
-
-        # Try splitting based on the original prompt first (might be less reliable with complex templates)
-        # if original_prompt_text in cleaned_text:
-        #      parts = cleaned_text.split(original_prompt_text, 1)
-        #      if len(parts) > 1:
-        #           cleaned_text = parts[1].strip()
-
-        # More robust approach using known separators
+        separators = ["ASSISTANT:", "[/INST]", "GPT:", "\n "]
+        
+        # Try splitting based on known separators
         found_separator = False
         for sep in separators:
              if sep in cleaned_text:
@@ -262,15 +254,12 @@ class LLaVANextEngine:
                   if len(parts) > 1:
                       cleaned_text = parts[1].strip()
                       found_separator = True
-                      # print(f"Cleaned text using separator '{sep}'") # Debugging print
-                      break # Use the first separator found
+                      break
 
         if not found_separator:
              print("Warning: Could not reliably separate prompt from response using known separators. Returning full decoded text.")
-             # As a last resort, maybe try removing the input prompt if it appears exactly at the beginning
-             if cleaned_text.startswith(original_prompt_text):
-                  cleaned_text = cleaned_text[len(original_prompt_text):].strip()
-
+             if cleaned_text.startswith(prompt):
+                  cleaned_text = cleaned_text[len(prompt):].strip()
 
         # Return the cleaned text and the full output dictionary if requested
         output_dict = outputs if return_dict_in_generate else None
@@ -281,6 +270,9 @@ class LLaVANextEngine:
     def get_attention_layer_names(self) -> List[str]:
         """
         Returns the names of attention layers in the model.
+        
+        Returns:
+            List of layer names
         """
         if self.model is None:
             raise ValueError("Model must be loaded before getting attention layer names.")

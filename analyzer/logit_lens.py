@@ -1,6 +1,8 @@
-# -*- coding: utf-8 -*-
 """
 Logit Lens analysis implementation for LLaVA-Next models.
+
+The LogitLens technique analyzes hidden states at different layers of the model
+by projecting them through the language model head to see what tokens are predicted.
 """
 
 import math
@@ -8,20 +10,11 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
-import requests
-from io import BytesIO
-import os
-from tqdm import tqdm
 from typing import Dict, Any, Optional, Union, List, Tuple, Callable
 
-# Necessary imports from transformers
-from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration, BitsAndBytesConfig
+from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
 from transformers.image_processing_utils import select_best_resolution
-from transformers.image_transforms import (
-    PaddingMode,
-    resize as hf_resize,
-    pad as hf_pad,
-)
+from transformers.image_transforms import resize as hf_resize, pad as hf_pad
 from transformers.image_utils import (
     ChannelDimension,
     PILImageResampling,
@@ -29,19 +22,26 @@ from transformers.image_utils import (
     infer_channel_dimension_format,
     to_numpy_array
 )
-import gc # For garbage collection
-
-# Import utilities from the parent utils directory
-from utils.data_utils import load_image, find_image_token_spans, get_image_token_spans, get_token_masks
-from utils.visual_utils import visualize_token_probabilities
-
+import gc
+from utils.data_utils import load_image, get_image_token_spans, get_token_masks
 
 class LLaVANextLogitLensAnalyzer:
     """
     Analyzer for applying the logit lens technique to LLaVA-Next models.
+    
+    Allows extracting and analyzing hidden states at different layers of the
+    transformer by projecting them through the language model head to examine
+    which tokens would be predicted at each layer.
     """
 
     def __init__(self, model: LlavaNextForConditionalGeneration, processor: LlavaNextProcessor):
+        """
+        Initialize the analyzer with a model and processor.
+        
+        Args:
+            model: A loaded LLaVA-Next model
+            processor: The corresponding processor
+        """
         if not isinstance(model, LlavaNextForConditionalGeneration):
              print(f"Warning: Model provided is type {type(model)}, expected LlavaNextForConditionalGeneration.")
         if not isinstance(processor, LlavaNextProcessor):
@@ -51,18 +51,19 @@ class LLaVANextLogitLensAnalyzer:
         self.processor = processor
         self.device = model.device
 
+        # Get image token ID from config or processor
         self.image_token_id = getattr(model.config, "image_token_index", None)
-        if self.image_token_id is None: # Fallback if not in config
+        if self.image_token_id is None:
              try:
                   self.image_token_id = processor.tokenizer.convert_tokens_to_ids(processor.image_token)
              except Exception:
                   print("Warning: Could not determine image_token_id from config or processor. Using default 32000.")
-                  self.image_token_id = 32000 # Common default
+                  self.image_token_id = 32000
 
-        # Default to 32 layers if not found (common for 7B models)
+        # Get number of layers from config
         self.num_layers = getattr(model.language_model.config, "num_hidden_layers", 32)
 
-        # Vision tower patch calculation (handle potential missing configs)
+        # Vision tower patch calculation
         vision_config = getattr(model.config, "vision_config", None)
         base_image_size = getattr(vision_config, "image_size", 336) if vision_config else 336
         self.vision_raw_patch_size = getattr(vision_config, "patch_size", 14) if vision_config else 14
@@ -70,14 +71,16 @@ class LLaVANextLogitLensAnalyzer:
              self.vision_patch_grid_size = base_image_size // self.vision_raw_patch_size
         else:
              print("Warning: Vision config patch_size is invalid. Defaulting grid size to 24.")
-             self.vision_patch_grid_size = 24 # 336 / 14
+             self.vision_patch_grid_size = 24
 
+        # Get vision feature selection strategy
         self.vision_feature_select = getattr(model.config, "vision_feature_select_strategy", "default")
-        # Default grid pinpoints from LlavaNextConfig
+        
+        # Get image grid pinpoints for high-res image support
         self.image_grid_pinpoints = getattr(model.config, "image_grid_pinpoints",
                                             [[336, 672], [672, 336], [672, 672], [1008, 336], [336, 1008]])
 
-        # Language model head for projecting hidden states to vocabulary tokens.
+        # Language model head for projecting hidden states to vocabulary tokens
         self.lm_head = model.language_model.lm_head
 
         print(f"Initialized LLaVANextLogitLensAnalyzer")
@@ -90,18 +93,24 @@ class LLaVANextLogitLensAnalyzer:
         print(f"  Vision Feature Selection: {self.vision_feature_select}")
         print(f"  Image Grid Pinpoints: {self.image_grid_pinpoints}")
 
-    # --------------------------------------------------------------------------
-    # Feature Mapping Logic (Handles LLaVA-Next Base + Spatial Patches)
-    # --------------------------------------------------------------------------
     def create_feature_mapping(self, image_spans: List[Tuple[int, int]], image_size_orig_hw: Tuple[int, int]) -> Dict[str, Any]:
-
+        """
+        Creates a mapping between token indices and feature positions for both base and patch features.
+        
+        Args:
+            image_spans: List of (start_idx, end_idx) tuples identifying image token spans
+            image_size_orig_hw: Original image size as (height, width)
+            
+        Returns:
+            Dictionary containing mappings for base and patch features
+        """
         if not image_spans:
             print("Error: No image spans found, cannot create feature mapping.")
             return {}
 
         # Handle potentially multiple spans (though usually one for LLaVA-Next)
         span_start = image_spans[0][0]
-        span_end = image_spans[-1][1] # Use end of the last span
+        span_end = image_spans[-1][1]
         if len(image_spans) > 1:
             print(f"Warning: Multiple image spans detected ({len(image_spans)}). Processing combined range: {span_start}-{span_end}")
 
@@ -111,9 +120,9 @@ class LLaVANextLogitLensAnalyzer:
              return {}
 
         # --- Base Feature Mapping (Fixed Grid) ---
-        base_grid_size = self.vision_patch_grid_size # e.g., 24
-        expected_base_tokens = base_grid_size * base_grid_size # e.g., 576
-        actual_base_token_count = min(expected_base_tokens, total_image_tokens) # Cannot exceed total tokens
+        base_grid_size = self.vision_patch_grid_size
+        expected_base_tokens = base_grid_size * base_grid_size
+        actual_base_token_count = min(expected_base_tokens, total_image_tokens)
         base_start_idx = span_start
         base_end_idx = span_start + actual_base_token_count - 1
 
@@ -129,7 +138,7 @@ class LLaVANextLogitLensAnalyzer:
         spatial_start_idx_potential = base_end_idx + 1
         num_spatial_tokens_available = max(0, span_end - spatial_start_idx_potential + 1)
 
-        orig_height, orig_width = image_size_orig_hw # H, W format
+        orig_height, orig_width = image_size_orig_hw
 
         mapping_spatial = {}
         mapping_newline = {}
@@ -138,8 +147,8 @@ class LLaVANextLogitLensAnalyzer:
         target_resolution_wh = (0, 0)
         resized_dimensions_wh = (0, 0)
         padded_dimensions_wh = (0, 0)
-        actual_spatial_start_idx = -1 # Index of first *mapped* spatial/newline token
-        actual_spatial_end_idx = -1 # Index of last *mapped* spatial/newline token
+        actual_spatial_start_idx = -1
+        actual_spatial_end_idx = -1
 
         if num_spatial_tokens_available > 0:
             print(f"Mapping Spatial Features: Available tokens {spatial_start_idx_potential}-{span_end} (Count: {num_spatial_tokens_available})")
@@ -162,18 +171,15 @@ class LLaVANextLogitLensAnalyzer:
             grid_rows_padded = padded_height // self.vision_raw_patch_size
             grid_cols_padded = padded_width // self.vision_raw_patch_size
 
-            # Grid sizes based on *unpadded* (resized) dimensions (for mapping features)
-            # Crucially, use ceil to determine how many patches cover the actual content
+            # Grid sizes based on unpadded dimensions (for mapping features)
             unpadded_grid_rows = math.ceil(resized_height / self.vision_raw_patch_size)
             unpadded_grid_cols = math.ceil(resized_width / self.vision_raw_patch_size)
             num_unpadded_patches = unpadded_grid_rows * unpadded_grid_cols
 
             # 4. Determine expected token structure (with/without newlines)
-            # LLaVA-Next adds newline tokens between rows of spatial patches.
-            has_newline = unpadded_grid_rows > 1 # Newlines are expected if more than one row of patches
+            has_newline = unpadded_grid_rows > 1
             expected_spatial_tokens_structure = num_unpadded_patches
             if has_newline:
-                # Add N-1 newlines if N rows (LLaVA models often omit the final newline)
                 expected_spatial_tokens_structure += (unpadded_grid_rows - 1)
 
             print(f"  Original HxW: {image_size_orig_hw}")
@@ -194,24 +200,24 @@ class LLaVANextLogitLensAnalyzer:
                 # Map patch tokens for the current row
                 for c in range(unpadded_grid_cols):
                     if current_token_idx <= span_end:
-                        if processed_spatial_count == 0: actual_spatial_start_idx = current_token_idx # Record start index
-                        mapping_spatial[current_token_idx] = (r, c)
-                        actual_spatial_end_idx = current_token_idx # Update last mapped index
-                        current_token_idx += 1
-                        processed_spatial_count += 1
-                    else: break # Ran out of tokens
-
-                if current_token_idx > span_end: break # Check after row patches
-
-                # Map newline token if expected and available (skip for the last row)
-                if has_newline and r < (unpadded_grid_rows - 1):
-                    if current_token_idx <= span_end:
                         if processed_spatial_count == 0: actual_spatial_start_idx = current_token_idx
-                        mapping_newline[current_token_idx] = r # Map newline to its preceding row index
+                        mapping_spatial[current_token_idx] = (r, c)
                         actual_spatial_end_idx = current_token_idx
                         current_token_idx += 1
                         processed_spatial_count += 1
-                    else: break # Ran out of tokens
+                    else: break
+
+                if current_token_idx > span_end: break
+
+                # Map newline token if expected and available
+                if has_newline and r < (unpadded_grid_rows - 1):
+                    if current_token_idx <= span_end:
+                        if processed_spatial_count == 0: actual_spatial_start_idx = current_token_idx
+                        mapping_newline[current_token_idx] = r
+                        actual_spatial_end_idx = current_token_idx
+                        current_token_idx += 1
+                        processed_spatial_count += 1
+                    else: break
 
             if current_token_idx <= span_end:
                  remaining = span_end - current_token_idx + 1
@@ -219,7 +225,7 @@ class LLaVANextLogitLensAnalyzer:
 
             print(f"  Mapped {processed_spatial_count} spatial/newline tokens. Actual index range mapped: {actual_spatial_start_idx}-{actual_spatial_end_idx}")
 
-        else: # No spatial tokens available
+        else:
             print("No spatial tokens available to map.")
             actual_spatial_start_idx = -1
             actual_spatial_end_idx = -1
@@ -245,7 +251,6 @@ class LLaVANextLogitLensAnalyzer:
             },
             "patch_feature": {
                 "start_idx": actual_spatial_start_idx if mapping_spatial else -1,
-                 # Use max spatial index if available, else -1
                 "end_idx": max(mapping_spatial.keys()) if mapping_spatial else -1,
                 "grid_for_visualization": (grid_rows_padded, grid_cols_padded), # Rows (H), Cols (W)
                 "grid_unpadded": (unpadded_grid_rows, unpadded_grid_cols), # Rows (H), Cols (W)
@@ -256,7 +261,7 @@ class LLaVANextLogitLensAnalyzer:
                 "end_idx": max(mapping_newline.keys()) if mapping_newline else -1,
                 "positions": mapping_newline, # {token_idx: row_idx}
             },
-            "combined_spatial_end_idx": actual_spatial_end_idx, # Last mapped index of patch OR newline
+            "combined_spatial_end_idx": actual_spatial_end_idx,
             "patch_size": self.vision_raw_patch_size,
             "original_size": (orig_width, orig_height), # W, H
             "best_resolution": target_resolution_wh, # W, H
@@ -264,39 +269,65 @@ class LLaVANextLogitLensAnalyzer:
             "resized_dimensions": resized_dimensions_wh, # W, H
         }
 
-    # --------------------------------------------------------------------------
-    # Image Processing Helpers (Mimicking LlavaNextImageProcessor internals)
-    # --------------------------------------------------------------------------
     def _calculate_resized_dimensions(self, orig_size_hw: Tuple[int, int], target_res_hw: Tuple[int, int]) -> Tuple[int, int]:
-         """ Calculates aspect-ratio preserved dimensions within target resolution. """
-         orig_h, orig_w = orig_size_hw
-         target_h, target_w = target_res_hw
-         scale_w = target_w / orig_w
-         scale_h = target_h / orig_h
-         if scale_w < scale_h:
-             new_w = target_w
-             new_h = min(math.ceil(orig_h * scale_w), target_h)
-         else:
-             new_h = target_h
-             new_w = min(math.ceil(orig_w * scale_h), target_w)
-         return new_w, new_h
+        """
+        Calculates aspect-ratio preserved dimensions within target resolution.
+        
+        Args:
+            orig_size_hw: Original image size as (height, width)
+            target_res_hw: Target resolution as (height, width)
+            
+        Returns:
+            (width, height) of the resized image
+        """
+        orig_h, orig_w = orig_size_hw
+        target_h, target_w = target_res_hw
+        scale_w = target_w / orig_w
+        scale_h = target_h / orig_h
+        if scale_w < scale_h:
+            new_w = target_w
+            new_h = min(math.ceil(orig_h * scale_w), target_h)
+        else:
+            new_h = target_h
+            new_w = min(math.ceil(orig_w * scale_h), target_w)
+        return new_w, new_h
 
     def _resize_for_patching(self, image: np.array, target_resolution_hw: tuple, resample, input_data_format):
-        """ Resizes image using HF's resize, preserving aspect ratio."""
+        """
+        Resizes image using HF's resize, preserving aspect ratio.
+        
+        Args:
+            image: Input image as numpy array
+            target_resolution_hw: Target resolution as (height, width)
+            resample: Resampling method
+            input_data_format: Channel format
+            
+        Returns:
+            Resized image as numpy array
+        """
         resized_w, resized_h = self._calculate_resized_dimensions(
              get_image_size(image, channel_dim=input_data_format), target_resolution_hw
         )
         return hf_resize(image, size=(resized_h, resized_w), resample=resample, input_data_format=input_data_format)
 
     def _pad_for_patching(self, image: np.array, input_data_format):
-        """ Pads image to be divisible by raw patch size using numpy.pad. """
+        """
+        Pads image to be divisible by raw patch size using numpy.pad.
+        
+        Args:
+            image: Input image as numpy array
+            input_data_format: Channel format
+            
+        Returns:
+            Padded image as numpy array
+        """
         resized_height, resized_width = get_image_size(image, channel_dim=input_data_format)
         padded_height = math.ceil(resized_height / self.vision_raw_patch_size) * self.vision_raw_patch_size
         padded_width = math.ceil(resized_width / self.vision_raw_patch_size) * self.vision_raw_patch_size
         pad_height_total = padded_height - resized_height
         pad_width_total = padded_width - resized_width
 
-        if pad_height_total == 0 and pad_width_total == 0: return image # No padding needed
+        if pad_height_total == 0 and pad_width_total == 0: return image
 
         pad_top = pad_height_total // 2
         pad_bottom = pad_height_total - pad_top
@@ -304,27 +335,33 @@ class LLaVANextLogitLensAnalyzer:
         pad_right = pad_width_total - pad_left
 
         if input_data_format == ChannelDimension.FIRST or input_data_format == "channels_first":
-            padding_np = ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)) # CHW
+            padding_np = ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right))
         elif input_data_format == ChannelDimension.LAST or input_data_format == "channels_last":
-            padding_np = ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)) # HWC
+            padding_np = ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0))
         else: raise ValueError(f"Unsupported input_data_format for padding: {input_data_format}")
 
         return np.pad(image, pad_width=padding_np, mode='constant', constant_values=0)
 
-    # --------------------------------------------------------------------------
-    # Core Analysis Steps
-    # --------------------------------------------------------------------------
     def compute_spatial_preview_image(self, image: Image.Image) -> Image.Image:
+        """
+        Computes the spatial preview image (resized + padded) for patch feature visualization.
+        
+        Args:
+            image: Original PIL image
+            
+        Returns:
+            Processed PIL image ready for visualization
+        """
         print("Computing spatial preview image (resized + padded)...")
         if image.mode != "RGB": image = image.convert("RGB")
         image_np = to_numpy_array(image)
-        input_df = infer_channel_dimension_format(image_np) # Usually HWC for PIL
+        input_df = infer_channel_dimension_format(image_np)
         orig_size_hw = (image.height, image.width)
 
         target_resolution_hw = select_best_resolution(orig_size_hw, self.image_grid_pinpoints)
         print(f"  Original HxW: {orig_size_hw}, Target Res HxW: {target_resolution_hw}")
 
-        # Use BICUBIC resampling (common default)
+        # Use BICUBIC resampling
         resized_image_np = self._resize_for_patching(image_np, target_resolution_hw, resample=PILImageResampling.BICUBIC, input_data_format=input_df)
         resized_h, resized_w = get_image_size(resized_image_np, channel_dim=input_df)
         print(f"  Resized HxW: ({resized_h}, {resized_w})")
@@ -337,21 +374,31 @@ class LLaVANextLogitLensAnalyzer:
         if padded_image_np.dtype != np.uint8:
              padded_image_np = np.clip(padded_image_np, 0, 255).astype(np.uint8)
         if input_df == ChannelDimension.FIRST:
-             padded_image_np = padded_image_np.transpose(1, 2, 0) # CHW -> HWC
+             padded_image_np = padded_image_np.transpose(1, 2, 0)
 
         spatial_preview = Image.fromarray(padded_image_np)
         print("  Spatial preview image computed.")
         return spatial_preview
 
     def prepare_inputs(self, image_source: Union[str, Image.Image], prompt_text: str) -> Dict[str, Any]:
+        """
+        Prepares input data for logit lens analysis.
+        
+        Args:
+            image_source: PIL image, URL, or local file path
+            prompt_text: Text prompt for the model
+            
+        Returns:
+            Dictionary containing all prepared inputs and metadata
+        """
         print("Preparing inputs for Logit Lens analysis...")
         try:
-            # Use util.load_image
+            # Load image
             original_image = load_image(image_source, resize_to=None, convert_mode="RGB", verbose=False)
             original_size_hw = (original_image.height, original_image.width)
             print(f"  Original image loaded. Size HxW: {original_size_hw}")
 
-            # Format prompt using chat template (handle potential errors)
+            # Format prompt using chat template
             conversation = [{"role": "user", "content": [{"type": "text", "text": prompt_text}, {"type": "image"}]}]
             try: formatted_prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
             except Exception as e:
@@ -359,7 +406,7 @@ class LLaVANextLogitLensAnalyzer:
                 image_token = getattr(self.processor, "image_token", "<image>")
                 formatted_prompt = f"USER: {image_token}\n{prompt_text} ASSISTANT:"
 
-            # Process inputs (image+text -> tensors)
+            # Process inputs
             inputs = self.processor(images=original_image, text=formatted_prompt, return_tensors="pt").to(self.device)
             input_ids = inputs.get("input_ids")
             if input_ids is None: raise ValueError("Processor did not return 'input_ids'.")
@@ -377,11 +424,11 @@ class LLaVANextLogitLensAnalyzer:
             return {
                 "inputs": inputs,
                 "image_spans": image_spans,
-                "image_mask": image_mask, # This is 1D boolean tensor
+                "image_mask": image_mask,
                 "feature_mapping": feature_mapping,
-                "original_size": original_size_hw, # H, W
-                "original_image": original_image, # PIL Image
-                "spatial_preview_image": spatial_preview_image, # PIL Image (resized+padded)
+                "original_size": original_size_hw,
+                "original_image": original_image,
+                "spatial_preview_image": spatial_preview_image,
                 "prompt_text": prompt_text
             }
 
@@ -391,6 +438,15 @@ class LLaVANextLogitLensAnalyzer:
              return {}
 
     def extract_hidden_states(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+        """
+        Extracts hidden states from all model layers.
+        
+        Args:
+            inputs: Dictionary of model inputs from processor
+            
+        Returns:
+            Dictionary containing hidden states and generated text
+        """
         print(f"Extracting hidden states from all {self.num_layers + 1} layers (incl. embeddings)...")
         self.model.eval()
         results = {}
@@ -423,7 +479,7 @@ class LLaVANextLogitLensAnalyzer:
                         parts = generated_text_raw.split(sep, 1)
                         if len(parts) > 1: cleaned_gen_text = parts[1].strip(); break
                 results["generated_text"] = cleaned_gen_text
-                print(f"  Sample generated text (cleaned): {cleaned_gen_text[:100]}...") # Show snippet
+                print(f"  Sample generated text (cleaned): {cleaned_gen_text[:100]}...")
 
             return results
 
@@ -437,9 +493,21 @@ class LLaVANextLogitLensAnalyzer:
         self,
         input_data: Dict[str, Any],
         outputs: Dict[str, Any],
-        concepts_to_track: Optional[Dict[str, List[int]]] = None, # Dict: concept -> token_ids
+        concepts_to_track: Optional[Dict[str, List[int]]] = None,
         cpu_offload: bool = True
     ) -> Dict[int, Dict[str, Any]]:
+        """
+        Extracts token probabilities by projecting hidden states through the language model head.
+        
+        Args:
+            input_data: Dictionary from prepare_inputs
+            outputs: Dictionary from extract_hidden_states
+            concepts_to_track: Dictionary mapping concept names to token IDs to track
+            cpu_offload: Whether to offload tensors to CPU during computation
+            
+        Returns:
+            Dictionary mapping layer indices to probability maps for each feature type and concept
+        """
         print("Extracting token probabilities (Logit Lens)...")
         if not concepts_to_track:
             print("  Warning: No concepts_to_track provided. Cannot extract probabilities.")
@@ -467,16 +535,15 @@ class LLaVANextLogitLensAnalyzer:
              return {}
         print(f"  Tracking valid concepts: {list(valid_concepts.keys())}")
 
-
         # Determine LM head device
         try: lm_head_device = next(self.lm_head.parameters()).device
-        except StopIteration: lm_head_device = self.device # Fallback
+        except StopIteration: lm_head_device = self.device
 
-        self.lm_head.eval() # Ensure head is in eval mode
+        self.lm_head.eval()
 
         with torch.no_grad():
-            for layer_idx in tqdm(range(num_layers_to_process), desc="Projecting Layers", ncols=100):
-                layer_hidden = hidden_states[layer_idx] # Shape: [1, seq_len, hidden_dim]
+            for layer_idx in range(num_layers_to_process):
+                layer_hidden = hidden_states[layer_idx]
                 orig_hidden_device = layer_hidden.device
 
                 # Move hidden state if needed
@@ -487,15 +554,12 @@ class LLaVANextLogitLensAnalyzer:
                 # Project & Softmax
                 try:
                      logits = self.lm_head(layer_hidden)
-                     # Use float32 for softmax stability
-                     probs = torch.softmax(logits.float(), dim=-1) # Shape: [1, seq_len, vocab_size]
+                     probs = torch.softmax(logits.float(), dim=-1)
                 except Exception as e:
                      print(f"Warning: Skip layer {layer_idx}, error during projection/softmax: {e}"); continue
-                finally: # Ensure cleanup even on error
-                    # Clean up potentially moved hidden state
+                finally:
                     if layer_hidden.device != orig_hidden_device: del layer_hidden
                     if 'logits' in locals() and logits.device == lm_head_device: del logits
-
 
                 # Extract probabilities for tracked concepts
                 layer_results = {"base_feature": {}, "patch_feature": {}, "newline_feature": {}}
@@ -510,9 +574,7 @@ class LLaVANextLogitLensAnalyzer:
                         if 0 <= token_idx < seq_len:
                             for concept, token_ids in valid_concepts.items():
                                 concept_probs = probs[0, token_idx, token_ids]
-                                base_grids[concept][r, c] = torch.max(concept_probs).item() # Max prob among concept's tokens
-                                #for concept, grid in base_grids.items():
-                                    #print(f"Layer {layer_idx} base_feature concept '{concept}': min {grid.min()}, max {grid.max()}, mean {grid.mean()}")
+                                base_grids[concept][r, c] = torch.max(concept_probs).item()
                     layer_results["base_feature"] = base_grids
 
                 # --- Patch Features ---
@@ -530,12 +592,11 @@ class LLaVANextLogitLensAnalyzer:
                 # --- Newline Features ---
                 newline_info = feature_mapping.get("newline_feature", {})
                 if newline_info.get("positions"):
-                    newline_dict = {c: {} for c in valid_concepts} # {concept: {row_idx: prob}}
+                    newline_dict = {c: {} for c in valid_concepts}
                     for token_idx, row_idx in newline_info["positions"].items():
                         if 0 <= token_idx < seq_len:
                             for concept, token_ids in valid_concepts.items():
                                 concept_probs = probs[0, token_idx, token_ids]
-                                # Store max prob for this newline token, associated with its preceding row
                                 newline_dict[concept][row_idx] = max(newline_dict[concept].get(row_idx, 0.0), torch.max(concept_probs).item())
                     layer_results["newline_feature"] = newline_dict
 
@@ -545,9 +606,9 @@ class LLaVANextLogitLensAnalyzer:
                 # --- Offload or Cleanup ---
                 if cpu_offload:
                      if probs.device != torch.device('cpu'):
-                          try: probs_cpu = probs.cpu(); del probs # Explicitly delete GPU tensor
+                          try: probs_cpu = probs.cpu(); del probs
                           except Exception as e: print(f"Warning: Failed to move/delete probs tensor for layer {layer_idx}: {e}")
-                elif probs.device == lm_head_device: # If not offloading, delete from compute device
+                elif probs.device == lm_head_device:
                     del probs
 
                 # Periodic CUDA cache clearing
@@ -555,4 +616,3 @@ class LLaVANextLogitLensAnalyzer:
 
         print("Token probability extraction complete.")
         return token_probs_by_layer
-

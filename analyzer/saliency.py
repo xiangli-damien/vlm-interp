@@ -1,6 +1,8 @@
-# -*- coding: utf-8 -*-
 """
 Saliency analysis utilities for VLM information flow.
+
+Provides functions for analyzing the flow of information between different types
+of tokens (text, image, generated) using attention weights and gradients.
 """
 
 import torch
@@ -15,32 +17,23 @@ def compute_flow_metrics_optimized(
     text_indices: torch.Tensor,
     image_indices: torch.Tensor,
     target_idx: int,
-    normalize: bool = False # Optional normalization
+    normalize: bool = False
 ) -> Dict[str, float]:
     """
     Computes information flow metrics from different token types (text, image, generated)
     towards a specific target token, based on an attention or saliency matrix.
 
-    Optimized using boolean masks and tensor operations.
-
     Args:
-        attention_or_saliency_matrix (torch.Tensor): A 2D tensor [seq_len, seq_len] representing
+        attention_or_saliency_matrix: A 2D tensor [seq_len, seq_len] representing
             attention weights or saliency scores. Assumes rows are destinations (target)
-            and columns are sources. Should be on CPU or GPU.
-        text_indices (torch.Tensor): 1D tensor of indices for text tokens. Must be on the same device
-                                     as the attention/saliency matrix.
-        image_indices (torch.Tensor): 1D tensor of indices for image tokens. Must be on the same device.
-        target_idx (int): The index of the target token (row index in the matrix).
-        normalize (bool): If True, normalizes the sum metrics to represent percentages of total
-                         incoming flow to the target (from valid sources before it). Defaults to False.
+            and columns are sources.
+        text_indices: 1D tensor of indices for text tokens
+        image_indices: 1D tensor of indices for image tokens
+        target_idx: The index of the target token (row index in the matrix)
+        normalize: If True, normalizes to represent percentages of total flow
 
     Returns:
-        Dict[str, float]: A dictionary containing flow metrics:
-            - 'Stq_sum'/'Stq_mean'/'Stq_count': Text -> Target (Source text, Query target)
-            - 'Siq_sum'/'Siq_mean'/'Siq_count': Image -> Target (Source image, Query target)
-            - 'Sgq_sum'/'Sgq_mean'/'Sgq_count': Generated -> Target (Source generated/other, Query target)
-            - 'Stq_percent', 'Siq_percent', 'Sgq_percent' (if normalize=True)
-            - 'token_counts': {'text', 'image', 'generated', 'total'}
+        Dict containing flow metrics between different token types and the target
     """
     metrics: Dict[str, float] = {}
     if attention_or_saliency_matrix.ndim != 2:
@@ -60,15 +53,12 @@ def compute_flow_metrics_optimized(
     if len(text_indices) > 0: text_mask_src[text_indices] = True
     if len(image_indices) > 0: image_mask_src[image_indices] = True
     # Generated/Other mask includes tokens that are neither text nor image
-    # Important: This might include special tokens (CLS, SEP, PAD) if not excluded earlier.
     generated_mask_src = ~(text_mask_src | image_mask_src)
 
     # Causal mask: source index must be less than target index
-    # (Target cannot attend to future tokens)
     causal_mask = torch.arange(S, device=device) < target_idx
 
     # --- Extract Target Row ---
-    # We only care about attention/saliency *to* the target token
     if not (0 <= target_idx < S):
         print(f"Warning: target_idx {target_idx} is out of bounds for sequence length {S}. Returning zero metrics.")
         for prefix in ["Stq", "Siq", "Sgq"]:
@@ -96,7 +86,7 @@ def compute_flow_metrics_optimized(
             flow_mean = values.mean().item()
             metrics[f"{prefix}_sum"] = flow_sum
             metrics[f"{prefix}_mean"] = flow_mean
-            total_flow_sum_causal += flow_sum # Accumulate for normalization base
+            total_flow_sum_causal += flow_sum
         else:
             metrics[f"{prefix}_sum"] = 0.0
             metrics[f"{prefix}_mean"] = 0.0
@@ -108,13 +98,13 @@ def compute_flow_metrics_optimized(
                  metrics[f"{prefix}_percent"] = (metrics[f"{prefix}_sum"] / total_flow_sum_causal) * 100.0
         else:
              for prefix in ["Stq", "Siq", "Sgq"]:
-                 metrics[f"{prefix}_percent"] = 0.0 # Assign 0 if total flow is negligible
+                 metrics[f"{prefix}_percent"] = 0.0
 
     # --- Token Counts ---
     metrics["token_counts"] = {
         "text": text_mask_src.sum().item(),
         "image": image_mask_src.sum().item(),
-        "generated": generated_mask_src.sum().item(), # Includes non-text, non-image tokens
+        "generated": generated_mask_src.sum().item(),
         "total": S
     }
 
@@ -127,27 +117,19 @@ def calculate_saliency_scores(
 ) -> Dict[str, torch.Tensor]:
     """
     Calculate saliency scores as the element-wise absolute product
-    of attention weights and their corresponding gradients.
-
-    S = |A * dA/dL|
+    of attention weights and their corresponding gradients: S = |A * dA/dL|
 
     Args:
-        attention_weights (Dict[str, torch.Tensor]): Dictionary mapping layer names
-            to attention weight tensors (e.g., [Batch, Heads, SeqLen, SeqLen]).
-            Should require gradients if grads are expected.
-        attention_grads (Dict[str, torch.Tensor]): Dictionary mapping layer names
-            to gradient tensors w.r.t. attention weights. Must have the same
-            shape and device as the corresponding weights.
+        attention_weights: Dictionary mapping layer names to attention weight tensors
+        attention_grads: Dictionary mapping layer names to gradient tensors
 
     Returns:
-        Dict[str, torch.Tensor]: Dictionary mapping layer names to the computed
-            saliency score tensors (same shape as input attention). Tensors
-            are detached from the computation graph.
+        Dictionary mapping layer names to saliency score tensors
     """
     saliency_scores: Dict[str, torch.Tensor] = {}
     print(f"Calculating saliency scores for {len(attention_grads)} layers with gradients...")
 
-    layers_with_grads = list(attention_grads.keys()) # Iterate over copy
+    layers_with_grads = list(attention_grads.keys())
 
     for layer_name in layers_with_grads:
         if layer_name in attention_weights:
@@ -162,9 +144,6 @@ def calculate_saliency_scores(
                 print(f"  Warning: Device mismatch for layer '{layer_name}'! Weights: {attn.device}, Grad: {grad.device}. Attempting to move grad.")
                 try: grad = grad.to(attn.device)
                 except Exception as e: print(f"    Error moving gradient: {e}. Skipping layer."); continue
-            # Grad requires_grad should generally be False as it's output of backward, but check attn
-            # if not attn.requires_grad:
-            #     print(f"  Warning: Attention weights for layer '{layer_name}' do not require grad. Saliency might be zero if gradients are truly zero.")
 
             # --- Compute Saliency ---
             try:
@@ -193,21 +172,18 @@ def analyze_layerwise_saliency_flow(
 
     For each layer with a saliency score, it averages the saliency matrix over
     batch and head dimensions (if present) and then computes flow metrics
-    (Text->Target, Image->Target, Generated->Target) using `compute_flow_metrics_optimized`.
+    (Text->Target, Image->Target, Generated->Target).
 
     Args:
-        saliency_scores (Dict[str, torch.Tensor]): Dictionary mapping layer names
-            to saliency tensors (output of `calculate_saliency_scores`).
-            Expected shapes are [B, H, S, S] or [S, S] after averaging.
-        text_indices (torch.Tensor): 1D tensor of indices for text tokens.
-        image_indices (torch.Tensor): 1D tensor of indices for image tokens.
-        target_token_idx (int): The index of the target token for flow analysis.
-        cpu_offload (bool): If True, attempts to move saliency tensors to CPU before
-                           computing metrics to conserve GPU memory. Defaults to True.
+        saliency_scores: Dictionary mapping layer names to saliency tensors
+        text_indices: 1D tensor of indices for text tokens
+        image_indices: 1D tensor of indices for image tokens
+        target_token_idx: The index of the target token for flow analysis
+        cpu_offload: If True, attempts to move saliency tensors to CPU before
+                     computing metrics to conserve GPU memory
 
     Returns:
-        Dict[int, Dict[str, float]]: A dictionary mapping layer numerical index (int)
-                                     to the computed flow metrics dictionary for that layer.
+        Dictionary mapping layer numerical index to flow metrics dictionary
     """
     layer_flow_metrics: Dict[int, Dict[str, float]] = {}
     print(f"\nAnalyzing layer-wise flow based on saliency scores for target token index: {target_token_idx}")
@@ -225,7 +201,6 @@ def analyze_layerwise_saliency_flow(
     sorted_layer_names = sorted(saliency_scores.keys(), key=get_layer_num)
 
     # Ensure index tensors are on the appropriate device for metric calculation
-    # If offloading, target CPU. If not, target the device of the first saliency tensor.
     target_device = torch.device('cpu') if cpu_offload else next(iter(saliency_scores.values())).device
     print(f"  Index tensors will be moved to: {target_device}")
     try:
@@ -264,7 +239,7 @@ def analyze_layerwise_saliency_flow(
                   if text_indices.device != saliency_matrix_2d.device: text_indices = text_indices.to(saliency_matrix_2d.device)
                   if image_indices.device != saliency_matrix_2d.device: image_indices = image_indices.to(saliency_matrix_2d.device)
         elif not cpu_offload and (text_indices.device != saliency_matrix_2d.device or image_indices.device != saliency_matrix_2d.device):
-             # If *not* offloading, make sure indices match the matrix device
+             # If not offloading, make sure indices match the matrix device
              print(f"Moving index tensors to device {saliency_matrix_2d.device} for layer {layer_num}")
              try:
                  if text_indices.device != saliency_matrix_2d.device: text_indices = text_indices.to(saliency_matrix_2d.device)
@@ -288,7 +263,7 @@ def analyze_layerwise_saliency_flow(
         except Exception as e:
             print(f"Error computing flow metrics for layer {layer_num} ('{layer_name}'): {e}")
             import traceback
-            traceback.print_exc() # Print details
+            traceback.print_exc()
 
         # --- Cleanup ---
         del saliency_matrix_2d # Explicitly delete the potentially large 2D matrix
