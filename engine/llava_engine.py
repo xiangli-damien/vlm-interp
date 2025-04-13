@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Defines the LLaVANextEngine class for interacting with LLaVA-Next models.
-
-This engine handles model loading, input preparation, and text generation.
-It relies on utility functions for tasks like model loading and data handling.
 """
 
 import torch
@@ -21,30 +18,16 @@ from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
 class LLaVANextEngine:
     """
     A VLM engine specifically designed for LLaVA-Next models.
-
-    Provides methods for loading models, processing inputs, generating responses,
-    and accessing model-specific information like attention layer names.
-    It separates core model interaction from the analysis logic.
     """
     def __init__(
         self,
-        model_id: str = "llava-hf/llava-v1.6-mistral-7b-hf", # Changed default to mistral as used often in notebook
+        model_id: str = "llava-hf/llava-v1.6-mistral-7b-hf",
         device: Optional[str] = None,
         load_in_4bit: bool = False,
         use_flash_attn: bool = False,
         enable_gradients: bool = False
     ):
-        """
-        Initialize the LLaVA engine.
-
-        Args:
-            model_id (str): HuggingFace model ID for a LLaVA-Next model.
-            device (Optional[str]): Target device ('cuda', 'cpu', etc.). Auto-detected if None.
-            load_in_4bit (bool): Whether to use 4-bit quantization (requires CUDA and bitsandbytes).
-                                 Gradients will be disabled if True unless enable_gradients is also True (though 4-bit grad support is limited).
-            use_flash_attn (bool): Whether to attempt using Flash Attention 2 for optimization (requires compatible hardware and installation).
-            enable_gradients (bool): Whether to enable gradient computation for the model parameters. If loading in 4-bit, this might have limited effect or raise errors depending on the setup.
-        """
+        
         self.model_id = model_id
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.processor: Optional[LlavaNextProcessor] = None
@@ -66,9 +49,6 @@ class LLaVANextEngine:
     def _load_model(self, enable_gradients: bool):
         """
         Internal method to load the model and processor using the utility function.
-
-        Args:
-            enable_gradients (bool): The effective flag determining if gradients should be enabled during model loading.
         """
         print(f"Engine attempting to load model '{self.model_id}'...")
         try:
@@ -116,22 +96,6 @@ class LLaVANextEngine:
     ) -> Dict[str, torch.Tensor]:
         """
         Build model inputs from an image and a text prompt.
-
-        Handles image loading (if path/URL provided) and uses the processor
-        to create the final input dictionary for the model.
-
-        Args:
-            image (Union[str, Image.Image]): PIL Image object or path/URL to an image.
-            prompt (str): Text prompt to accompany the image.
-            conversation_format (bool): Whether to use the LLaVA conversation format. Defaults to True.
-
-        Returns:
-            Dict[str, torch.Tensor]: Dictionary of model inputs ('input_ids', 'attention_mask', 'pixel_values', etc.), moved to the engine's device.
-
-        Raises:
-            ValueError: If the model or processor is not loaded.
-            FileNotFoundError: If image path is invalid.
-            requests.exceptions.RequestException: If image URL is invalid or download fails.
         """
         if self.model is None or self.processor is None:
             raise ValueError("Model and processor must be loaded before building inputs.")
@@ -316,15 +280,7 @@ class LLaVANextEngine:
 
     def get_attention_layer_names(self) -> List[str]:
         """
-        Get the names of the attention modules within the language model component.
-
-        Relies on the utility function `get_llm_attention_layer_names`.
-
-        Returns:
-            List[str]: A list of attention layer names (e.g., 'language_model.model.layers.0.self_attn').
-
-        Raises:
-            ValueError: If the model is not loaded.
+        Returns the names of attention layers in the model.
         """
         if self.model is None:
             raise ValueError("Model must be loaded before getting attention layer names.")

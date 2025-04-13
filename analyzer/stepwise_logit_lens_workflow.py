@@ -80,11 +80,9 @@ def run_stepwise_logit_lens_workflow(
 
     try:
         # 1. Instantiate the analyzer core (reused for its methods)
-        # We don't need gradients for Logit Lens itself
         analyzer = LLaVANextLogitLensAnalyzer(model, processor)
 
         # 2. Prepare Initial Inputs and Static Data
-        # Use the analyzer's preparation method
         print("Preparing initial inputs and feature mapping...")
         initial_input_data = analyzer.prepare_inputs(image_source, prompt_text)
         if not initial_input_data:

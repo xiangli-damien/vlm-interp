@@ -1,10 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Logit Lens analysis implementation for LLaVA-Next models.
-
-This analyzer extracts hidden states from each layer of the model, projects them
-through the language model head to obtain token probabilities (logits lens),
-and organizes this data for visualization, focusing on specific concept tokens.
 """
 
 import math
@@ -43,25 +39,9 @@ from utils.visual_utils import visualize_token_probabilities
 class LLaVANextLogitLensAnalyzer:
     """
     Analyzer for applying the logit lens technique to LLaVA-Next models.
-
-    This analyzer extracts hidden states from each layer, projects them to the
-    vocabulary space using the LM head, and computes probabilities for tracked
-    concept tokens across different image feature representations (base and spatial patches).
-    It prepares the data necessary for visualization via `visualize_token_probabilities`.
-
-    Handles the specific image processing logic of LLaVA-Next (base features,
-    spatial patches with unpadding) to correctly map token probabilities back
-    to spatial locations on the processed image.
     """
 
     def __init__(self, model: LlavaNextForConditionalGeneration, processor: LlavaNextProcessor):
-        """
-        Initialize the analyzer with a LLaVA-Next model and processor.
-
-        Args:
-            model (LlavaNextForConditionalGeneration): A loaded LLaVA-Next model instance.
-            processor (LlavaNextProcessor): The corresponding LLaVA-Next processor instance.
-        """
         if not isinstance(model, LlavaNextForConditionalGeneration):
              print(f"Warning: Model provided is type {type(model)}, expected LlavaNextForConditionalGeneration.")
         if not isinstance(processor, LlavaNextProcessor):
@@ -71,8 +51,6 @@ class LLaVANextLogitLensAnalyzer:
         self.processor = processor
         self.device = model.device
 
-        # Extract configuration parameters needed for mapping and processing
-        # Use getattr for safe access with defaults
         self.image_token_id = getattr(model.config, "image_token_index", None)
         if self.image_token_id is None: # Fallback if not in config
              try:
@@ -116,30 +94,7 @@ class LLaVANextLogitLensAnalyzer:
     # Feature Mapping Logic (Handles LLaVA-Next Base + Spatial Patches)
     # --------------------------------------------------------------------------
     def create_feature_mapping(self, image_spans: List[Tuple[int, int]], image_size_orig_hw: Tuple[int, int]) -> Dict[str, Any]:
-        """
-        Create a mapping from token indices within image spans to their conceptual spatial grid positions.
 
-        Handles LLaVA-Next's base (fixed grid) and spatial patch features, accounting for the
-        model's internal unpadding and potential newline tokens based on image aspect ratio and resolution.
-        Provides necessary info for visualization alignment.
-
-        Args:
-            image_spans (List[Tuple[int, int]]): List of (start, end) indices for image token spans
-                                                  (output of `find_image_token_spans`).
-            image_size_orig_hw (Tuple[int, int]): Original image size (Height, Width).
-
-        Returns:
-            Dict[str, Any]: A dictionary containing mapping information:
-                - 'base_feature': {'start_idx', 'end_idx', 'grid': (H, W), 'positions': {token_idx: (row, col)}}
-                - 'patch_feature': {'start_idx', 'end_idx', 'grid_for_visualization': (H_pad, W_pad),
-                                    'grid_unpadded': (H_unpad, W_unpad), 'positions': {token_idx: (row, col)}}
-                - 'newline_feature': {'start_idx', 'end_idx', 'positions': {token_idx: row_idx}}
-                - 'patch_size': Raw vision patch size (e.g., 14).
-                - 'original_size': Original image size (W, H).
-                - 'best_resolution': Target resolution selected (W, H).
-                - 'padded_dimensions': Dimensions after padding (W, H).
-                - 'resized_dimensions': Dimensions after aspect-ratio preserving resize (W, H).
-        """
         if not image_spans:
             print("Error: No image spans found, cannot create feature mapping.")
             return {}
@@ -360,16 +315,6 @@ class LLaVANextLogitLensAnalyzer:
     # Core Analysis Steps
     # --------------------------------------------------------------------------
     def compute_spatial_preview_image(self, image: Image.Image) -> Image.Image:
-        """
-        Computes the 'spatial preview image' - the result of resizing and padding
-        the original image as it would be processed for the spatial patch features.
-
-        Args:
-            image (Image.Image): The original PIL Image object (RGB format assumed).
-
-        Returns:
-            Image.Image: The spatial preview PIL Image.
-        """
         print("Computing spatial preview image (resized + padded)...")
         if image.mode != "RGB": image = image.convert("RGB")
         image_np = to_numpy_array(image)
@@ -399,18 +344,6 @@ class LLaVANextLogitLensAnalyzer:
         return spatial_preview
 
     def prepare_inputs(self, image_source: Union[str, Image.Image], prompt_text: str) -> Dict[str, Any]:
-        """
-        Prepare model inputs, feature mappings, and supporting data for analysis.
-
-        Args:
-            image_source (Union[str, Image.Image]): PIL image, URL string, or local file path string.
-            prompt_text (str): The text prompt string.
-
-        Returns:
-            Dict[str, Any]: Dictionary containing 'inputs' (for model), 'image_spans', 'image_mask',
-                            'feature_mapping', 'original_size', 'original_image', 'spatial_preview_image',
-                            'prompt_text'. Returns empty dict on failure.
-        """
         print("Preparing inputs for Logit Lens analysis...")
         try:
             # Use util.load_image
@@ -458,16 +391,6 @@ class LLaVANextLogitLensAnalyzer:
              return {}
 
     def extract_hidden_states(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, Any]:
-        """
-        Run a forward pass to extract hidden states from all layers and get sample output text.
-
-        Args:
-            inputs (Dict[str, torch.Tensor]): Model inputs from `prepare_inputs`.
-
-        Returns:
-            Dict[str, Any]: Dictionary with 'hidden_states' (tuple), 'logits' (tensor),
-                            'generated_text' (str). Returns empty dict on failure.
-        """
         print(f"Extracting hidden states from all {self.num_layers + 1} layers (incl. embeddings)...")
         self.model.eval()
         results = {}
@@ -517,21 +440,6 @@ class LLaVANextLogitLensAnalyzer:
         concepts_to_track: Optional[Dict[str, List[int]]] = None, # Dict: concept -> token_ids
         cpu_offload: bool = True
     ) -> Dict[int, Dict[str, Any]]:
-        """
-        Projects hidden states from each layer through the LM head to get token probabilities
-        for specified concepts, organized by layer and feature type (base, patch, newline).
-
-        Args:
-            input_data (Dict[str, Any]): Data from `prepare_inputs`, must include 'feature_mapping'.
-            outputs (Dict[str, Any]): Data from `extract_hidden_states`, must include 'hidden_states'.
-            concepts_to_track (Optional[Dict[str, List[int]]]): Dictionary mapping concept strings
-                to lists of their corresponding token IDs. If None or empty, returns empty results.
-            cpu_offload (bool): If True, moves probability tensors to CPU after computation.
-
-        Returns:
-            Dict[int, Dict[str, Any]]: Nested dictionary: {layer_idx: {'base_feature': {concept: np.array}, ...}}.
-                                       Returns empty dict if no concepts are tracked or errors occur.
-        """
         print("Extracting token probabilities (Logit Lens)...")
         if not concepts_to_track:
             print("  Warning: No concepts_to_track provided. Cannot extract probabilities.")

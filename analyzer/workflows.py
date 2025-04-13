@@ -2,8 +2,6 @@
 """
 End-to-end analysis workflow functions.
 
-These functions orchestrate the use of engine, analyzer components, and utilities
-to perform standard analysis procedures like Logit Lens or Saliency Flow analysis.
 """
 
 import torch

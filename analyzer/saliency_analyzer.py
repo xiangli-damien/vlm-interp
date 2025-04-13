@@ -1,12 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Saliency analysis utilities for VLM information flow.
-
-Includes functions for:
-- Calculating saliency scores from attention weights and gradients.
-- Computing information flow metrics (e.g., Text->Target, Image->Target)
-  based on attention or saliency matrices.
-- Analyzing layer-wise flow based on saliency scores.
 """
 
 import torch
@@ -15,7 +9,6 @@ import gc
 from typing import Dict, Any, Optional, List, Tuple, Union
 from tqdm import tqdm
 
-# Note: This analyzer typically operates on data captured by hook_utils.GradientAttentionCapture
 
 def compute_flow_metrics_optimized(
     attention_or_saliency_matrix: torch.Tensor,
