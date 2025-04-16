@@ -25,9 +25,12 @@ except ImportError:
 # Workflow Functions
 from analyzer.workflows import (
     run_logit_lens_workflow,
-    run_saliency_workflow
+    run_saliency_workflow,
+    run_semantic_tracing_experiment  # Add the new workflow function
 )
 
+# Semantic Tracing Analyzer
+from analyzer.semantic_tracing import SemanticTracer
 
 __all__ = [
     # Analyzers & Components
@@ -35,10 +38,12 @@ __all__ = [
     "calculate_saliency_scores",
     "analyze_layerwise_saliency_flow",
     "compute_flow_metrics_optimized",
+    "SemanticTracer",  # Add the new analyzer class
     
     # Workflows
     "run_logit_lens_workflow",
     "run_saliency_workflow",
+    "run_semantic_tracing_experiment",  # Add the new workflow function
 ]
 
 # Add stepwise_logit_lens_workflow if available

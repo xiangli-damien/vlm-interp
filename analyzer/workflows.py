@@ -22,10 +22,10 @@ from analyzer.saliency import (
 
 # Import utilities
 from utils.data_utils import load_image, build_conversation, find_token_indices
-from utils.model_utils import get_llm_attention_layer_names
+from utils.model_utils import get_llm_attention_layer_names, load_model
 from utils.hook_utils import GradientAttentionCapture
 from utils.viz_utils import visualize_token_probabilities, visualize_information_flow
-
+from analyzer.semantic_tracing import SemanticTracer
 
 def run_logit_lens_workflow(
     model: torch.nn.Module,
@@ -336,3 +336,91 @@ def run_saliency_workflow(
         final_results["error"] = str(e)
 
     return final_results
+
+def run_semantic_tracing_experiment(
+    model_id: str = "llava-hf/llava-v1.6-mistral-7b-hf",
+    image_path: str = None, 
+    prompt: str = "What can you see in this image?",
+    output_dir: str = "semantic_tracing_results",
+    top_k: int = 3,
+    num_tokens: int = 1,
+    use_4bit: bool = True,
+    target_token_idx: Optional[int] = None,
+    image_size: Tuple[int, int] = (224, 224),  # Reduced size to save memory
+    concepts_to_track: Optional[List[str]] = None
+):
+    """
+    Run a complete semantic tracing experiment.
+    
+    Args:
+        model_id: HuggingFace model ID for LLaVA-Next
+        image_path: Path to the image file
+        prompt: Text prompt to use
+        output_dir: Directory to save results
+        top_k: Number of top contributing tokens to track at each step
+        num_tokens: Number of tokens to generate if target_token_idx is None
+        use_4bit: Whether to load the model in 4-bit precision
+        target_token_idx: Index of specific token to analyze (if None, uses first generated token)
+        image_size: Size to resize the image to
+        concepts_to_track: List of concepts to track with logit lens
+    
+    Returns:
+        Dictionary with experiment results
+    """
+    from utils.data_utils import load_image
+    from utils.model_utils import load_model
+    import time
+    
+    start_time = time.time()
+    print(f"=== Starting Semantic Tracing Experiment ===")
+    print(f"Model: {model_id}")
+    print(f"Image: {image_path}")
+    print(f"Prompt: {prompt}")
+    print(f"Output Directory: {output_dir}")
+    
+    # 1. Load model and processor
+    print("\nLoading model and processor...")
+    model, processor = load_model(
+        model_id=model_id,
+        load_in_4bit=use_4bit, 
+        enable_gradients=True
+    )
+    
+    # 2. Load image
+    print("\nLoading image...")
+    image = load_image(image_path, resize_to=image_size)
+    
+    # 3. Create semantic tracer
+    tracer = SemanticTracer(
+        model=model,
+        processor=processor,
+        top_k=top_k,
+        output_dir=output_dir,
+        logit_lens_concepts=concepts_to_track
+    )
+    
+    # 4. Prepare inputs
+    print("\nPreparing inputs...")
+    input_data = tracer.prepare_inputs(image, prompt)
+    
+    # 5. Run semantic tracing
+    print("\nRunning semantic tracing...")
+    trace_results = tracer.generate_and_analyze(
+        input_data=input_data,
+        target_token_idx=target_token_idx,
+        num_tokens=num_tokens
+    )
+    
+    # 6. Visualize results
+    print("\nVisualizing results...")
+    visualization_paths = tracer.visualize_trace(trace_results)
+    
+    # 7. Add visualization paths to results
+    trace_results["visualization_paths"] = visualization_paths
+    
+    end_time = time.time()
+    print(f"\n=== Experiment Complete ===")
+    print(f"Total time: {end_time - start_time:.2f} seconds")
+    print(f"Results saved to: {output_dir}")
+    
+    return trace_results
