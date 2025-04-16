@@ -23,8 +23,7 @@ from transformers.image_utils import (
     to_numpy_array
 )
 import gc
-from utils.data_utils import load_image, get_image_token_spans, get_token_masks
-
+from utils.data_utils import build_formatted_prompt, load_image, get_image_token_spans, get_token_masks
 class LLaVANextLogitLensAnalyzer:
     """
     Analyzer for applying the logit lens technique to LLaVA-Next models.
@@ -381,46 +380,26 @@ class LLaVANextLogitLensAnalyzer:
         return spatial_preview
 
     def prepare_inputs(self, image_source: Union[str, Image.Image], prompt_text: str) -> Dict[str, Any]:
-        """
-        Prepares input data for logit lens analysis.
-        
-        Args:
-            image_source: PIL image, URL, or local file path
-            prompt_text: Text prompt for the model
-            
-        Returns:
-            Dictionary containing all prepared inputs and metadata
-        """
-        print("Preparing inputs for Logit Lens analysis...")
         try:
-            # Load image
+            # 1. Load image and get size
             original_image = load_image(image_source, resize_to=None, convert_mode="RGB", verbose=False)
             original_size_hw = (original_image.height, original_image.width)
-            print(f"  Original image loaded. Size HxW: {original_size_hw}")
-
-            # Format prompt using chat template
-            conversation = [{"role": "user", "content": [{"type": "text", "text": prompt_text}, {"type": "image"}]}]
-            try: formatted_prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
-            except Exception as e:
-                print(f"  Warning: Using basic prompt format due to chat template error: {e}")
-                image_token = getattr(self.processor, "image_token", "<image>")
-                formatted_prompt = f"USER: {image_token}\n{prompt_text} ASSISTANT:"
-
-            # Process inputs
+            # 2. Format prompt with chat template (fallback to basic format if needed)
+            formatted_prompt = build_formatted_prompt(self.processor, prompt_text)
+            # 3. Process image and text into model inputs
             inputs = self.processor(images=original_image, text=formatted_prompt, return_tensors="pt").to(self.device)
             input_ids = inputs.get("input_ids")
-            if input_ids is None: raise ValueError("Processor did not return 'input_ids'.")
-            print(f"  Inputs processed by processor. Input IDs shape: {input_ids.shape}")
-
-            # Find image tokens and create mapping
+            if input_ids is None:
+                raise RuntimeError("Processor failed to return 'input_ids'.")
+            # 4. Extract image patch token span and mask
             image_spans = get_image_token_spans(input_ids, self.image_token_id)
             _, image_mask = get_token_masks(input_ids, self.image_token_id)
+            # 5. Map token position to image grid
             feature_mapping = self.create_feature_mapping(image_spans, original_size_hw)
-            if not feature_mapping: raise ValueError("Failed to create feature mapping.")
-
-            # Compute the spatial preview image
+            if not feature_mapping:
+                raise RuntimeError("Feature mapping is empty or invalid.")
+            # 6. Optional preview image for patch visualization
             spatial_preview_image = self.compute_spatial_preview_image(original_image)
-
             return {
                 "inputs": inputs,
                 "image_spans": image_spans,
@@ -431,22 +410,14 @@ class LLaVANextLogitLensAnalyzer:
                 "spatial_preview_image": spatial_preview_image,
                 "prompt_text": prompt_text
             }
-
         except Exception as e:
-             print(f"Error during input preparation: {e}")
-             import traceback; traceback.print_exc()
-             return {}
+            print(f"[Error] Failed to prepare inputs: {e}")
+            import traceback; traceback.print_exc()
+            return {}
+
 
     def extract_hidden_states(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, Any]:
-        """
-        Extracts hidden states from all model layers.
         
-        Args:
-            inputs: Dictionary of model inputs from processor
-            
-        Returns:
-            Dictionary containing hidden states and generated text
-        """
         print(f"Extracting hidden states from all {self.num_layers + 1} layers (incl. embeddings)...")
         self.model.eval()
         results = {}

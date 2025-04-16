@@ -21,11 +21,11 @@ from analyzer.saliency import (
 )
 
 # Import utilities
-from utils.data_utils import load_image, build_conversation, find_token_indices
+from utils.data_utils import get_token_indices, load_image, build_conversation
 from utils.model_utils import get_llm_attention_layer_names, load_model
 from utils.hook_utils import GradientAttentionCapture
 from utils.viz_utils import visualize_token_probabilities, visualize_information_flow
-from analyzer.semantic_tracing import SemanticTracer
+from analyzer.semantic_tracing import EnhancedSemanticTracer
 
 def run_logit_lens_workflow(
     model: torch.nn.Module,
@@ -207,7 +207,7 @@ def run_saliency_workflow(
         pixel_values = inputs["pixel_values"]
         image_sizes = inputs.get("image_sizes")
         image_token_id = getattr(model.config, "image_token_index", 32000)
-        text_indices, image_indices = find_token_indices(initial_input_ids, image_token_id)
+        text_indices, image_indices = get_token_indices(initial_input_ids, image_token_id)
         all_attn_layer_names = get_llm_attention_layer_names(model)
         if not all_attn_layer_names: raise ValueError("Could not find attention layers.")
         print(f" Found {len(all_attn_layer_names)} attention layers.")
@@ -347,10 +347,12 @@ def run_semantic_tracing_experiment(
     use_4bit: bool = True,
     target_token_idx: Optional[int] = None,
     image_size: Tuple[int, int] = (224, 224),  # Reduced size to save memory
-    concepts_to_track: Optional[List[str]] = None
+    concepts_to_track: Optional[List[str]] = None,
+    normalize_weights: bool = True,
+    debug: bool = False
 ):
     """
-    Run a complete semantic tracing experiment.
+    Run a complete semantic tracing experiment, with support for multi-token analysis.
     
     Args:
         model_id: HuggingFace model ID for LLaVA-Next
@@ -358,11 +360,13 @@ def run_semantic_tracing_experiment(
         prompt: Text prompt to use
         output_dir: Directory to save results
         top_k: Number of top contributing tokens to track at each step
-        num_tokens: Number of tokens to generate if target_token_idx is None
+        num_tokens: Number of tokens to generate and analyze
         use_4bit: Whether to load the model in 4-bit precision
         target_token_idx: Index of specific token to analyze (if None, uses first generated token)
         image_size: Size to resize the image to
         concepts_to_track: List of concepts to track with logit lens
+        normalize_weights: Whether to normalize token importance weights between layers
+        debug: Whether to print additional debug information
     
     Returns:
         Dictionary with experiment results
@@ -377,6 +381,7 @@ def run_semantic_tracing_experiment(
     print(f"Image: {image_path}")
     print(f"Prompt: {prompt}")
     print(f"Output Directory: {output_dir}")
+    print(f"Number of tokens to analyze: {num_tokens}")
     
     # 1. Load model and processor
     print("\nLoading model and processor...")
@@ -390,26 +395,35 @@ def run_semantic_tracing_experiment(
     print("\nLoading image...")
     image = load_image(image_path, resize_to=image_size)
     
-    # 3. Create semantic tracer
-    tracer = SemanticTracer(
+    # 3. Create Enhanced semantic tracer
+    tracer = EnhancedSemanticTracer(
         model=model,
         processor=processor,
         top_k=top_k,
         output_dir=output_dir,
-        logit_lens_concepts=concepts_to_track
+        logit_lens_concepts=concepts_to_track,
+        normalize_weights=normalize_weights,
+        debug=debug
     )
     
     # 4. Prepare inputs
     print("\nPreparing inputs...")
     input_data = tracer.prepare_inputs(image, prompt)
     
-    # 5. Run semantic tracing
+    # 5. Run semantic tracing - handling multiple tokens if requested
     print("\nRunning semantic tracing...")
-    trace_results = tracer.generate_and_analyze(
-        input_data=input_data,
-        target_token_idx=target_token_idx,
-        num_tokens=num_tokens
-    )
+    if num_tokens > 1 and target_token_idx is None:
+        print(f"Analyzing {num_tokens} consecutive tokens...")
+        trace_results = tracer.generate_and_analyze_multiple(
+            input_data=input_data,
+            num_tokens=num_tokens
+        )
+    else:
+        trace_results = tracer.generate_and_analyze(
+            input_data=input_data,
+            target_token_idx=target_token_idx,
+            num_tokens=num_tokens if target_token_idx is None else 1
+        )
     
     # 6. Visualize results
     print("\nVisualizing results...")

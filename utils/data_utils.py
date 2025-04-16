@@ -140,102 +140,14 @@ def build_conversation(prompt_text: str, conversation_format: bool = True) -> Un
         # Simpler format (less common for LLaVA-Next)
         print("Warning: Using non-standard simple string format for conversation.")
         return prompt_text
-
-
-def find_token_indices(input_ids: torch.Tensor, image_token_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Separates input token IDs into text and image token indices.
-
-    Args:
-        input_ids: Tensor of token IDs [1, sequence_length]
-        image_token_id: Token ID for image tokens
-
-    Returns:
-        (text_indices, image_indices): Tensors of indices
-    """
-    if input_ids.dim() != 2 or input_ids.shape[0] != 1:
-        raise ValueError(f"Expected input_ids tensor with shape [1, sequence_length], but got {input_ids.shape}")
-
-    # Keep tensors on the same device
-    device = input_ids.device
-
-    # Flatten to 1D for easier processing
-    input_ids_1d = input_ids[0]
-
-    # Create boolean masks
-    is_image_mask = (input_ids_1d == image_token_id)
-    is_text_mask = ~is_image_mask
-
-    # Find indices where masks are True
-    text_indices = torch.where(is_text_mask)[0]
-    image_indices = torch.where(is_image_mask)[0]
-
-    print(f"Found {len(text_indices)} text tokens and {len(image_indices)} image tokens using ID {image_token_id}.")
-
-    return text_indices, image_indices
-
-
-def find_image_token_spans(input_ids: torch.Tensor, image_token_id: int) -> List[Tuple[int, int]]:
-    """
-    Finds contiguous spans (start and end indices) of image tokens in the input sequence.
-
-    Args:
-        input_ids: Tensor of token IDs [1, sequence_length]
-        image_token_id: Token ID for image tokens
-
-    Returns:
-        List of (start_index, end_index) tuples
-    """
-    if input_ids.dim() != 2 or input_ids.shape[0] != 1:
-        raise ValueError(f"Expected input_ids tensor with shape [1, sequence_length], but got {input_ids.shape}")
-
-    device = input_ids.device
-    input_ids_1d = input_ids[0]
-
-    # Create boolean mask for image tokens
-    image_mask = (input_ids_1d == image_token_id)
-    num_image_tokens = image_mask.sum().item()
-
-    if num_image_tokens == 0:
-        print(f"Warning: Image token ID {image_token_id} not found in the input sequence.")
-        return []
-
-    print(f"Found {num_image_tokens} image tokens with ID {image_token_id}. Identifying spans...")
-
-    # Pad the mask with False at both ends to correctly detect transitions at boundaries
-    padded_mask = torch.cat([
-        torch.tensor([False], device=device),
-        image_mask,
-        torch.tensor([False], device=device)
-    ])
-
-    # Find indices where the mask value changes (False->True or True->False)
-    diff = padded_mask[1:].int() - padded_mask[:-1].int()
-    change_indices = torch.where(diff != 0)[0]
-
-    spans = []
-    # Iterate through change indices in pairs
-    for i in range(0, len(change_indices), 2):
-         # Ensure we have a pair of changes (start and end)
-        if i + 1 < len(change_indices):
-            start_idx = change_indices[i].item()
-            end_idx = change_indices[i+1].item() - 1
-
-            # Sanity check
-            if diff[start_idx] == 1 and diff[end_idx + 1] == -1:
-                span_len = end_idx - start_idx + 1
-                if span_len > 0:
-                     spans.append((start_idx, end_idx))
-                     print(f"  Detected image token span: Indices {start_idx} to {end_idx} (Length: {span_len})")
-                else:
-                     print(f"  Warning: Detected zero-length span at index {start_idx}. Ignoring.")
-            else:
-                 print(f"  Warning: Unexpected transition pattern detected near index {start_idx}. Check input_ids.")
-
-    if not spans:
-        print("Warning: Found image tokens, but could not form valid contiguous spans.")
-
-    return spans
+    
+def build_formatted_prompt(processor, prompt_text: str) -> str:
+    conversation = build_conversation(prompt_text)
+    try:
+        return processor.apply_chat_template(conversation, add_generation_prompt=True)
+    except Exception:
+        image_token = getattr(processor, "image_token", "<image>")
+        return f"USER: {image_token}\n{prompt_text} ASSISTANT:"
 
 
 def get_token_masks(input_ids: torch.Tensor, image_token_id: int) -> Tuple[torch.Tensor, torch.Tensor]:

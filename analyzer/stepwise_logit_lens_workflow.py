@@ -19,12 +19,12 @@ from typing import Dict, Any, Optional, Union, List, Tuple
 # --- Imports from existing project components ---
 # Analyzers
 # Assuming analyzer is in the same directory level or accessible via python path
-from analyzer.logit_lens_analyzer import LLaVANextLogitLensAnalyzer
+from analyzer.logit_lens import LLaVANextLogitLensAnalyzer
 # Utils
 # Assuming utils are in a 'utils' directory relative to this file's parent
 # Adjust path if structure is different (e.g., from ..utils import ...)
 try:
-    from utils.visual_utils import visualize_token_probabilities
+    from utils.viz_utils import visualize_token_probabilities
     from utils.data_utils import get_token_indices # If needed, though analyzer handles it
 except ImportError:
     print("Warning: Could not import required components in stepwise_logit_lens_workflow.py")

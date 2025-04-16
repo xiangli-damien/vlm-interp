@@ -30,7 +30,7 @@ from analyzer.workflows import (
 )
 
 # Semantic Tracing Analyzer
-from analyzer.semantic_tracing import SemanticTracer
+from analyzer.semantic_tracing import EnhancedSemanticTracer
 
 __all__ = [
     # Analyzers & Components
@@ -38,7 +38,7 @@ __all__ = [
     "calculate_saliency_scores",
     "analyze_layerwise_saliency_flow",
     "compute_flow_metrics_optimized",
-    "SemanticTracer",  # Add the new analyzer class
+    "EnhancedSemanticTracer",  # Add the new analyzer class
     
     # Workflows
     "run_logit_lens_workflow",
