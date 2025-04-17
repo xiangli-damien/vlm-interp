@@ -2532,15 +2532,12 @@ class EnhancedSemanticTracer:
         # Track the current set of tokens for each layer
         current_layer_tokens = {}
         
-        # Loop through each layer from deepest to shallowest
+        # First pass: add all target tokens to establish layer positions
         for layer_idx in reversed(layers):
             layer_data = trace_results[layer_idx]
-            layer_name = layer_data.get("layer_name", f"Layer {layer_idx}")
-            
-            # Track tokens in this layer
             current_layer_tokens[layer_idx] = []
             
-            # Process each target token in this layer
+            # Only process targets on first pass
             for target in layer_data.get("target_tokens", []):
                 target_token_idx = target.get("index")
                 if target_token_idx is None:
@@ -2580,8 +2577,59 @@ class EnhancedSemanticTracer:
                 if target_token_idx not in token_to_node:
                     token_to_node[target_token_idx] = {}
                 token_to_node[target_token_idx][layer_idx] = node_id
+        
+        # Calculate positions for target nodes first
+        pos = {}
+        layer_widths = {}
+        layer_heights = []
+        
+        # Calculate width for each layer based on target tokens
+        for layer_idx in layers:
+            if layer_idx in current_layer_tokens:
+                layer_nodes = current_layer_tokens[layer_idx]
+                layer_widths[layer_idx] = max(len(layer_nodes), 1)
+                layer_heights.append(len(layer_nodes))
+        
+        # Position nodes in each layer
+        x_spacing = 1.0
+        y_spacing = 1.0
+        
+        # Calculate the widest layer
+        max_width = max(layer_widths.values()) if layer_widths else 1
+        
+        # First pass: position target nodes
+        for layer_idx in layers:
+            if layer_idx in current_layer_tokens:
+                layer_nodes = current_layer_tokens[layer_idx]
                 
-                # Process sources for this target
+                # Calculate horizontal position for this layer
+                layer_x = layers.index(layer_idx) * x_spacing
+                
+                # Calculate vertical positions for nodes in this layer
+                layer_width = layer_widths[layer_idx]
+                num_nodes = len(layer_nodes)
+                
+                if num_nodes > 0:
+                    # Calculate vertical spacing to center nodes
+                    total_height = (num_nodes - 1) * y_spacing
+                    start_y = -total_height / 2
+                    
+                    for i, node_id in enumerate(layer_nodes):
+                        pos[node_id] = (layer_x, start_y + i * y_spacing)
+        
+        # Second pass: add sources and connect targets
+        for layer_idx in reversed(layers):
+            layer_data = trace_results[layer_idx]
+            
+            # Process each target token and its sources
+            for target in layer_data.get("target_tokens", []):
+                target_token_idx = target.get("index")
+                if target_token_idx is None:
+                    continue
+                    
+                node_id = f"L{layer_idx}_T{target_token_idx}"
+                
+                # Now process sources for this target
                 for source in target.get("sources", []):
                     source_idx = source.get("index")
                     if source_idx is None:
@@ -2621,55 +2669,62 @@ class EnhancedSemanticTracer:
                         
                         # Add node to graph
                         G.add_node(source_node_id)
+                        
+                        # Important: Add to current layer tokens for counting
+                        current_layer_tokens[layer_idx].append(source_node_id)
+                        
+                        # Position the source node near its target
+                        if node_id in pos:
+                            # Get target position
+                            target_x, target_y = pos[node_id]
+                            
+                            # Position source node slightly offset from target
+                            # Check if there are already other sources for this target
+                            existing_sources = [n for n in current_layer_tokens[layer_idx] 
+                                            if n.startswith(f"L{layer_idx}_S") and n != source_node_id]
+                            
+                            # Calculate offset based on number of existing sources
+                            offset = len(existing_sources) * 0.2 + 0.2
+                            pos[source_node_id] = (target_x - 0.3, target_y - offset)
+                        else:
+                            # Fallback position if target has no position (shouldn't happen)
+                            layer_x = layers.index(layer_idx) * x_spacing
+                            source_y = -(len(current_layer_tokens[layer_idx]) - 1) * y_spacing / 2
+                            pos[source_node_id] = (layer_x - 0.3, source_y)
+                        
+                        # Now that the source node exists and is positioned, create edge
+                        G.add_edge(
+                            source_node_id,
+                            node_id,
+                            weight=source.get("scaled_weight", 0.0),
+                            saliency=source.get("saliency_score", 0.0)
+                        )
+                        
                     else:
                         # Source found in a previous layer
                         source_node_id = token_to_node[source_idx][source_layer]
-                    
-                    # Add edge from source to target with saliency weight
-                    G.add_edge(
-                        source_node_id,
-                        node_id,
-                        weight=source.get("scaled_weight", 0.0),
-                        saliency=source.get("saliency_score", 0.0)
-                    )
+                        
+                        # Add edge from source to target with saliency weight
+                        G.add_edge(
+                            source_node_id,
+                            node_id,
+                            weight=source.get("scaled_weight", 0.0),
+                            saliency=source.get("saliency_score", 0.0)
+                        )
         
-        # Position nodes by layer
-        pos = {}
-        layer_widths = {}
-        layer_heights = []
-        
-        # Calculate width for each layer based on number of nodes
-        for layer_idx in layers:
-            if layer_idx in current_layer_tokens:
-                layer_nodes = current_layer_tokens[layer_idx]
-                layer_widths[layer_idx] = max(len(layer_nodes), 1)
-                layer_heights.append(len(layer_nodes))
-        
-        # Position nodes in each layer
-        x_spacing = 1.0
-        y_spacing = 1.0
-        
-        # Calculate the widest layer
-        max_width = max(layer_widths.values()) if layer_widths else 1
-        
-        for layer_idx in layers:
-            if layer_idx in current_layer_tokens:
-                layer_nodes = current_layer_tokens[layer_idx]
-                
-                # Calculate horizontal position for this layer
-                layer_x = layers.index(layer_idx) * x_spacing
-                
-                # Calculate vertical positions for nodes in this layer
-                layer_width = layer_widths[layer_idx]
-                num_nodes = len(layer_nodes)
-                
-                if num_nodes > 0:
-                    # Calculate vertical spacing to center nodes
-                    total_height = (num_nodes - 1) * y_spacing
-                    start_y = -total_height / 2
-                    
-                    for i, node_id in enumerate(layer_nodes):
-                        pos[node_id] = (layer_x, start_y + i * y_spacing)
+        # Verify all nodes have positions
+        for node in G.nodes():
+            if node not in pos:
+                print(f"Warning: Node '{node}' has no position assigned. Adding default position.")
+                # Add a default position
+                layer_prefix = node.split('_')[0][1:]  # Extract layer number from L{layer}_...
+                try:
+                    layer_idx = int(layer_prefix)
+                    layer_x = layers.index(layer_idx) * x_spacing if layer_idx in layers else 0
+                    pos[node] = (layer_x, 0)  # Default vertical position at center
+                except (ValueError, IndexError):
+                    # If we can't extract layer number, just place at origin
+                    pos[node] = (0, 0)
         
         # Now we need to render the graph
         plt.figure(figsize=(max(len(layers) * 4, 12), max(int(max(layer_heights) * 0.8 if layer_heights else 1), 10)))
