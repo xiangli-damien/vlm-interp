@@ -1138,7 +1138,7 @@ class EnhancedSemanticTracer:
     
     def _visualize_source_distribution(
         self,
-        trace_results: Dict[int, Dict[str, Any]],
+        trace_results: Dict[str, Dict[str, Any]],
         target_text: str,
         target_idx: int,
         save_dir: str,
@@ -1146,9 +1146,21 @@ class EnhancedSemanticTracer:
         """Visualize the distribution of source token types (text, image, generated) across layers"""
         saved_paths = []
         
-        # Convert keys to integers if they're strings
-        if trace_results and all(isinstance(key, str) for key in trace_results.keys()):
-            trace_results = {int(k): v for k, v in trace_results.items()}
+        # Handle mixed key types (string and integer)
+        # First convert to a consistent format - all integers
+        int_keyed_results = {}
+        for k, v in trace_results.items():
+            try:
+                # Try to convert to int if it's a string
+                key = int(k) if isinstance(k, str) else k
+                int_keyed_results[key] = v
+            except (ValueError, TypeError):
+                # If conversion fails, skip this item
+                print(f"Warning: Could not convert key {k} to integer, skipping.")
+                continue
+        
+        # Now replace the original dict with our sanitized version
+        trace_results = int_keyed_results
         
         layers = sorted(trace_results.keys())
         
@@ -1238,10 +1250,10 @@ class EnhancedSemanticTracer:
         plt.close(fig)
         
         return saved_paths
-    
+
     def _visualize_semantic_evolution(
         self,
-        trace_results: Dict[int, Dict[str, Any]],
+        trace_results: Dict[str, Dict[str, Any]],
         target_text: str,
         target_idx: int,
         save_dir: str
@@ -1249,10 +1261,18 @@ class EnhancedSemanticTracer:
         """Visualize how concepts evolve across layers using logit lens projections"""
         saved_paths = []
         
-        # Convert keys to integers if they're strings
-        if trace_results and all(isinstance(key, str) for key in trace_results.keys()):
-            trace_results = {int(k): v for k, v in trace_results.items()}
-            
+        # Handle mixed key types (string and integer)
+        int_keyed_results = {}
+        for k, v in trace_results.items():
+            try:
+                key = int(k) if isinstance(k, str) else k
+                int_keyed_results[key] = v
+            except (ValueError, TypeError):
+                print(f"Warning: Could not convert key {k} to integer, skipping.")
+                continue
+        
+        trace_results = int_keyed_results
+        
         layers = sorted(trace_results.keys())
         
         # Extract concept probabilities for the top sources at each layer
@@ -1313,10 +1333,10 @@ class EnhancedSemanticTracer:
         plt.close(fig)
         
         return saved_paths
-    
+
     def _visualize_image_token_heatmaps(
         self,
-        trace_results: Dict[int, Dict[str, Any]],
+        trace_results: Dict[str, Dict[str, Any]],
         target_text: str,
         target_idx: int,
         save_dir: str
@@ -1327,10 +1347,18 @@ class EnhancedSemanticTracer:
         """
         saved_paths = []
         
-        # Convert keys to integers if they're strings
-        if trace_results and all(isinstance(key, str) for key in trace_results.keys()):
-            trace_results = {int(k): v for k, v in trace_results.items()}
-            
+        # Handle mixed key types (string and integer)
+        int_keyed_results = {}
+        for k, v in trace_results.items():
+            try:
+                key = int(k) if isinstance(k, str) else k
+                int_keyed_results[key] = v
+            except (ValueError, TypeError):
+                print(f"Warning: Could not convert key {k} to integer, skipping.")
+                continue
+        
+        trace_results = int_keyed_results
+        
         layers = sorted(trace_results.keys())
         
         # Get the input data with feature mapping information
@@ -1506,6 +1534,274 @@ class EnhancedSemanticTracer:
                         saved_paths.append(composite_path)
                 except Exception as e:
                     print(f"Error creating patch composite: {e}")
+        
+        return saved_paths
+
+    def _create_text_report(self, results: Dict[str, Any], output_path: str) -> str:
+        """
+        Creates a detailed text report of semantic tracing results.
+        
+        Args:
+            results: Results dictionary from semantic tracing
+            output_path: Path to save the report
+            
+        Returns:
+            Path to saved report
+        """
+        trace_results = results.get("trace_results", {})
+        target_token = results.get("target_token", {})
+        target_text = target_token.get("text", "unknown")
+        target_idx = target_token.get("index", -1)
+        
+        # Handle mixed key types (string and integer)
+        int_keyed_results = {}
+        for k, v in trace_results.items():
+            try:
+                key = int(k) if isinstance(k, str) else k
+                int_keyed_results[key] = v
+            except (ValueError, TypeError):
+                print(f"Warning: Could not convert key {k} to integer, skipping.")
+                continue
+        
+        trace_results = int_keyed_results
+        
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(f"Semantic Tracing Report\n")
+            f.write(f"======================\n\n")
+            f.write(f"Target Token: '{target_text}' (Index: {target_idx})\n\n")
+            
+            layers = sorted(trace_results.keys())
+            f.write(f"Analysis of {len(layers)} layers:\n")
+            
+            for layer_idx in layers:
+                layer_data = trace_results[layer_idx]
+                layer_name = layer_data.get("layer_name", f"Layer {layer_idx}")
+                
+                f.write(f"\n{'='*40}\n")
+                f.write(f"Layer {layer_idx} ({layer_name}):\n")
+                f.write(f"{'-'*40}\n")
+                
+                # Targets in this layer
+                targets = layer_data.get("target_tokens", [])
+                f.write(f"Targets in this layer: {len(targets)}\n")
+                
+                for i, target in enumerate(targets):
+                    f.write(f"\n  Target {i+1}: '{target.get('text', '')}' (Index: {target.get('index', -1)})\n")
+                    f.write(f"  Importance Weight: {target.get('weight', 0.0):.4f}\n")
+                    
+                    # Sources for this target
+                    sources = target.get("sources", [])
+                    f.write(f"  Sources: {len(sources)}\n")
+                    
+                    for j, source in enumerate(sources):
+                        source_type = source.get("type", -1)
+                        type_name = "Text" if source_type == 1 else "Image" if source_type == 2 else "Generated"
+                        
+                        f.write(f"    Source {j+1}: '{source.get('text', '')}' (Index: {source.get('index', -1)}, Type: {type_name})\n")
+                        f.write(f"      Raw Saliency: {source.get('saliency_score', 0.0):.4f}\n")
+                        f.write(f"      Relative Weight: {source.get('relative_weight', 0.0):.4f}\n")
+                        f.write(f"      Global Weight: {source.get('scaled_weight', 0.0):.4f}\n")
+                        
+                        # Add logit lens info if available
+                        logit_lens = layer_data.get("logit_lens_projections", {}).get(source.get("index", -1), {})
+                        if not logit_lens and isinstance(source.get("index"), int):
+                            # Try looking up as string key
+                            logit_lens = layer_data.get("logit_lens_projections", {}).get(str(source.get("index", -1)), {})
+                        
+                        if logit_lens:
+                            top_predictions = logit_lens.get("top_predictions", [])
+                            if top_predictions:
+                                f.write("      Top predictions:\n")
+                                for pred in top_predictions[:3]:  # Show top 3
+                                    f.write(f"        {pred.get('rank', 0)}: '{pred.get('token_text', '')}' ({pred.get('probability', 0.0):.4f})\n")
+                            
+                            concept_predictions = logit_lens.get("concept_predictions", {})
+                            if concept_predictions:
+                                f.write("      Concept probabilities:\n")
+                                for concept, data in concept_predictions.items():
+                                    f.write(f"        '{concept}': {data.get('probability', 0.0):.4f}\n")
+        
+        return output_path
+
+    def _visualize_multi_token_concept_evolution(
+        self,
+        all_traces: List[Dict[str, Dict[str, Any]]],
+        target_texts: List[str],
+        save_dir: str
+    ) -> List[str]:
+        """Create visualization of concept evolution across multiple target tokens"""
+        saved_paths = []
+        
+        if not all_traces or not target_texts:
+            return saved_paths
+        
+        # Process each trace to handle mixed key types
+        processed_traces = []
+        for trace in all_traces:
+            int_keyed_trace = {}
+            for k, v in trace.items():
+                try:
+                    key = int(k) if isinstance(k, str) else k
+                    int_keyed_trace[key] = v
+                except (ValueError, TypeError):
+                    print(f"Warning: Could not convert key {k} to integer, skipping.")
+                    continue
+            processed_traces.append(int_keyed_trace)
+        
+        all_traces = processed_traces
+        
+        # Check that we have traces with consistent layers
+        all_layers = [sorted(trace.keys()) for trace in all_traces]
+        if not all(layers == all_layers[0] for layers in all_layers):
+            print("Warning: Inconsistent layer indices across traces. Using intersection.")
+            common_layers = sorted(set.intersection(*[set(layers) for layers in all_layers]))
+            if not common_layers:
+                print("No common layers found across traces. Cannot create combined visualization.")
+                return saved_paths
+        else:
+            common_layers = all_layers[0]
+        
+        # For each concept, create a plot showing evolution across all tokens
+        for concept in self.logit_lens_concepts:
+            fig, ax = plt.subplots(figsize=(12, 6))
+            
+            for trace_idx, (trace, target_text) in enumerate(zip(all_traces, target_texts)):
+                # Extract concept probabilities for this trace
+                concept_probs = []
+                
+                for layer_idx in common_layers:
+                    layer_data = trace.get(layer_idx, {})
+                    projections = layer_data.get("logit_lens_projections", {})
+                    
+                    if projections:
+                        token_probs = []
+                        for token_idx, proj_data in projections.items():
+                            # Handle token_idx as string if needed
+                            if isinstance(token_idx, str):
+                                token_idx = int(token_idx)
+                                
+                            concept_pred = proj_data.get("concept_predictions", {}).get(concept)
+                            if concept_pred:
+                                token_probs.append(concept_pred["probability"])
+                        
+                        # Average if we have values
+                        if token_probs:
+                            avg_prob = sum(token_probs) / len(token_probs)
+                        else:
+                            avg_prob = 0.0
+                    else:
+                        # No projections for this layer, use zeros
+                        avg_prob = 0.0
+                        
+                    concept_probs.append(avg_prob)
+                
+                # Plot this token's concept evolution
+                ax.plot(common_layers, concept_probs, marker='o', linewidth=2, 
+                    label=f"'{target_text}'")
+            
+            ax.set_ylabel(f"'{concept}' Probability")
+            ax.set_xlabel("Layer")
+            ax.set_title(f"Concept '{concept}' Evolution Across Layers for Multiple Tokens")
+            ax.set_xticks(common_layers)
+            ax.set_xticklabels([str(l) for l in common_layers], rotation=90)
+            ax.grid(True, linestyle='--', alpha=0.7)
+            ax.legend()
+            
+            plt.tight_layout()
+            
+            # Save figure
+            save_path = os.path.join(save_dir, f"multi_token_concept_{concept}_evolution.png")
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            saved_paths.append(save_path)
+            
+            plt.close(fig)
+        
+        return saved_paths
+
+    def _visualize_multi_token_type_distribution(
+        self,
+        all_traces: List[Dict[str, Dict[str, Any]]],
+        target_texts: List[str],
+        save_dir: str
+    ) -> List[str]:
+        """Create visualization of token type distributions across multiple target tokens"""
+        saved_paths = []
+        
+        if not all_traces or not target_texts:
+            return saved_paths
+        
+        # Process each trace to handle mixed key types
+        processed_traces = []
+        for trace in all_traces:
+            int_keyed_trace = {}
+            for k, v in trace.items():
+                try:
+                    key = int(k) if isinstance(k, str) else k
+                    int_keyed_trace[key] = v
+                except (ValueError, TypeError):
+                    print(f"Warning: Could not convert key {k} to integer, skipping.")
+                    continue
+            processed_traces.append(int_keyed_trace)
+        
+        all_traces = processed_traces
+        
+        # Check that we have traces with consistent layers
+        all_layers = [sorted(trace.keys()) for trace in all_traces]
+        if not all(layers == all_layers[0] for layers in all_layers):
+            print("Warning: Inconsistent layer indices across traces. Using intersection.")
+            common_layers = sorted(set.intersection(*[set(layers) for layers in all_layers]))
+            if not common_layers:
+                print("No common layers found across traces. Cannot create combined visualization.")
+                return saved_paths
+        else:
+            common_layers = all_layers[0]
+        
+        # Create a plot for each token type
+        for token_type, type_name in [(1, "Text"), (2, "Image"), (0, "Generated")]:
+            fig, ax = plt.subplots(figsize=(12, 6))
+            
+            for trace_idx, (trace, target_text) in enumerate(zip(all_traces, target_texts)):
+                # Extract type contributions for this trace
+                type_contribs = []
+                
+                for layer_idx in common_layers:
+                    layer_data = trace.get(layer_idx, {})
+                    
+                    # Combine all sources across all targets for this layer
+                    all_sources = []
+                    for target in layer_data.get("target_tokens", []):
+                        all_sources.extend(target.get("sources", []))
+                    
+                    # Calculate contribution for this type
+                    type_contrib = sum(src.get("scaled_weight", 0.0) for src in all_sources if src.get("type") == token_type)
+                    
+                    # Normalize relative to all contributions
+                    total = sum(src.get("scaled_weight", 0.0) for src in all_sources)
+                    if total > 0:
+                        type_contrib /= total
+                        
+                    type_contribs.append(type_contrib)
+                
+                # Plot this token's type contribution
+                ax.plot(common_layers, type_contribs, marker='o', linewidth=2, 
+                    label=f"'{target_text}'")
+            
+            ax.set_ylabel(f"{type_name} Token Contribution")
+            ax.set_xlabel("Layer")
+            ax.set_title(f"{type_name} Token Influence Across Layers for Multiple Tokens")
+            ax.set_xticks(common_layers)
+            ax.set_xticklabels([str(l) for l in common_layers], rotation=90)
+            ax.grid(True, linestyle='--', alpha=0.7)
+            ax.legend()
+            
+            plt.tight_layout()
+            
+            # Save figure
+            save_path = os.path.join(save_dir, f"multi_token_{type_name.lower()}_contribution.png")
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            saved_paths.append(save_path)
+            
+            plt.close(fig)
         
         return saved_paths
 
@@ -1909,84 +2205,6 @@ class EnhancedSemanticTracer:
             traceback.print_exc()
             return None
     
-    def _create_text_report(self, results: Dict[str, Any], output_path: str) -> str:
-        """
-        Creates a detailed text report of semantic tracing results.
-        
-        Args:
-            results: Results dictionary from semantic tracing
-            output_path: Path to save the report
-            
-        Returns:
-            Path to saved report
-        """
-        trace_results = results.get("trace_results", {})
-        target_token = results.get("target_token", {})
-        target_text = target_token.get("text", "unknown")
-        target_idx = target_token.get("index", -1)
-        
-        # Convert keys to integers if they're strings
-        if trace_results and all(isinstance(key, str) for key in trace_results.keys()):
-            trace_results = {int(k): v for k, v in trace_results.items()}
-        
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(f"Semantic Tracing Report\n")
-            f.write(f"======================\n\n")
-            f.write(f"Target Token: '{target_text}' (Index: {target_idx})\n\n")
-            
-            layers = sorted(trace_results.keys())
-            f.write(f"Analysis of {len(layers)} layers:\n")
-            
-            for layer_idx in layers:
-                layer_data = trace_results[layer_idx]
-                layer_name = layer_data.get("layer_name", f"Layer {layer_idx}")
-                
-                f.write(f"\n{'='*40}\n")
-                f.write(f"Layer {layer_idx} ({layer_name}):\n")
-                f.write(f"{'-'*40}\n")
-                
-                # Targets in this layer
-                targets = layer_data.get("target_tokens", [])
-                f.write(f"Targets in this layer: {len(targets)}\n")
-                
-                for i, target in enumerate(targets):
-                    f.write(f"\n  Target {i+1}: '{target.get('text', '')}' (Index: {target.get('index', -1)})\n")
-                    f.write(f"  Importance Weight: {target.get('weight', 0.0):.4f}\n")
-                    
-                    # Sources for this target
-                    sources = target.get("sources", [])
-                    f.write(f"  Sources: {len(sources)}\n")
-                    
-                    for j, source in enumerate(sources):
-                        source_type = source.get("type", -1)
-                        type_name = "Text" if source_type == 1 else "Image" if source_type == 2 else "Generated"
-                        
-                        f.write(f"    Source {j+1}: '{source.get('text', '')}' (Index: {source.get('index', -1)}, Type: {type_name})\n")
-                        f.write(f"      Raw Saliency: {source.get('saliency_score', 0.0):.4f}\n")
-                        f.write(f"      Relative Weight: {source.get('relative_weight', 0.0):.4f}\n")
-                        f.write(f"      Global Weight: {source.get('scaled_weight', 0.0):.4f}\n")
-                        
-                        # Add logit lens info if available
-                        logit_lens = layer_data.get("logit_lens_projections", {}).get(source.get("index", -1), {})
-                        if not logit_lens and isinstance(source.get("index"), int):
-                            # Try looking up as string key
-                            logit_lens = layer_data.get("logit_lens_projections", {}).get(str(source.get("index", -1)), {})
-                        
-                        if logit_lens:
-                            top_predictions = logit_lens.get("top_predictions", [])
-                            if top_predictions:
-                                f.write("      Top predictions:\n")
-                                for pred in top_predictions[:3]:  # Show top 3
-                                    f.write(f"        {pred.get('rank', 0)}: '{pred.get('token_text', '')}' ({pred.get('probability', 0.0):.4f})\n")
-                            
-                            concept_predictions = logit_lens.get("concept_predictions", {})
-                            if concept_predictions:
-                                f.write("      Concept probabilities:\n")
-                                for concept, data in concept_predictions.items():
-                                    f.write(f"        '{concept}': {data.get('probability', 0.0):.4f}\n")
-        
-        return output_path
-    
     def _visualize_trace_data(
         self,
         csv_path: str,
@@ -2161,151 +2379,5 @@ class EnhancedSemanticTracer:
             print(f"Error visualizing trace data: {e}")
             import traceback
             traceback.print_exc()
-        
-        return saved_paths
-    
-    def _visualize_multi_token_concept_evolution(
-        self,
-        all_traces: List[Dict[int, Dict[str, Any]]],
-        target_texts: List[str],
-        save_dir: str
-    ) -> List[str]:
-        """Create visualization of concept evolution across multiple target tokens"""
-        saved_paths = []
-        
-        if not all_traces or not target_texts:
-            return saved_paths
-            
-        # Check that we have traces with consistent layers
-        all_layers = [sorted(trace.keys()) for trace in all_traces]
-        if not all(layers == all_layers[0] for layers in all_layers):
-            print("Warning: Inconsistent layer indices across traces. Using intersection.")
-            common_layers = sorted(set.intersection(*[set(layers) for layers in all_layers]))
-            if not common_layers:
-                print("No common layers found across traces. Cannot create combined visualization.")
-                return saved_paths
-        else:
-            common_layers = all_layers[0]
-        
-        # For each concept, create a plot showing evolution across all tokens
-        for concept in self.logit_lens_concepts:
-            fig, ax = plt.subplots(figsize=(12, 6))
-            
-            for trace_idx, (trace, target_text) in enumerate(zip(all_traces, target_texts)):
-                # Extract concept probabilities for this trace
-                concept_probs = []
-                
-                for layer_idx in common_layers:
-                    layer_data = trace.get(layer_idx, {})
-                    projections = layer_data.get("logit_lens_projections", {})
-                    
-                    if projections:
-                        token_probs = []
-                        for token_idx, proj_data in projections.items():
-                            concept_pred = proj_data.get("concept_predictions", {}).get(concept)
-                            if concept_pred:
-                                token_probs.append(concept_pred["probability"])
-                        
-                        if token_probs:
-                            avg_prob = sum(token_probs) / len(token_probs)
-                        else:
-                            avg_prob = 0.0
-                    else:
-                        avg_prob = 0.0
-                        
-                    concept_probs.append(avg_prob)
-                
-                # Plot this token's concept evolution
-                ax.plot(common_layers, concept_probs, marker='o', linewidth=2, 
-                       label=f"'{target_text}'")
-            
-            ax.set_ylabel(f"'{concept}' Probability")
-            ax.set_xlabel("Layer")
-            ax.set_title(f"Concept '{concept}' Evolution Across Layers for Multiple Tokens")
-            ax.set_xticks(common_layers)
-            ax.set_xticklabels([str(l) for l in common_layers], rotation=90)
-            ax.grid(True, linestyle='--', alpha=0.7)
-            ax.legend()
-            
-            plt.tight_layout()
-            
-            # Save figure
-            save_path = os.path.join(save_dir, f"multi_token_concept_{concept}_evolution.png")
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            saved_paths.append(save_path)
-            
-            plt.close(fig)
-        
-        return saved_paths
-    
-    def _visualize_multi_token_type_distribution(
-        self,
-        all_traces: List[Dict[int, Dict[str, Any]]],
-        target_texts: List[str],
-        save_dir: str
-    ) -> List[str]:
-        """Create visualization of token type distributions across multiple target tokens"""
-        saved_paths = []
-        
-        if not all_traces or not target_texts:
-            return saved_paths
-            
-        # Check that we have traces with consistent layers
-        all_layers = [sorted(trace.keys()) for trace in all_traces]
-        if not all(layers == all_layers[0] for layers in all_layers):
-            print("Warning: Inconsistent layer indices across traces. Using intersection.")
-            common_layers = sorted(set.intersection(*[set(layers) for layers in all_layers]))
-            if not common_layers:
-                print("No common layers found across traces. Cannot create combined visualization.")
-                return saved_paths
-        else:
-            common_layers = all_layers[0]
-        
-        # Create a plot for each token type
-        for token_type, type_name in [(1, "Text"), (2, "Image"), (0, "Generated")]:
-            fig, ax = plt.subplots(figsize=(12, 6))
-            
-            for trace_idx, (trace, target_text) in enumerate(zip(all_traces, target_texts)):
-                # Extract type contributions for this trace
-                type_contribs = []
-                
-                for layer_idx in common_layers:
-                    layer_data = trace.get(layer_idx, {})
-                    
-                    # Combine all sources across all targets for this layer
-                    all_sources = []
-                    for target in layer_data.get("target_tokens", []):
-                        all_sources.extend(target.get("sources", []))
-                    
-                    # Calculate contribution for this type
-                    type_contrib = sum(src.get("scaled_weight", 0.0) for src in all_sources if src.get("type") == token_type)
-                    
-                    # Normalize relative to all contributions
-                    total = sum(src.get("scaled_weight", 0.0) for src in all_sources)
-                    if total > 0:
-                        type_contrib /= total
-                        
-                    type_contribs.append(type_contrib)
-                
-                # Plot this token's type contribution
-                ax.plot(common_layers, type_contribs, marker='o', linewidth=2, 
-                       label=f"'{target_text}'")
-            
-            ax.set_ylabel(f"{type_name} Token Contribution")
-            ax.set_xlabel("Layer")
-            ax.set_title(f"{type_name} Token Influence Across Layers for Multiple Tokens")
-            ax.set_xticks(common_layers)
-            ax.set_xticklabels([str(l) for l in common_layers], rotation=90)
-            ax.grid(True, linestyle='--', alpha=0.7)
-            ax.legend()
-            
-            plt.tight_layout()
-            
-            # Save figure
-            save_path = os.path.join(save_dir, f"multi_token_{type_name.lower()}_contribution.png")
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            saved_paths.append(save_path)
-            
-            plt.close(fig)
         
         return saved_paths
