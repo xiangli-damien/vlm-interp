@@ -1145,6 +1145,11 @@ class EnhancedSemanticTracer:
     ) -> List[str]:
         """Visualize the distribution of source token types (text, image, generated) across layers"""
         saved_paths = []
+        
+        # Convert keys to integers if they're strings
+        if trace_results and all(isinstance(key, str) for key in trace_results.keys()):
+            trace_results = {int(k): v for k, v in trace_results.items()}
+        
         layers = sorted(trace_results.keys())
         
         if not layers:
@@ -1243,6 +1248,11 @@ class EnhancedSemanticTracer:
     ) -> List[str]:
         """Visualize how concepts evolve across layers using logit lens projections"""
         saved_paths = []
+        
+        # Convert keys to integers if they're strings
+        if trace_results and all(isinstance(key, str) for key in trace_results.keys()):
+            trace_results = {int(k): v for k, v in trace_results.items()}
+            
         layers = sorted(trace_results.keys())
         
         # Extract concept probabilities for the top sources at each layer
@@ -1259,6 +1269,10 @@ class EnhancedSemanticTracer:
                     
                     # Check all tokens with projections
                     for token_idx, proj_data in projections.items():
+                        # Handle token_idx as string if needed
+                        if isinstance(token_idx, str):
+                            token_idx = int(token_idx)
+                            
                         concept_pred = proj_data.get("concept_predictions", {}).get(concept)
                         if concept_pred:
                             concept_probs.append(concept_pred["probability"])
@@ -1310,17 +1324,13 @@ class EnhancedSemanticTracer:
         """
         Visualize heatmaps of image token influence across layers by mapping tokens
         back to their spatial positions in the original image.
-        
-        Args:
-            trace_results: Trace results dictionary with layer data
-            target_text: Text of the target token
-            target_idx: Index of the target token
-            save_dir: Directory to save visualizations
-            
-        Returns:
-            List of saved file paths
         """
         saved_paths = []
+        
+        # Convert keys to integers if they're strings
+        if trace_results and all(isinstance(key, str) for key in trace_results.keys()):
+            trace_results = {int(k): v for k, v in trace_results.items()}
+            
         layers = sorted(trace_results.keys())
         
         # Get the input data with feature mapping information
@@ -1399,6 +1409,10 @@ class EnhancedSemanticTracer:
                 
                 # Fill the heatmap with normalized weights
                 for token_idx, weight in normalized_weights.items():
+                    # Convert token_idx to int if it's a string
+                    if isinstance(token_idx, str):
+                        token_idx = int(token_idx)
+                        
                     position = base_feature_info["positions"].get(token_idx)
                     if position:
                         r, c = position
@@ -1428,6 +1442,10 @@ class EnhancedSemanticTracer:
                 
                 # Fill the heatmap with normalized weights
                 for token_idx, weight in normalized_weights.items():
+                    # Convert token_idx to int if it's a string
+                    if isinstance(token_idx, str):
+                        token_idx = int(token_idx)
+                        
                     position = patch_feature_info["positions"].get(token_idx)
                     if position:
                         r, c = position
@@ -1907,6 +1925,10 @@ class EnhancedSemanticTracer:
         target_text = target_token.get("text", "unknown")
         target_idx = target_token.get("index", -1)
         
+        # Convert keys to integers if they're strings
+        if trace_results and all(isinstance(key, str) for key in trace_results.keys()):
+            trace_results = {int(k): v for k, v in trace_results.items()}
+        
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(f"Semantic Tracing Report\n")
             f.write(f"======================\n\n")
@@ -1946,6 +1968,10 @@ class EnhancedSemanticTracer:
                         
                         # Add logit lens info if available
                         logit_lens = layer_data.get("logit_lens_projections", {}).get(source.get("index", -1), {})
+                        if not logit_lens and isinstance(source.get("index"), int):
+                            # Try looking up as string key
+                            logit_lens = layer_data.get("logit_lens_projections", {}).get(str(source.get("index", -1)), {})
+                        
                         if logit_lens:
                             top_predictions = logit_lens.get("top_predictions", [])
                             if top_predictions:
