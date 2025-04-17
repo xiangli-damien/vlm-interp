@@ -576,21 +576,19 @@ def visualize_token_probabilities(
                         print(f"  Warning: Shape mismatch base layer {layer_idx}, '{concept}'. Expected {base_grid}, got {base_prob_map.shape}. Skipping.")
                         continue
 
-                    # Upscale Heatmap
-                    upscaled_heatmap_base: Optional[np.ndarray] = None
-                    try:
-                        if HAS_SKIMAGE:
-                            upscaled_heatmap_base = skimage_resize(base_prob_map, target_overlay_size, order=1, 
-                                                                 mode='constant', cval=0, anti_aliasing=True, 
-                                                                 preserve_range=True)
-                        else:
-                            repeat_y = target_overlay_size[1] // base_grid_h
-                            repeat_x = target_overlay_size[0] // base_grid_w
-                            upscaled_heatmap_base = np.kron(base_prob_map, np.ones((repeat_y, repeat_x)))
-                            upscaled_heatmap_base = upscaled_heatmap_base[:target_overlay_size[1], :target_overlay_size[0]]
-                    except Exception as e:
-                         print(f"  Warning: Error upscaling base heatmap layer {layer_idx} '{concept}': {e}. Skipping visualization.")
-                         continue
+                    # Simplified upscaling: repeat each heatmap cell into a block
+                    repeat_y = target_overlay_size[1] // base_grid_h
+                    repeat_x = target_overlay_size[0] // base_grid_w
+                    upscaled_heatmap_base = np.kron(
+                        base_prob_map,
+                        np.ones((repeat_y, repeat_x), dtype=base_prob_map.dtype)
+                    )
+                    # trim to exact target size
+                    upscaled_heatmap_base = upscaled_heatmap_base[
+                        :target_overlay_size[1],
+                        :target_overlay_size[0]
+                    ]
+
 
                     # Plotting
                     fig, ax = plt.subplots(figsize=(6, 6))

@@ -209,7 +209,7 @@ class LLaVANextLogitLensAnalyzer:
                 if current_token_idx > span_end: break
 
                 # Map newline token if expected and available
-                if has_newline and r < (unpadded_grid_rows - 1):
+                if has_newline:
                     if current_token_idx <= span_end:
                         if processed_spatial_count == 0: actual_spatial_start_idx = current_token_idx
                         mapping_newline[current_token_idx] = r

@@ -18,6 +18,7 @@ from PIL import ImageDraw
 from typing import Dict, Any, Optional, List, Tuple, Union, Set
 from tqdm.auto import tqdm
 from collections import defaultdict
+import networkx as nx
 
 # Import components from existing modules
 from analyzer.saliency import calculate_saliency_scores
@@ -1217,21 +1218,11 @@ class EnhancedSemanticTracer:
         target_text: str,
         target_idx: int,
         save_dir: str,
-        input_data: Optional[Dict[str, Any]] = None  # Add optional input_data parameter
+        input_data: Optional[Dict[str, Any]] = None
     ) -> List[str]:
         """
         Visualize heatmaps of image token influence across layers by mapping tokens
         back to their spatial positions in the original image.
-        
-        Args:
-            trace_results: Dictionary with trace results for each layer
-            target_text: Text of the target token
-            target_idx: Index of the target token
-            save_dir: Directory to save visualizations
-            input_data: Optional input data with feature mapping information
-            
-        Returns:
-            List of saved file paths
         """
         saved_paths = []
         
@@ -1283,13 +1274,23 @@ class EnhancedSemanticTracer:
         
         # Get numeric layers
         layers = sorted(trace_results.keys())
+        if not layers:
+            print("Warning: No layers found in trace_results. Cannot create heatmaps.")
+            return saved_paths
         
         # Extract base and patch feature information
         base_feature_info = feature_mapping.get("base_feature", {})
         patch_feature_info = feature_mapping.get("patch_feature", {})
         
-        if not base_feature_info or not patch_feature_info:
-            print("Warning: Missing feature mapping information. Visualizations may be incomplete.")
+        if not base_feature_info and not patch_feature_info:
+            print("Error: No valid feature mapping information found. Cannot create visualizations.")
+            return saved_paths
+        
+        if not base_feature_info:
+            print("Warning: Missing base feature mapping information. Base feature visualizations will be skipped.")
+        
+        if not patch_feature_info:
+            print("Warning: Missing patch feature mapping information. Patch feature visualizations will be skipped.")
         
         # Prepare output directories
         base_heatmap_dir = os.path.join(save_dir, "base_feature_heatmaps")
@@ -1297,11 +1298,9 @@ class EnhancedSemanticTracer:
         os.makedirs(base_heatmap_dir, exist_ok=True)
         os.makedirs(patch_heatmap_dir, exist_ok=True)
         
-        # Rest of the function remains the same
-        # ...
-        
-        # Return the rest of the function implementation as is
-        # Just ensure all necessary code is retained from the original function
+        # Keep track of which layers have valid visualizations
+        base_valid_layers = []
+        patch_valid_layers = []
         
         # Process each layer
         for layer_idx in layers:
@@ -1310,6 +1309,7 @@ class EnhancedSemanticTracer:
             # Process all targets in this layer
             targets = layer_data.get("target_tokens", [])
             if not targets:
+                print(f"Layer {layer_idx}: No target tokens found. Skipping.")
                 continue
             
             # Collect all image token sources across all targets for this layer
@@ -1328,14 +1328,16 @@ class EnhancedSemanticTracer:
                             image_token_weights[source_idx] = weight
             
             if not image_token_weights:
-                continue  # No image tokens in this layer
+                print(f"Layer {layer_idx}: No image tokens with influence found. Skipping.")
+                continue
             
             # Normalize weights for visualization
             max_weight = max(image_token_weights.values())
-            if max_weight > 0:
-                normalized_weights = {idx: weight / max_weight for idx, weight in image_token_weights.items()}
-            else:
-                normalized_weights = image_token_weights
+            if max_weight <= 0:
+                print(f"Layer {layer_idx}: All image token weights are zero or negative. Skipping.")
+                continue
+                
+            normalized_weights = {idx: weight / max_weight for idx, weight in image_token_weights.items()}
             
             # 1. Visualize base features
             if base_feature_info.get("positions") and base_feature_info.get("grid"):
@@ -1345,6 +1347,7 @@ class EnhancedSemanticTracer:
                 base_heatmap = np.zeros((base_grid_h, base_grid_w), dtype=np.float32)
                 
                 # Fill the heatmap with normalized weights
+                mapped_tokens = 0
                 for token_idx, weight in normalized_weights.items():
                     # Convert token_idx to int if it's a string
                     if isinstance(token_idx, str):
@@ -1355,9 +1358,11 @@ class EnhancedSemanticTracer:
                         r, c = position
                         if 0 <= r < base_grid_h and 0 <= c < base_grid_w:
                             base_heatmap[r, c] = weight
+                            mapped_tokens += 1
                 
                 # Create visualization if we have data
-                if np.max(base_heatmap) > 0:
+                if mapped_tokens > 0 and np.max(base_heatmap) > 0:
+                    print(f"Layer {layer_idx}: Creating base feature heatmap with {mapped_tokens} mapped tokens.")
                     base_path = self._create_base_feature_overlay(
                         heatmap=base_heatmap,
                         original_image=original_image,
@@ -1369,6 +1374,9 @@ class EnhancedSemanticTracer:
                     )
                     if base_path:
                         saved_paths.append(base_path)
+                        base_valid_layers.append(layer_idx)
+                else:
+                    print(f"Layer {layer_idx}: No valid base feature mapping. Max value: {np.max(base_heatmap)}")
             
             # 2. Visualize patch features
             if patch_feature_info.get("positions") and patch_feature_info.get("grid_unpadded"):
@@ -1378,6 +1386,7 @@ class EnhancedSemanticTracer:
                 patch_heatmap = np.zeros((prob_grid_h, prob_grid_w), dtype=np.float32)
                 
                 # Fill the heatmap with normalized weights
+                mapped_tokens = 0
                 for token_idx, weight in normalized_weights.items():
                     # Convert token_idx to int if it's a string
                     if isinstance(token_idx, str):
@@ -1388,9 +1397,11 @@ class EnhancedSemanticTracer:
                         r, c = position
                         if 0 <= r < prob_grid_h and 0 <= c < prob_grid_w:
                             patch_heatmap[r, c] = weight
+                            mapped_tokens += 1
                 
                 # Create visualization if we have data
-                if np.max(patch_heatmap) > 0:
+                if mapped_tokens > 0 and np.max(patch_heatmap) > 0:
+                    print(f"Layer {layer_idx}: Creating patch feature heatmap with {mapped_tokens} mapped tokens.")
                     # Get required dimensions
                     resized_dims_wh = feature_mapping.get("resized_dimensions", (0, 0))
                     patch_size = feature_mapping.get("patch_size", 14)  # Default to 14 if not specified
@@ -1407,6 +1418,9 @@ class EnhancedSemanticTracer:
                     )
                     if patch_path:
                         saved_paths.append(patch_path)
+                        patch_valid_layers.append(layer_idx)
+                else:
+                    print(f"Layer {layer_idx}: No valid patch feature mapping. Max value: {np.max(patch_heatmap)}")
         
         # Create composite visualizations if we have multiple layers
         if len(saved_paths) > 0:
@@ -1414,35 +1428,43 @@ class EnhancedSemanticTracer:
             base_paths = [p for p in saved_paths if "base_influence" in p]
             if base_paths:
                 try:
-                    base_layers = [int(os.path.basename(p).split('_')[2]) for p in base_paths]
+                    print(f"Creating composite base image with {len(base_paths)} heatmaps...")
                     base_composite_path = os.path.join(save_dir, f"composite_base_influence_{target_idx}.png")
                     composite_path = self._create_composite_image(
                         image_paths=base_paths,
-                        layers=base_layers,
+                        layers=base_valid_layers,
                         output_filename=base_composite_path,
                         title=f"Base Image Token Influence Across Layers for Target '{target_text}'"
                     )
                     if composite_path:
                         saved_paths.append(composite_path)
+                        print(f"Successfully created base composite image: {composite_path}")
                 except Exception as e:
                     print(f"Error creating base composite: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             # Create composite for patch feature heatmaps
             patch_paths = [p for p in saved_paths if "patch_influence" in p]
             if patch_paths:
                 try:
-                    patch_layers = [int(os.path.basename(p).split('_')[2]) for p in patch_paths]
+                    print(f"Creating composite patch image with {len(patch_paths)} heatmaps...")
                     patch_composite_path = os.path.join(save_dir, f"composite_patch_influence_{target_idx}.png")
                     composite_path = self._create_composite_image(
                         image_paths=patch_paths,
-                        layers=patch_layers,
+                        layers=patch_valid_layers,
                         output_filename=patch_composite_path,
                         title=f"Patch Image Token Influence Across Layers for Target '{target_text}'"
                     )
                     if composite_path:
                         saved_paths.append(composite_path)
+                        print(f"Successfully created patch composite image: {composite_path}")
                 except Exception as e:
                     print(f"Error creating patch composite: {e}")
+                    import traceback
+                    traceback.print_exc()
+        else:
+            print("No valid heatmaps were created. Check if image tokens have significant influence in any layer.")
         
         return saved_paths
 
@@ -1452,7 +1474,7 @@ class EnhancedSemanticTracer:
         target_text: str,
         target_idx: int,
         save_dir: str,
-        input_data: Optional[Dict[str, Any]] = None  # Add input_data parameter
+        input_data: Optional[Dict[str, Any]] = None
     ) -> List[str]:
         """Helper to visualize a single token's trace results"""
         saved_paths = []
@@ -1467,7 +1489,17 @@ class EnhancedSemanticTracer:
         if input_data is None and "input_data" in special_keys:
             input_data = special_keys["input_data"]
         
-        # 1. Visualize the trace as a stacked bar chart
+        # 1. Create new token flow graph visualization (NEW)
+        try:
+            print("Creating token flow graph visualization...")
+            paths = self._visualize_token_flow_graph(trace_results, target_text, target_idx, save_dir)
+            saved_paths.extend(paths)
+        except Exception as e:
+            print(f"Error visualizing token flow graph: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # 2. Visualize the trace as a stacked bar chart
         try:
             paths = self._visualize_source_distribution(trace_results, target_text, target_idx, save_dir)
             saved_paths.extend(paths)
@@ -1476,7 +1508,7 @@ class EnhancedSemanticTracer:
             import traceback
             traceback.print_exc()
         
-        # 2. Visualize the semantic evolution using logit lens
+        # 3. Visualize the semantic evolution using logit lens
         try:
             paths = self._visualize_semantic_evolution(trace_results, target_text, target_idx, save_dir)
             saved_paths.extend(paths)
@@ -1485,7 +1517,7 @@ class EnhancedSemanticTracer:
             import traceback
             traceback.print_exc()
         
-        # 3. Visualize image token heatmaps if available - pass input_data
+        # 4. Visualize image token heatmaps if available - pass input_data
         try:
             paths = self._visualize_image_token_heatmaps(
                 trace_results, 
@@ -1500,7 +1532,7 @@ class EnhancedSemanticTracer:
             import traceback
             traceback.print_exc()
         
-        # 4. Create a text report
+        # 5. Create a text report
         try:
             report_path = self._create_text_report(
                 {"trace_results": trace_results, "target_token": {"text": target_text, "index": target_idx}}, 
@@ -1512,7 +1544,7 @@ class EnhancedSemanticTracer:
             import traceback
             traceback.print_exc()
         
-        # 5. Create trace data visualization from CSV if available
+        # 6. Create trace data visualization from CSV if available
         try:
             trace_data_path = special_keys.get("trace_data_path")
             if trace_data_path and os.path.exists(trace_data_path):
@@ -1689,6 +1721,127 @@ class EnhancedSemanticTracer:
         
         return output_path
 
+
+    def _visualize_trace_data(
+        self,
+        csv_path: str,
+        target_text: str,
+        target_idx: int,
+        save_dir: str
+    ) -> List[str]:
+        """Visualize trace data from the CSV file"""
+        saved_paths = []
+        
+        if not os.path.exists(csv_path):
+            print(f"Trace data CSV not found at {csv_path}")
+            return saved_paths
+                
+        try:
+            df = pd.read_csv(csv_path)
+            
+            # Create directory for trace visualizations
+            trace_vis_dir = os.path.join(save_dir, "trace_data_plots")
+            os.makedirs(trace_vis_dir, exist_ok=True)
+            
+            # 1. Top predicted tokens by layer
+            fig, ax = plt.subplots(figsize=(12, 8))
+            
+            # Focus on unique token positions
+            token_positions = df["token_index"].unique()
+            
+            # Create color map for token positions
+            cmap = plt.cm.get_cmap('tab20', len(token_positions))
+            color_map = {pos: cmap(i) for i, pos in enumerate(token_positions)}
+            
+            # Group by layer and get top predicted tokens
+            layers = sorted(df["layer"].unique())
+            
+            # For each unique token position, plot its top prediction probability across layers
+            for pos in token_positions:
+                token_df = df[df["token_index"] == pos]
+                if len(token_df) >= len(layers) * 0.5:  # Only include if present in at least half the layers
+                    token_text = token_df["token_text"].iloc[0]
+                    layer_probs = []
+                    
+                    for layer in layers:
+                        layer_row = token_df[token_df["layer"] == layer]
+                        if not layer_row.empty:
+                            prob = layer_row["predicted_top_prob"].iloc[0]
+                            layer_probs.append(prob)
+                        else:
+                            layer_probs.append(None)
+                    
+                    # Plot with positions that have data
+                    valid_indices = [i for i, p in enumerate(layer_probs) if p is not None]
+                    valid_layers = [layers[i] for i in valid_indices]
+                    valid_probs = [layer_probs[i] for i in valid_indices]
+                    
+                    if valid_probs:
+                        ax.plot(valid_layers, valid_probs, marker='o', label=f"{pos}: '{token_text}'", 
+                                color=color_map[pos], linewidth=2, alpha=0.8)
+            
+            ax.set_xlabel("Layer")
+            ax.set_ylabel("Top Prediction Probability")
+            ax.set_title(f"Top Token Prediction Confidence by Layer for Target '{target_text}'")
+            ax.grid(True, linestyle='--', alpha=0.7)
+            ax.set_xticks(layers)
+            
+            # Add legend with reasonable size
+            if len(token_positions) > 15:
+                # Too many tokens, use a compact legend
+                ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize='small')
+            else:
+                ax.legend(loc='best')
+                
+            plt.tight_layout()
+            
+            # Save figure
+            save_path = os.path.join(trace_vis_dir, f"top_predictions_by_layer_{target_idx}.png")
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            saved_paths.append(save_path)
+            
+            plt.close(fig)
+            
+            # 2. Create heatmap of all concept probabilities for key tokens
+            concept_cols = [col for col in df.columns if col.startswith("concept_") and col.endswith("_prob")]
+            if concept_cols:
+                token_probs = df.groupby('token_index').agg({
+                    'token_text': 'first',
+                    'token_type': 'first',
+                    **{col: 'max' for col in concept_cols}
+                }).reset_index()
+                
+                # Select tokens with at least one significant concept probability
+                token_probs['max_concept_prob'] = token_probs[concept_cols].max(axis=1)
+                significant_tokens = token_probs[token_probs['max_concept_prob'] > 0.05]
+                
+                if len(significant_tokens) > 0:
+                    # Create a heatmap
+                    plt.figure(figsize=(12, max(6, len(significant_tokens) * 0.4)))
+                    
+                    # Prepare data for heatmap
+                    heatmap_data = significant_tokens.set_index('token_text')[concept_cols]
+                    # Rename columns to just concept names
+                    heatmap_data.columns = [col.replace("concept_", "").replace("_prob", "") for col in concept_cols]
+                    
+                    # Create heatmap
+                    sns.heatmap(heatmap_data, cmap='YlOrRd', annot=True, fmt='.2f', cbar_kws={'label': 'Probability'})
+                    plt.title(f'Maximum Concept Probabilities for Key Tokens - Target {target_idx}: "{target_text}"')
+                    plt.tight_layout()
+                    
+                    # Save figure
+                    save_path = os.path.join(trace_vis_dir, f"concept_heatmap_{target_idx}.png")
+                    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+                    saved_paths.append(save_path)
+                    
+                    plt.close()
+        
+        except Exception as e:
+            print(f"Error visualizing trace data: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return saved_paths
     def _visualize_multi_token_concept_evolution(
         self,
         all_traces: List[Dict[str, Dict[str, Any]]],
@@ -2168,11 +2321,31 @@ class EnhancedSemanticTracer:
                 path_layer_map = {}
                 for p in image_paths:
                     try:
-                        layer_num_str = os.path.basename(p).split('_')[2]  # Assumes format like "base_influence_layer_32_..."
-                        path_layer_map[int(layer_num_str)] = p
-                    except (IndexError, ValueError):
-                        print(f"Could not extract layer number from filename: {os.path.basename(p)}")
-                
+                        # More robust layer extraction from filename
+                        filename = os.path.basename(p)
+                        parts = filename.split('_')
+                        layer_num = None
+                        
+                        # Look for "layer_X" pattern in filename
+                        for i, part in enumerate(parts):
+                            if part == "layer" and i+1 < len(parts) and parts[i+1].isdigit():
+                                layer_num = int(parts[i+1])
+                                break
+                        
+                        # Fallback: Try other patterns commonly found in filenames
+                        if layer_num is None:
+                            for part in parts:
+                                if part.isdigit() and 0 <= int(part) < 100:  # Reasonable layer range
+                                    layer_num = int(part)
+                                    break
+                        
+                        if layer_num is not None:
+                            path_layer_map[layer_num] = p
+                        else:
+                            print(f"Could not extract layer number from filename: {filename}")
+                    except (IndexError, ValueError) as e:
+                        print(f"Could not extract layer number from filename: {os.path.basename(p)}: {e}")
+                    
                 # Rebuild lists based on layers
                 matched_paths = [path_layer_map.get(l) for l in layers]
                 filtered_layers = [l for l, p in zip(layers, matched_paths) if p is not None]
@@ -2185,6 +2358,7 @@ class EnhancedSemanticTracer:
                 image_paths = filtered_paths
                 layers = filtered_layers
             
+            # Rest of the function remains the same...
             # Load first image to get dimensions
             with Image.open(image_paths[0]) as img:
                 img_w, img_h = img.size
@@ -2270,180 +2444,300 @@ class EnhancedSemanticTracer:
             import traceback
             traceback.print_exc()
             return None
+
     
-    def _visualize_trace_data(
+    def _visualize_token_flow_graph(
         self,
-        csv_path: str,
+        trace_results: Dict[str, Dict[str, Any]],
         target_text: str,
         target_idx: int,
-        save_dir: str
+        save_dir: str,
+        title: str = None,
+        max_layers: int = None
     ) -> List[str]:
-        """Visualize trace data from the CSV file"""
+        """
+        Visualizes the semantic trace as a flow graph showing token connections across layers.
+        
+        Creates a layered visualization with:
+        - One column per model layer
+        - Tokens as nodes colored by type (image=red, text=blue, generated=green)
+        - Connections between source and target tokens across layers
+        - Line thickness representing saliency score contributions
+        - Each token showing its text and highest predicted logit
+        
+        Args:
+            trace_results: Dictionary with trace results for each layer
+            target_text: Text of the target token
+            target_idx: Index of the target token
+            save_dir: Directory to save visualizations
+            title: Custom title for the visualization
+            max_layers: Maximum number of layers to include (None = all)
+            
+        Returns:
+            List of saved file paths
+        """
+        import matplotlib.pyplot as plt
+        import networkx as nx
+        
         saved_paths = []
         
-        if not os.path.exists(csv_path):
-            print(f"Trace data CSV not found at {csv_path}")
-            return saved_paths
-            
-        try:
-            df = pd.read_csv(csv_path)
-            
-            # Create directory for trace visualizations
-            trace_vis_dir = os.path.join(save_dir, "trace_data_plots")
-            os.makedirs(trace_vis_dir, exist_ok=True)
-            
-            # 1. Top predicted tokens by layer
-            fig, ax = plt.subplots(figsize=(12, 8))
-            
-            # Focus on unique token positions
-            token_positions = df["token_index"].unique()
-            
-            # Create color map for token positions
-            cmap = plt.cm.get_cmap('tab20', len(token_positions))
-            color_map = {pos: cmap(i) for i, pos in enumerate(token_positions)}
-            
-            # Group by layer and get top predicted tokens
-            layers = sorted(df["layer"].unique())
-            
-            # For each unique token position, plot its top prediction probability across layers
-            for pos in token_positions:
-                token_df = df[df["token_index"] == pos]
-                if len(token_df) >= len(layers) * 0.5:  # Only include if present in at least half the layers
-                    token_text = token_df["token_text"].iloc[0]
-                    layer_probs = []
-                    
-                    for layer in layers:
-                        layer_row = token_df[token_df["layer"] == layer]
-                        if not layer_row.empty:
-                            prob = layer_row["predicted_top_prob"].iloc[0]
-                            layer_probs.append(prob)
-                        else:
-                            layer_probs.append(None)
-                    
-                    # Plot with positions that have data
-                    valid_indices = [i for i, p in enumerate(layer_probs) if p is not None]
-                    valid_layers = [layers[i] for i in valid_indices]
-                    valid_probs = [layer_probs[i] for i in valid_indices]
-                    
-                    if valid_probs:
-                        ax.plot(valid_layers, valid_probs, marker='o', label=f"{pos}: '{token_text}'", 
-                                color=color_map[pos], linewidth=2, alpha=0.8)
-            
-            ax.set_xlabel("Layer")
-            ax.set_ylabel("Top Prediction Probability")
-            ax.set_title(f"Top Token Prediction Confidence by Layer for Target '{target_text}'")
-            ax.grid(True, linestyle='--', alpha=0.7)
-            ax.set_xticks(layers)
-            
-            # Add legend with reasonable size
-            if len(token_positions) > 15:
-                # Too many tokens, use a compact legend
-                ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize='small')
-            else:
-                ax.legend(loc='best')
-                
-            plt.tight_layout()
-            
-            # Save figure
-            save_path = os.path.join(trace_vis_dir, f"top_predictions_by_layer_{target_idx}.png")
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            saved_paths.append(save_path)
-            
-            plt.close(fig)
-            
-            # 2. Concept probabilities by layer for selected tokens
-            # Identify concepts in the data
-            concept_cols = [col for col in df.columns if col.startswith("concept_") and col.endswith("_prob")]
-            concepts = [col.replace("concept_", "").replace("_prob", "") for col in concept_cols]
-            
-            if concepts:
-                # For each concept, create a plot
-                for concept, concept_col in zip(concepts, concept_cols):
-                    fig, ax = plt.subplots(figsize=(12, 8))
-                    
-                    # Again plot by token position
-                    for pos in token_positions:
-                        token_df = df[df["token_index"] == pos]
-                        if len(token_df) >= len(layers) * 0.5:  # Only include if present in at least half the layers
-                            token_text = token_df["token_text"].iloc[0]
-                            layer_probs = []
-                            
-                            for layer in layers:
-                                layer_row = token_df[token_df["layer"] == layer]
-                                if not layer_row.empty and concept_col in layer_row.columns:
-                                    prob = layer_row[concept_col].iloc[0]
-                                    layer_probs.append(prob)
-                                else:
-                                    layer_probs.append(None)
-                            
-                            # Plot with positions that have data
-                            valid_indices = [i for i, p in enumerate(layer_probs) if p is not None]
-                            valid_layers = [layers[i] for i in valid_indices]
-                            valid_probs = [layer_probs[i] for i in valid_indices]
-                            
-                            if valid_probs and max(valid_probs) > 0.01:  # Only show tokens with some probability
-                                ax.plot(valid_layers, valid_probs, marker='o', label=f"{pos}: '{token_text}'", 
-                                        color=color_map[pos], linewidth=2, alpha=0.8)
-                    
-                    ax.set_xlabel("Layer")
-                    ax.set_ylabel(f"'{concept}' Probability")
-                    ax.set_title(f"Concept '{concept}' Probability by Layer for Target '{target_text}'")
-                    ax.grid(True, linestyle='--', alpha=0.7)
-                    ax.set_xticks(layers)
-                    
-                    # Add legend with reasonable size
-                    if ax.get_legend_handles_labels()[0]:  # Only add legend if there are items
-                        if len(token_positions) > 15:
-                            # Too many tokens, use a compact legend
-                            ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize='small')
-                        else:
-                            ax.legend(loc='best')
-                    
-                    plt.tight_layout()
-                    
-                    # Save figure
-                    save_path = os.path.join(trace_vis_dir, f"concept_{concept}_by_layer_{target_idx}.png")
-                    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-                    saved_paths.append(save_path)
-                    
-                    plt.close(fig)
-                
-                # 3. Create heatmap of all concept probabilities for key tokens
-                # Group by token_index and get max probability for each concept
-                token_probs = df.groupby('token_index').agg({
-                    'token_text': 'first',
-                    'token_type': 'first',
-                    **{col: 'max' for col in concept_cols}
-                }).reset_index()
-                
-                # Select tokens with at least one significant concept probability
-                token_probs['max_concept_prob'] = token_probs[concept_cols].max(axis=1)
-                significant_tokens = token_probs[token_probs['max_concept_prob'] > 0.05]
-                
-                if len(significant_tokens) > 0:
-                    # Create a heatmap
-                    plt.figure(figsize=(12, max(6, len(significant_tokens) * 0.4)))
-                    
-                    # Prepare data for heatmap
-                    heatmap_data = significant_tokens.set_index('token_text')[concept_cols]
-                    # Rename columns to just concept names
-                    heatmap_data.columns = concepts
-                    
-                    # Create heatmap
-                    sns.heatmap(heatmap_data, cmap='YlOrRd', annot=True, fmt='.2f', cbar_kws={'label': 'Probability'})
-                    plt.title(f'Maximum Concept Probabilities for Key Tokens - Target {target_idx}: "{target_text}"')
-                    plt.tight_layout()
-                    
-                    # Save figure
-                    save_path = os.path.join(trace_vis_dir, f"concept_heatmap_{target_idx}.png")
-                    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-                    saved_paths.append(save_path)
-                    
-                    plt.close()
+        # Extract special keys before integer conversion
+        special_keys = {}
+        for k, v in trace_results.items():
+            if not isinstance(k, int) and not k.isdigit():
+                special_keys[k] = v
         
-        except Exception as e:
-            print(f"Error visualizing trace data: {e}")
-            import traceback
-            traceback.print_exc()
+        # Handle mixed key types (string and integer)
+        int_keyed_results = {}
+        for k, v in trace_results.items():
+            # Skip special keys
+            if k == "input_data" or k == "trace_data_path":
+                continue
+                
+            try:
+                key = int(k) if isinstance(k, str) else k
+                int_keyed_results[key] = v
+            except (ValueError, TypeError):
+                print(f"Warning: Could not convert key {k} to integer, skipping.")
+                continue
+        
+        # Now replace the original dict with our sanitized version
+        trace_results = int_keyed_results
+        
+        # Sort layers (assume sequential layers)
+        layers = sorted(trace_results.keys())
+        if not layers:
+            print("Warning: No layers found in trace results.")
+            return saved_paths
+        
+        if max_layers is not None and max_layers < len(layers):
+            # Sample layers evenly if we need to reduce
+            step = len(layers) // max_layers
+            layers = layers[::step]
+            if len(layers) > max_layers:
+                layers = layers[:max_layers]
+        
+        # Create a directed graph
+        G = nx.DiGraph()
+        
+        # Dictionary to track node positions by layer
+        node_positions = {}
+        
+        # Dictionary to map token indices to node IDs
+        token_to_node = {}
+        
+        # Dictionary to store node metadata (color, label, etc.)
+        node_metadata = {}
+        
+        # Track the current set of tokens for each layer
+        current_layer_tokens = {}
+        
+        # Loop through each layer from deepest to shallowest
+        for layer_idx in reversed(layers):
+            layer_data = trace_results[layer_idx]
+            layer_name = layer_data.get("layer_name", f"Layer {layer_idx}")
+            
+            # Track tokens in this layer
+            current_layer_tokens[layer_idx] = []
+            
+            # Process each target token in this layer
+            for target in layer_data.get("target_tokens", []):
+                target_token_idx = target.get("index")
+                if target_token_idx is None:
+                    continue
+                    
+                # Create a unique node ID for this token in this layer
+                node_id = f"L{layer_idx}_T{target_token_idx}"
+                
+                # Get top prediction from logit lens if available
+                top_pred = ""
+                logit_lens = layer_data.get("logit_lens_projections", {}).get(target_token_idx, {})
+                if not logit_lens and isinstance(target_token_idx, int):
+                    # Try looking up as string key
+                    logit_lens = layer_data.get("logit_lens_projections", {}).get(str(target_token_idx), {})
+                
+                if logit_lens:
+                    top_predictions = logit_lens.get("top_predictions", [])
+                    if top_predictions and len(top_predictions) > 0:
+                        top_pred = f"→{top_predictions[0].get('token_text', '')}"
+                
+                # Store node metadata
+                node_metadata[node_id] = {
+                    "type": target.get("type", 0),  # 0=generated, 1=text, 2=image
+                    "text": target.get("text", ""),
+                    "idx": target_token_idx,
+                    "layer": layer_idx,
+                    "top_pred": top_pred
+                }
+                
+                # Add node to graph
+                G.add_node(node_id)
+                
+                # Track this token in the current layer
+                current_layer_tokens[layer_idx].append(node_id)
+                
+                # Map token index to node ID
+                if target_token_idx not in token_to_node:
+                    token_to_node[target_token_idx] = {}
+                token_to_node[target_token_idx][layer_idx] = node_id
+                
+                # Process sources for this target
+                for source in target.get("sources", []):
+                    source_idx = source.get("index")
+                    if source_idx is None:
+                        continue
+                    
+                    # Look for this source in the next deeper layer
+                    source_layer = None
+                    for l in reversed(layers):
+                        if l < layer_idx and source_idx in token_to_node and l in token_to_node[source_idx]:
+                            source_layer = l
+                            break
+                    
+                    if source_layer is None:
+                        # Source not found in previous layers, create it in this layer
+                        source_node_id = f"L{layer_idx}_S{source_idx}"
+                        
+                        # Get top prediction for source if available
+                        source_top_pred = ""
+                        source_logit_lens = layer_data.get("logit_lens_projections", {}).get(source_idx, {})
+                        if not source_logit_lens and isinstance(source_idx, int):
+                            source_logit_lens = layer_data.get("logit_lens_projections", {}).get(str(source_idx), {})
+                        
+                        if source_logit_lens:
+                            source_top_predictions = source_logit_lens.get("top_predictions", [])
+                            if source_top_predictions and len(source_top_predictions) > 0:
+                                source_top_pred = f"→{source_top_predictions[0].get('token_text', '')}"
+                        
+                        # Store node metadata
+                        node_metadata[source_node_id] = {
+                            "type": source.get("type", 0),  # 0=generated, 1=text, 2=image
+                            "text": source.get("text", ""),
+                            "idx": source_idx,
+                            "layer": layer_idx,
+                            "is_source": True,
+                            "top_pred": source_top_pred
+                        }
+                        
+                        # Add node to graph
+                        G.add_node(source_node_id)
+                    else:
+                        # Source found in a previous layer
+                        source_node_id = token_to_node[source_idx][source_layer]
+                    
+                    # Add edge from source to target with saliency weight
+                    G.add_edge(
+                        source_node_id,
+                        node_id,
+                        weight=source.get("scaled_weight", 0.0),
+                        saliency=source.get("saliency_score", 0.0)
+                    )
+        
+        # Position nodes by layer
+        pos = {}
+        layer_widths = {}
+        layer_heights = []
+        
+        # Calculate width for each layer based on number of nodes
+        for layer_idx in layers:
+            if layer_idx in current_layer_tokens:
+                layer_nodes = current_layer_tokens[layer_idx]
+                layer_widths[layer_idx] = max(len(layer_nodes), 1)
+                layer_heights.append(len(layer_nodes))
+        
+        # Position nodes in each layer
+        x_spacing = 1.0
+        y_spacing = 1.0
+        
+        # Calculate the widest layer
+        max_width = max(layer_widths.values()) if layer_widths else 1
+        
+        for layer_idx in layers:
+            if layer_idx in current_layer_tokens:
+                layer_nodes = current_layer_tokens[layer_idx]
+                
+                # Calculate horizontal position for this layer
+                layer_x = layers.index(layer_idx) * x_spacing
+                
+                # Calculate vertical positions for nodes in this layer
+                layer_width = layer_widths[layer_idx]
+                num_nodes = len(layer_nodes)
+                
+                if num_nodes > 0:
+                    # Calculate vertical spacing to center nodes
+                    total_height = (num_nodes - 1) * y_spacing
+                    start_y = -total_height / 2
+                    
+                    for i, node_id in enumerate(layer_nodes):
+                        pos[node_id] = (layer_x, start_y + i * y_spacing)
+        
+        # Now we need to render the graph
+        plt.figure(figsize=(max(len(layers) * 4, 12), max(int(max(layer_heights) * 0.8 if layer_heights else 1), 10)))
+        
+        # Define colors for different token types
+        token_colors = {
+            0: "#2ecc71",  # Generated = green
+            1: "#3498db",  # Text = blue
+            2: "#e74c3c"   # Image = red
+        }
+        
+        # Get node colors based on token type
+        node_colors = [token_colors.get(node_metadata.get(node, {}).get("type", 0), "#7f8c8d") for node in G.nodes()]
+        
+        # Draw nodes
+        nx.draw_networkx_nodes(
+            G, pos,
+            node_size=500,
+            node_color=node_colors,
+            alpha=0.8
+        )
+        
+        # Draw edges with width based on saliency
+        for u, v, data in G.edges(data=True):
+            width = data.get("weight", 0.0) * 10  # Scale width for visibility
+            nx.draw_networkx_edges(
+                G, pos,
+                edgelist=[(u, v)],
+                width=max(width, 0.5),  # Set minimum width
+                alpha=min(width / 2, 0.8),  # Scale alpha by width, max 0.8
+                arrows=True,
+                arrowsize=15
+            )
+        
+        # Add node labels with token text and top prediction
+        labels = {node: f"{node_metadata.get(node, {}).get('text', '')}\n{node_metadata.get(node, {}).get('top_pred', '')}" 
+                for node in G.nodes()}
+        nx.draw_networkx_labels(G, pos, labels=labels, font_size=8)
+        
+        # Add layer labels at the top
+        for i, layer_idx in enumerate(layers):
+            layer_x = i * x_spacing
+            max_y = max([y for _, y in pos.values()]) if pos else 0
+            plt.text(layer_x, max_y + 1, f"Layer {layer_idx}", 
+                    ha='center', va='center', fontsize=12, fontweight='bold')
+        
+        # Set title
+        if title is None:
+            title = f"Semantic Trace Flow Graph for Token '{target_text}' (idx: {target_idx})"
+        plt.title(title, fontsize=14)
+        
+        # Add legend for token types
+        legend_elements = [
+            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor="#3498db", markersize=10, label='Text Token'),
+            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor="#e74c3c", markersize=10, label='Image Token'),
+            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor="#2ecc71", markersize=10, label='Generated Token')
+        ]
+        plt.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.05), ncol=3)
+        
+        # Remove axis
+        plt.axis('off')
+        plt.tight_layout()
+        
+        # Save the figure
+        save_path = os.path.join(save_dir, f"flow_graph_{target_idx}.png")
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        saved_paths.append(save_path)
         
         return saved_paths
