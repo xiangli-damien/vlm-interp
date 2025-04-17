@@ -978,130 +978,7 @@ class EnhancedSemanticTracer:
             import traceback
             traceback.print_exc()
             return {}
-    
-    def visualize_trace(self, results: Dict[str, Any], save_dir: Optional[str] = None) -> List[str]:
-        """
-        Visualize the semantic tracing results with enhanced outputs.
-        
-        Args:
-            results: Results from generate_and_analyze
-            save_dir: Directory to save visualizations (defaults to self.output_dir)
-            
-        Returns:
-            List of saved file paths
-        """
-        if save_dir is None:
-            save_dir = os.path.join(self.output_dir, "visualizations")
-        
-        os.makedirs(save_dir, exist_ok=True)
-        saved_paths = []
-        
-        # Check if we have multi-token results
-        is_multi_token = "target_tokens" in results and isinstance(results["target_tokens"], list)
-        
-        if is_multi_token:
-            # Process multi-token results
-            for i, target_token in enumerate(results["target_tokens"]):
-                token_idx = target_token["index"]
-                token_text = target_token["text"]
-                token_key = f"token_{token_idx}"
-                
-                if token_key in results["trace_results"]:
-                    token_dir = os.path.join(save_dir, f"token_{token_idx}_{token_text}")
-                    os.makedirs(token_dir, exist_ok=True)
-                    
-                    trace_results = results["trace_results"][token_key]
-                    print(f"\nVisualizing trace for token {i+1}: '{token_text}' at position {token_idx}")
-                    
-                    # Visualize this token's trace
-                    token_paths = self._visualize_single_trace(trace_results, token_text, token_idx, token_dir)
-                    saved_paths.extend(token_paths)
-            
-            # Create combined visualization across all tokens
-            combined_dir = os.path.join(save_dir, "combined")
-            os.makedirs(combined_dir, exist_ok=True)
-            combined_paths = self._visualize_combined_traces(results, combined_dir)
-            saved_paths.extend(combined_paths)
-            
-        else:
-            # Single token results (traditional format)
-            trace_results = results.get("trace_results", {})
-            if not trace_results:
-                print("No trace results to visualize.")
-                return saved_paths
-            
-            # Basic info for labeling
-            target_token = results.get("target_token", {})
-            target_text = target_token.get("text", "unknown")
-            target_idx = target_token.get("index", -1)
-            
-            # Visualize the single trace
-            token_paths = self._visualize_single_trace(trace_results, target_text, target_idx, save_dir)
-            saved_paths.extend(token_paths)
-        
-        print(f"Total visualization files created: {len(saved_paths)}")
-        return saved_paths
-    
-    def _visualize_single_trace(
-        self,
-        trace_results: Dict[int, Dict[str, Any]],
-        target_text: str,
-        target_idx: int,
-        save_dir: str
-    ) -> List[str]:
-        """Helper to visualize a single token's trace results"""
-        saved_paths = []
-        
-        # 1. Visualize the trace as a stacked bar chart
-        try:
-            paths = self._visualize_source_distribution(trace_results, target_text, target_idx, save_dir)
-            saved_paths.extend(paths)
-        except Exception as e:
-            print(f"Error visualizing source distribution: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        # 2. Visualize the semantic evolution using logit lens
-        try:
-            paths = self._visualize_semantic_evolution(trace_results, target_text, target_idx, save_dir)
-            saved_paths.extend(paths)
-        except Exception as e:
-            print(f"Error visualizing semantic evolution: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        # 3. Visualize image token heatmaps if available
-        try:
-            paths = self._visualize_image_token_heatmaps(trace_results, target_text, target_idx, save_dir)
-            saved_paths.extend(paths)
-        except Exception as e:
-            print(f"Error visualizing image token heatmaps: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        # 4. Create a text report
-        try:
-            report_path = self._create_text_report(
-                {"trace_results": trace_results, "target_token": {"text": target_text, "index": target_idx}}, 
-                os.path.join(save_dir, f"semantic_trace_report_{target_idx}.txt")
-            )
-            saved_paths.append(report_path)
-        except Exception as e:
-            print(f"Error creating text report: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        # 5. Create trace data visualization from CSV if available
-        try:
-            if "trace_data_path" in trace_results and os.path.exists(trace_results["trace_data_path"]):
-                paths = self._visualize_trace_data(trace_results["trace_data_path"], target_text, target_idx, save_dir)
-                saved_paths.extend(paths)
-        except Exception as e:
-            print(f"Error visualizing trace data: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        return saved_paths
+      
     
     def _visualize_combined_traces(self, results: Dict[str, Any], save_dir: str) -> List[str]:
         """Create visualizations combining data from multiple token traces"""
@@ -1339,17 +1216,38 @@ class EnhancedSemanticTracer:
         trace_results: Dict[str, Dict[str, Any]],
         target_text: str,
         target_idx: int,
-        save_dir: str
+        save_dir: str,
+        input_data: Optional[Dict[str, Any]] = None  # Add optional input_data parameter
     ) -> List[str]:
         """
         Visualize heatmaps of image token influence across layers by mapping tokens
         back to their spatial positions in the original image.
+        
+        Args:
+            trace_results: Dictionary with trace results for each layer
+            target_text: Text of the target token
+            target_idx: Index of the target token
+            save_dir: Directory to save visualizations
+            input_data: Optional input data with feature mapping information
+            
+        Returns:
+            List of saved file paths
         """
         saved_paths = []
+        
+        # Extract special keys before integer conversion
+        special_keys = {}
+        for k, v in trace_results.items():
+            if k == "input_data" or k == "trace_data_path":
+                special_keys[k] = v
         
         # Handle mixed key types (string and integer)
         int_keyed_results = {}
         for k, v in trace_results.items():
+            # Skip special keys
+            if k == "input_data" or k == "trace_data_path":
+                continue
+                
             try:
                 key = int(k) if isinstance(k, str) else k
                 int_keyed_results[key] = v
@@ -1357,14 +1255,16 @@ class EnhancedSemanticTracer:
                 print(f"Warning: Could not convert key {k} to integer, skipping.")
                 continue
         
+        # Now replace the original dict with our sanitized version
         trace_results = int_keyed_results
         
-        layers = sorted(trace_results.keys())
+        # Determine the source of input_data (parameter or trace_results)
+        if input_data is None:
+            input_data = special_keys.get("input_data", {})
         
-        # Get the input data with feature mapping information
-        input_data = trace_results.get("input_data", {})
+        # Get feature mapping and image information
         if not input_data:
-            print("Error: No input_data found in trace_results. Cannot visualize image token heatmaps.")
+            print("Error: No input_data found in trace_results or parameters. Cannot visualize image token heatmaps.")
             return saved_paths
         
         # Extract required data for visualization
@@ -1381,6 +1281,9 @@ class EnhancedSemanticTracer:
             print("Error: Missing original_image or spatial_preview_image. Cannot visualize.")
             return saved_paths
         
+        # Get numeric layers
+        layers = sorted(trace_results.keys())
+        
         # Extract base and patch feature information
         base_feature_info = feature_mapping.get("base_feature", {})
         patch_feature_info = feature_mapping.get("patch_feature", {})
@@ -1393,6 +1296,12 @@ class EnhancedSemanticTracer:
         patch_heatmap_dir = os.path.join(save_dir, "patch_feature_heatmaps")
         os.makedirs(base_heatmap_dir, exist_ok=True)
         os.makedirs(patch_heatmap_dir, exist_ok=True)
+        
+        # Rest of the function remains the same
+        # ...
+        
+        # Return the rest of the function implementation as is
+        # Just ensure all necessary code is retained from the original function
         
         # Process each layer
         for layer_idx in layers:
@@ -1535,6 +1444,163 @@ class EnhancedSemanticTracer:
                 except Exception as e:
                     print(f"Error creating patch composite: {e}")
         
+        return saved_paths
+
+    def _visualize_single_trace(
+        self,
+        trace_results: Dict[int, Dict[str, Any]],
+        target_text: str,
+        target_idx: int,
+        save_dir: str,
+        input_data: Optional[Dict[str, Any]] = None  # Add input_data parameter
+    ) -> List[str]:
+        """Helper to visualize a single token's trace results"""
+        saved_paths = []
+        
+        # Extract special keys before processing numeric keys
+        special_keys = {}
+        for k, v in trace_results.items():
+            if not isinstance(k, int) and not k.isdigit():
+                special_keys[k] = v
+        
+        # Try to get input_data from trace_results if not provided
+        if input_data is None and "input_data" in special_keys:
+            input_data = special_keys["input_data"]
+        
+        # 1. Visualize the trace as a stacked bar chart
+        try:
+            paths = self._visualize_source_distribution(trace_results, target_text, target_idx, save_dir)
+            saved_paths.extend(paths)
+        except Exception as e:
+            print(f"Error visualizing source distribution: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # 2. Visualize the semantic evolution using logit lens
+        try:
+            paths = self._visualize_semantic_evolution(trace_results, target_text, target_idx, save_dir)
+            saved_paths.extend(paths)
+        except Exception as e:
+            print(f"Error visualizing semantic evolution: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # 3. Visualize image token heatmaps if available - pass input_data
+        try:
+            paths = self._visualize_image_token_heatmaps(
+                trace_results, 
+                target_text, 
+                target_idx, 
+                save_dir,
+                input_data=input_data
+            )
+            saved_paths.extend(paths)
+        except Exception as e:
+            print(f"Error visualizing image token heatmaps: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # 4. Create a text report
+        try:
+            report_path = self._create_text_report(
+                {"trace_results": trace_results, "target_token": {"text": target_text, "index": target_idx}}, 
+                os.path.join(save_dir, f"semantic_trace_report_{target_idx}.txt")
+            )
+            saved_paths.append(report_path)
+        except Exception as e:
+            print(f"Error creating text report: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # 5. Create trace data visualization from CSV if available
+        try:
+            trace_data_path = special_keys.get("trace_data_path")
+            if trace_data_path and os.path.exists(trace_data_path):
+                paths = self._visualize_trace_data(trace_data_path, target_text, target_idx, save_dir)
+                saved_paths.extend(paths)
+        except Exception as e:
+            print(f"Error visualizing trace data: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return saved_paths
+
+    def visualize_trace(self, results: Dict[str, Any], save_dir: Optional[str] = None) -> List[str]:
+        """
+        Visualize the semantic tracing results with enhanced outputs.
+        
+        Args:
+            results: Results from generate_and_analyze
+            save_dir: Directory to save visualizations (defaults to self.output_dir)
+            
+        Returns:
+            List of saved file paths
+        """
+        if save_dir is None:
+            save_dir = os.path.join(self.output_dir, "visualizations")
+        
+        os.makedirs(save_dir, exist_ok=True)
+        saved_paths = []
+        
+        # Extract top-level input_data from results
+        input_data = results.get("input_data")
+        
+        # Check if we have multi-token results
+        is_multi_token = "target_tokens" in results and isinstance(results["target_tokens"], list)
+        
+        if is_multi_token:
+            # Process multi-token results
+            for i, target_token in enumerate(results["target_tokens"]):
+                token_idx = target_token["index"]
+                token_text = target_token["text"]
+                token_key = f"token_{token_idx}"
+                
+                if token_key in results["trace_results"]:
+                    token_dir = os.path.join(save_dir, f"token_{token_idx}_{token_text}")
+                    os.makedirs(token_dir, exist_ok=True)
+                    
+                    trace_results = results["trace_results"][token_key]
+                    print(f"\nVisualizing trace for token {i+1}: '{token_text}' at position {token_idx}")
+                    
+                    # Pass input_data to visualization
+                    token_paths = self._visualize_single_trace(
+                        trace_results, 
+                        token_text, 
+                        token_idx, 
+                        token_dir,
+                        input_data=input_data
+                    )
+                    saved_paths.extend(token_paths)
+            
+            # Create combined visualization across all tokens
+            combined_dir = os.path.join(save_dir, "combined")
+            os.makedirs(combined_dir, exist_ok=True)
+            combined_paths = self._visualize_combined_traces(results, combined_dir)
+            saved_paths.extend(combined_paths)
+            
+        else:
+            # Single token results (traditional format)
+            trace_results = results.get("trace_results", {})
+            if not trace_results:
+                print("No trace results to visualize.")
+                return saved_paths
+            
+            # Basic info for labeling
+            target_token = results.get("target_token", {})
+            target_text = target_token.get("text", "unknown")
+            target_idx = target_token.get("index", -1)
+            
+            # Visualize the single trace - pass input_data
+            token_paths = self._visualize_single_trace(
+                trace_results, 
+                target_text, 
+                target_idx, 
+                save_dir,
+                input_data=input_data
+            )
+            saved_paths.extend(token_paths)
+        
+        print(f"Total visualization files created: {len(saved_paths)}")
         return saved_paths
 
     def _create_text_report(self, results: Dict[str, Any], output_path: str) -> str:
