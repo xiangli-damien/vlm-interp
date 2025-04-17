@@ -349,6 +349,10 @@ def run_semantic_tracing_experiment(
     image_size: Tuple[int, int] = (224, 224),  # Reduced size to save memory
     concepts_to_track: Optional[List[str]] = None,
     normalize_weights: bool = True,
+    single_forward_pass: bool = False,  # New parameter for one-time forward pass
+    analyze_last_token: bool = False,   # New parameter to analyze last token in prompt
+    output_format: str = "both",        # Output format: png, svg, or both
+    align_tokens_by_layer: bool = True, # Align tokens in columns by layer
     debug: bool = False
 ):
     """
@@ -366,6 +370,10 @@ def run_semantic_tracing_experiment(
         image_size: Size to resize the image to
         concepts_to_track: List of concepts to track with logit lens
         normalize_weights: Whether to normalize token importance weights between layers
+        single_forward_pass: Use one forward pass for all layers (reduces memory usage)
+        analyze_last_token: Whether to analyze the last token in the given prompt
+        output_format: Format for flow graph output (png, svg, or both)
+        align_tokens_by_layer: Whether to align tokens in columns for each layer
         debug: Whether to print additional debug information
     
     Returns:
@@ -382,6 +390,7 @@ def run_semantic_tracing_experiment(
     print(f"Prompt: {prompt}")
     print(f"Output Directory: {output_dir}")
     print(f"Number of tokens to analyze: {num_tokens}")
+    print(f"Using single forward pass: {single_forward_pass}")
     
     # 1. Load model and processor
     print("\nLoading model and processor...")
@@ -410,24 +419,42 @@ def run_semantic_tracing_experiment(
     print("\nPreparing inputs...")
     input_data = tracer.prepare_inputs(image, prompt)
     
-    # 5. Run semantic tracing - handling multiple tokens if requested
+    # 5. Run semantic tracing based on the selected mode
     print("\nRunning semantic tracing...")
-    if num_tokens > 1 and target_token_idx is None:
-        print(f"Analyzing {num_tokens} consecutive tokens...")
+    
+    if analyze_last_token:
+        # Analyze the last token in the prompt directly
+        trace_results = tracer.analyze_last_token(
+            input_data=input_data,
+            single_forward_pass=single_forward_pass
+        )
+    elif num_tokens > 1 and target_token_idx is None:
+        # Analyze multiple consecutively generated tokens
         trace_results = tracer.generate_and_analyze_multiple(
             input_data=input_data,
-            num_tokens=num_tokens
+            num_tokens=num_tokens,
+            batch_compute=not single_forward_pass  # Use batch compute if not using single forward pass
         )
     else:
+        # Standard single token analysis
         trace_results = tracer.generate_and_analyze(
             input_data=input_data,
             target_token_idx=target_token_idx,
-            num_tokens=num_tokens if target_token_idx is None else 1
+            num_tokens=num_tokens if target_token_idx is None else 1,
+            batch_compute=not single_forward_pass  # Use batch compute if not using single forward pass
         )
     
-    # 6. Visualize results
+    # 6. Visualize results with enhanced parameters
     print("\nVisualizing results...")
-    visualization_paths = tracer.visualize_trace(trace_results)
+    visualization_paths = tracer.visualize_trace(
+        trace_results,
+        flow_graph_params={
+            "output_format": output_format,
+            "align_tokens_by_layer": align_tokens_by_layer,
+            "show_orphaned_nodes": False,
+            "use_variable_node_size": True
+        }
+    )
     
     # 7. Add visualization paths to results
     trace_results["visualization_paths"] = visualization_paths
