@@ -346,14 +346,17 @@ def run_semantic_tracing_experiment(
     num_tokens: int = 1,
     use_4bit: bool = True,
     target_token_idx: Optional[int] = None,
-    image_size: Tuple[int, int] = (224, 224),  # Reduced size to save memory
+    image_size: Tuple[int, int] = (336, 336),
     concepts_to_track: Optional[List[str]] = None,
     normalize_weights: bool = True,
-    single_forward_pass: bool = False,  # New parameter for one-time forward pass
-    analyze_last_token: bool = False,   # New parameter to analyze last token in prompt
-    output_format: str = "both",        # Output format: png, svg, or both
-    align_tokens_by_layer: bool = True, # Align tokens in columns by layer
-    debug: bool = False
+    single_forward_pass: bool = False,
+    analyze_last_token: bool = False,
+    output_format: str = "both",
+    align_tokens_by_layer: bool = True,
+    show_orphaned_nodes: bool = True,
+    min_edge_weight: float = 0.00,
+    use_variable_node_size: bool = True,
+    debug_mode: bool = False
 ):
     """
     Run a complete semantic tracing experiment, with support for multi-token analysis.
@@ -374,7 +377,10 @@ def run_semantic_tracing_experiment(
         analyze_last_token: Whether to analyze the last token in the given prompt
         output_format: Format for flow graph output (png, svg, or both)
         align_tokens_by_layer: Whether to align tokens in columns for each layer
-        debug: Whether to print additional debug information
+        show_orphaned_nodes: Whether to show nodes with no connections
+        min_edge_weight: Minimum edge weight to display (filters weak connections)
+        use_variable_node_size: Whether to vary node size based on weight
+        debug_mode: Whether to print detailed debug information during flow graph creation
     
     Returns:
         Dictionary with experiment results
@@ -389,8 +395,14 @@ def run_semantic_tracing_experiment(
     print(f"Image: {image_path}")
     print(f"Prompt: {prompt}")
     print(f"Output Directory: {output_dir}")
-    print(f"Number of tokens to analyze: {num_tokens}")
-    print(f"Using single forward pass: {single_forward_pass}")
+    
+    # Print analysis mode information
+    if analyze_last_token:
+        print(f"Mode: Analyzing last token in prompt")
+    elif single_forward_pass:
+        print(f"Mode: Single forward pass, generating {num_tokens} token(s)")
+    else:
+        print(f"Mode: Multi-token analysis, generating {num_tokens} token(s)")
     
     # 1. Load model and processor
     print("\nLoading model and processor...")
@@ -412,7 +424,7 @@ def run_semantic_tracing_experiment(
         output_dir=output_dir,
         logit_lens_concepts=concepts_to_track,
         normalize_weights=normalize_weights,
-        debug=debug
+        debug=debug_mode
     )
     
     # 4. Prepare inputs
@@ -433,7 +445,7 @@ def run_semantic_tracing_experiment(
         trace_results = tracer.generate_and_analyze_multiple(
             input_data=input_data,
             num_tokens=num_tokens,
-            batch_compute=not single_forward_pass  # Use batch compute if not using single forward pass
+            batch_compute=not single_forward_pass
         )
     else:
         # Standard single token analysis
@@ -441,19 +453,23 @@ def run_semantic_tracing_experiment(
             input_data=input_data,
             target_token_idx=target_token_idx,
             num_tokens=num_tokens if target_token_idx is None else 1,
-            batch_compute=not single_forward_pass  # Use batch compute if not using single forward pass
+            batch_compute=not single_forward_pass
         )
     
     # 6. Visualize results with enhanced parameters
     print("\nVisualizing results...")
+    flow_graph_params = {
+        "output_format": output_format,
+        "align_tokens_by_layer": align_tokens_by_layer,
+        "show_orphaned_nodes": show_orphaned_nodes,
+        "min_edge_weight": min_edge_weight,
+        "use_variable_node_size": use_variable_node_size,
+        "debug_mode": debug_mode
+    }
+    
     visualization_paths = tracer.visualize_trace(
         trace_results,
-        flow_graph_params={
-            "output_format": output_format,
-            "align_tokens_by_layer": align_tokens_by_layer,
-            "show_orphaned_nodes": False,
-            "use_variable_node_size": True
-        }
+        flow_graph_params=flow_graph_params
     )
     
     # 7. Add visualization paths to results

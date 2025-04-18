@@ -2570,12 +2570,13 @@ class EnhancedSemanticTracer:
         max_layers: int = None,
         output_format: str = "both",  # "png", "svg", or "both"
         align_tokens_by_layer: bool = True,
-        show_orphaned_nodes: bool = False,
-        min_edge_weight: float = 0.05,
+        show_orphaned_nodes: bool = True,  # Changed default to True
+        min_edge_weight: float = 0.00,
         use_variable_node_size: bool = True,
-        min_node_size: int = 250,
+        min_node_size: int = 400,
         max_node_size: int = 1200,
-        font_family: str = "DejaVu Sans, Arial, Helvetica, sans-serif"
+        font_family: str = "DejaVu Sans, Arial, Helvetica, sans-serif",
+        debug_mode: bool = False  # Add debug mode for troubleshooting
     ) -> List[str]:
         """
         Visualizes the semantic trace as a flow graph showing token connections across layers.
@@ -2603,6 +2604,7 @@ class EnhancedSemanticTracer:
             min_node_size: Minimum node size for visualization
             max_node_size: Maximum node size for visualization
             font_family: Font families to use, comma-separated for fallbacks
+            debug_mode: Whether to print debug information
             
         Returns:
             List of saved file paths
@@ -2653,38 +2655,45 @@ class EnhancedSemanticTracer:
         # Create a directed graph
         G = nx.DiGraph()
         
-        # Dictionary to track node positions by layer
-        node_positions = {}
-        
         # Dictionary to map token indices to node IDs
-        token_to_node = {}
+        token_to_node = {}  # {token_idx: {layer_idx: node_id}}
         
-        # Dictionary to store node metadata (color, label, etc.)
-        node_metadata = {}
+        # Dictionary to store node metadata
+        node_metadata = {}  # {node_id: {metadata}}
         
-        # Track tokens per layer for positioning
-        layer_tokens = {layer_idx: [] for layer_idx in layers}
-        token_layers = {}  # Maps token_idx to its first appearance layer
+        # Dictionary to track tokens by layer
+        layer_tokens = {layer_idx: [] for layer_idx in layers}  # {layer_idx: [token_indices]}
         
-        # First pass: collect all target and source tokens and their layers
-        for layer_idx in reversed(layers):
+        # Track all unique token indices
+        all_token_indices = set()
+        
+        if debug_mode:
+            print("DEBUG MODE: Processing trace results to create flow graph")
+            print(f"Found {len(layers)} layers: {layers}")
+        
+        # PHASE 1: First pass to collect all tokens and create initial nodes
+        for layer_idx in layers:
             layer_data = trace_results[layer_idx]
             
-            # Process all targets in this layer
+            if debug_mode:
+                print(f"\nDEBUG: Processing layer {layer_idx}")
+                num_targets = len(layer_data.get("target_tokens", []))
+                print(f"Found {num_targets} target tokens in layer {layer_idx}")
+            
+            # Process target tokens in this layer
             for target in layer_data.get("target_tokens", []):
                 target_token_idx = target.get("index")
                 if target_token_idx is None:
                     continue
-                    
-                # Store in layer tokens if we haven't seen this token before
-                if target_token_idx not in token_layers:
-                    token_layers[target_token_idx] = layer_idx
-                    layer_tokens[layer_idx].append(target_token_idx)
                 
-                # Create unique node ID
+                # Add to tracking collections
+                all_token_indices.add(target_token_idx)
+                layer_tokens[layer_idx].append(target_token_idx)
+                
+                # Create node ID for this target
                 node_id = f"L{layer_idx}_T{target_token_idx}"
                 
-                # Get top prediction
+                # Get top prediction if available
                 top_pred = ""
                 logit_lens = layer_data.get("logit_lens_projections", {}).get(target_token_idx, {})
                 if not logit_lens and isinstance(target_token_idx, int):
@@ -2699,7 +2708,7 @@ class EnhancedSemanticTracer:
                 
                 # Store node metadata
                 node_metadata[node_id] = {
-                    "type": target.get("type", 0),  # 0=generated, 1=text, 2=image
+                    "type": target.get("type", 0),
                     "text": target.get("text", ""),
                     "idx": target_token_idx,
                     "layer": layer_idx,
@@ -2708,7 +2717,7 @@ class EnhancedSemanticTracer:
                     "is_target": True
                 }
                 
-                # Register token -> node mapping
+                # Register this node in token_to_node lookup
                 if target_token_idx not in token_to_node:
                     token_to_node[target_token_idx] = {}
                 token_to_node[target_token_idx][layer_idx] = node_id
@@ -2719,15 +2728,15 @@ class EnhancedSemanticTracer:
                     if source_idx is None:
                         continue
                     
-                    # Store in layer tokens if we haven't seen this token before
-                    if source_idx not in token_layers:
-                        token_layers[source_idx] = layer_idx
+                    # Add source to tracking collections
+                    all_token_indices.add(source_idx)
+                    if source_idx not in layer_tokens[layer_idx]:
                         layer_tokens[layer_idx].append(source_idx)
                     
-                    # Create unique node ID for this source
+                    # Create node ID for this source in current layer
                     source_node_id = f"L{layer_idx}_S{source_idx}"
                     
-                    # Get top prediction for source
+                    # Get top prediction for source if available
                     source_top_pred = ""
                     source_logit_lens = layer_data.get("logit_lens_projections", {}).get(source_idx, {})
                     if not source_logit_lens and isinstance(source_idx, int):
@@ -2740,7 +2749,7 @@ class EnhancedSemanticTracer:
                             prob = source_top_predictions[0].get('probability', 0)
                             source_top_pred = f"→{pred_text} ({prob:.2f})"
                     
-                    # Store node metadata
+                    # Store source metadata
                     node_metadata[source_node_id] = {
                         "type": source.get("type", 0),
                         "text": source.get("text", ""),
@@ -2752,68 +2761,118 @@ class EnhancedSemanticTracer:
                         "is_source": True
                     }
                     
-                    # Register token -> node mapping
+                    # Register source in token_to_node lookup
                     if source_idx not in token_to_node:
                         token_to_node[source_idx] = {}
                     token_to_node[source_idx][layer_idx] = source_node_id
         
-        # Second pass: Add nodes and edges to the graph
-        for layer_idx in reversed(layers):
+        if debug_mode:
+            print(f"\nDEBUG: First pass complete")
+            print(f"Found {len(all_token_indices)} unique tokens across all layers")
+            print(f"Created {len(node_metadata)} node definitions")
+        
+        # PHASE 2: Add nodes and edges to the graph
+        for layer_idx in layers:
+            current_layer = layer_idx
+            prev_layers = [l for l in layers if l < current_layer]
+            
             layer_data = trace_results[layer_idx]
             
-            # Process each target token and its sources
+            if debug_mode:
+                print(f"\nDEBUG: Creating nodes and edges for layer {layer_idx}")
+                print(f"Previous layers available: {prev_layers}")
+            
+            # Add nodes for all targets in this layer
             for target in layer_data.get("target_tokens", []):
                 target_token_idx = target.get("index")
                 if target_token_idx is None:
                     continue
-                    
-                target_node_id = f"L{layer_idx}_T{target_token_idx}"
+                
+                # Get target node ID
+                target_node_id = token_to_node[target_token_idx].get(layer_idx)
+                if not target_node_id:
+                    continue
                 
                 # Add target node to graph
-                if target_node_id not in G:
-                    G.add_node(target_node_id)
+                G.add_node(target_node_id)
                 
-                # Process sources for this target
+                if debug_mode:
+                    print(f"Added target node: {target_node_id} for token {target_token_idx}")
+                
+                # Process each source for this target
                 for source in target.get("sources", []):
                     source_idx = source.get("index")
-                    if source_idx is None:
-                        continue
-                    
                     source_weight = source.get("scaled_weight", 0.0)
                     
-                    # Skip edges with weights below threshold
-                    if source_weight < min_edge_weight:
+                    if source_idx is None or source_weight < min_edge_weight:
                         continue
                     
-                    # Look for this source in the same layer first
-                    source_node_id = f"L{layer_idx}_S{source_idx}"
+                    # 1. First try to find source in this layer
+                    source_node_id = token_to_node.get(source_idx, {}).get(layer_idx)
                     
-                    # If source doesn't exist in this layer, try to find it in a previous layer
-                    if source_node_id not in node_metadata:
-                        # Find this source in previous layers
-                        found = False
-                        for prev_layer in [l for l in layers if l < layer_idx]:
+                    # 2. If not found in current layer, look in previous layers
+                    if not source_node_id and prev_layers:
+                        # Find the most recent previous layer containing this token
+                        for prev_layer in reversed(prev_layers):
                             if prev_layer in token_to_node.get(source_idx, {}):
                                 source_node_id = token_to_node[source_idx][prev_layer]
-                                found = True
                                 break
-                        
-                        if not found:
-                            # Shouldn't happen, but just in case
-                            print(f"Warning: Source token {source_idx} not found in any layer below {layer_idx}")
-                            continue
                     
-                    # Add source node to graph
-                    if source_node_id not in G:
+                    # Skip if no valid source node found
+                    if not source_node_id:
+                        if debug_mode:
+                            print(f"  Warning: No node found for source token {source_idx} in current or previous layers")
+                        continue
+                    
+                    # Add source node to graph if not already present
+                    if source_node_id not in G.nodes():
                         G.add_node(source_node_id)
+                        if debug_mode:
+                            print(f"  Added source node: {source_node_id} for token {source_idx}")
                     
-                    # Add edge from source to target
+                    # Add edge from source to target with weight
                     G.add_edge(
                         source_node_id,
                         target_node_id,
                         weight=source_weight,
                         saliency=source.get("saliency_score", 0.0)
                     )
+                    
+                    if debug_mode:
+                        print(f"  Added edge: {source_node_id} -> {target_node_id} with weight {source_weight:.3f}")
+        
+        # Add special edges between the same token in adjacent layers
+        # This helps ensure continuity of token paths across layers
+        for token_idx in all_token_indices:
+            token_layers = sorted(token_to_node.get(token_idx, {}).keys())
+            
+            for i in range(len(token_layers) - 1):
+                current_layer = token_layers[i]
+                next_layer = token_layers[i+1]
+                
+                # Only connect adjacent layers
+                if next_layer - current_layer > 1:
+                    continue
+                    
+                src_node_id = token_to_node[token_idx][current_layer]
+                dst_node_id = token_to_node[token_idx][next_layer]
+                
+                # Only add if both nodes are in the graph
+                if src_node_id in G.nodes() and dst_node_id in G.nodes():
+                    # Add a continuation edge with special weight
+                    G.add_edge(
+                        src_node_id,
+                        dst_node_id,
+                        weight=0.5,  # Special weight for continuation edges
+                        is_continuation=True
+                    )
+                    
+                    if debug_mode:
+                        print(f"Added continuation edge: {src_node_id} -> {dst_node_id}")
+        
+        if debug_mode:
+            print(f"\nDEBUG: Graph construction complete")
+            print(f"Created graph with {len(G.nodes())} nodes and {len(G.edges())} edges")
         
         # Remove orphaned nodes if requested
         if not show_orphaned_nodes:
@@ -2821,38 +2880,36 @@ class EnhancedSemanticTracer:
             if orphaned_nodes:
                 print(f"Removing {len(orphaned_nodes)} orphaned nodes with no connections")
                 G.remove_nodes_from(orphaned_nodes)
-                for node in orphaned_nodes:
-                    if node in node_metadata:
-                        del node_metadata[node]
         
-        # Now calculate positions for the remaining nodes
+        # Calculate positions for nodes
         pos = {}
         
         # Set standard spacing
         x_spacing = 1.0
         y_spacing = 1.0
         
+        # Get all layers present in the graph (some might have been removed)
+        graph_layers = sorted(set(node_metadata[n]["layer"] for n in G.nodes()))
+        
+        if debug_mode:
+            print(f"\nDEBUG: Calculating node positions")
+            print(f"Layers in graph: {graph_layers}")
+            
         if align_tokens_by_layer:
-            # Strategy 1: Organize nodes in strict columns by layer
-            layer_node_counts = {}
+            # Organize nodes in strict columns by layer
             layer_nodes = {}
             
-            # Group nodes by their layer
+            # Group nodes by layer
             for node in G.nodes():
-                if node in node_metadata:
-                    layer = node_metadata[node]["layer"]
-                    if layer not in layer_nodes:
-                        layer_nodes[layer] = []
-                    layer_nodes[layer].append(node)
-            
-            # Count nodes per layer
-            for layer, nodes in layer_nodes.items():
-                layer_node_counts[layer] = len(nodes)
+                layer = node_metadata[node]["layer"]
+                if layer not in layer_nodes:
+                    layer_nodes[layer] = []
+                layer_nodes[layer].append(node)
             
             # Position nodes with fixed x by layer, distributed y
             for layer_idx, layer_node_list in layer_nodes.items():
                 # Layer-specific x-coordinate
-                layer_x = layers.index(layer_idx) * x_spacing
+                layer_x = graph_layers.index(layer_idx) * x_spacing
                 
                 # Distribute nodes vertically
                 num_nodes = len(layer_node_list)
@@ -2867,12 +2924,11 @@ class EnhancedSemanticTracer:
                     for i, node_id in enumerate(layer_node_list):
                         # Position with regular vertical spacing
                         pos[node_id] = (layer_x, start_y + i * y_spacing)
+                        
+                        if debug_mode and i < 3:  # Show first few nodes only to avoid verbose output
+                            print(f"Positioned node {node_id} at ({layer_x}, {start_y + i * y_spacing})")
         else:
-            # Strategy 2: Allow more flexible positioning (potentially better for complex graphs)
-            # Use networkx's layout algorithms with layer constraints
-            # This is important for layer 0 which might otherwise collapse
-            
-            # Set fixed x positions by layer, but let y positions be determined by a layout algorithm
+            # More flexible positioning using a spring layout with constraints
             fixed_pos = {}
             y_pos = {}
             
@@ -2881,7 +2937,8 @@ class EnhancedSemanticTracer:
                 if node in node_metadata:
                     layer = node_metadata[node]["layer"]
                     # Set fixed x position by layer
-                    fixed_pos[node] = (layers.index(layer) * x_spacing, 0)
+                    layer_index = graph_layers.index(layer)
+                    fixed_pos[node] = (layer_index * x_spacing, 0)
                     # Track token index for initial y position
                     token_idx = node_metadata[node]["idx"]
                     if layer not in y_pos:
@@ -2902,19 +2959,26 @@ class EnhancedSemanticTracer:
                     y = -num_nodes/2 * y_spacing + i * y_spacing
                     init_pos[node] = (x, y)
             
-            # Use a layout that respects our constraints but adjusts for connections
+            # Use spring layout with fixed x positions
             pos = nx.spring_layout(
                 G, 
                 pos=init_pos,
-                fixed=[node for node in G.nodes()],  # Fix all x positions
-                k=0.2,  # More compact layout
+                fixed=list(G.nodes()),  # Fix all positions initially
+                k=0.3,  # Spring constant
                 iterations=50  # More iterations for better arrangement
             )
+            
+            # Now adjust only y-positions while keeping x-positions fixed by layer
+            for node, (x, y) in pos.items():
+                layer = node_metadata[node]["layer"]
+                layer_index = graph_layers.index(layer)
+                pos[node] = (layer_index * x_spacing, y)  # Keep fixed x by layer
         
-        # Now get ready to render the graph
+        # Now render the graph
         # Calculate figure size based on number of layers and nodes
-        max_nodes_per_layer = max([len([n for n in G.nodes() if node_metadata.get(n, {}).get("layer") == l]) for l in layers], default=1)
-        fig_width = max(len(layers) * 3, 12)  # Width scales with layers
+        max_nodes_per_layer = max([len([n for n in G.nodes() if node_metadata.get(n, {}).get("layer") == l]) 
+                                for l in graph_layers], default=1)
+        fig_width = max(len(graph_layers) * 3, 12)  # Width scales with layers
         fig_height = max(max_nodes_per_layer * 0.8, 8)  # Height scales with max nodes in any layer
         
         plt.figure(figsize=(fig_width, fig_height))
@@ -2929,7 +2993,7 @@ class EnhancedSemanticTracer:
             2: "#e74c3c"   # Image = red
         }
         
-        # Calculate node sizes based on weights if requested
+        # Calculate node sizes based on weights
         if use_variable_node_size:
             # Get all weights
             all_weights = [
@@ -2982,9 +3046,16 @@ class EnhancedSemanticTracer:
         # Draw edges with width based on saliency/weight
         edge_width_multiplier = 5.0  # Controls overall edge thickness
         
+        # Draw regular edges
+        regular_edges = [(u, v) for u, v, d in G.edges(data=True) if not d.get('is_continuation', False)]
+        continuation_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('is_continuation', False)]
+        
         # Draw edges in two passes for better visualization
         # First a white "halo" for contrast
         for u, v, data in G.edges(data=True):
+            if data.get('is_continuation', False):
+                continue  # Skip continuation edges in this pass
+                
             weight = data.get("weight", 0.0)
             width = weight * edge_width_multiplier 
             if width >= min_edge_weight * edge_width_multiplier:
@@ -2998,6 +3069,9 @@ class EnhancedSemanticTracer:
         
         # Then the actual edges with proper width and alpha
         for u, v, data in G.edges(data=True):
+            if data.get('is_continuation', False):
+                continue  # Skip continuation edges in this pass
+                
             weight = data.get("weight", 0.0)
             width = weight * edge_width_multiplier
             if width >= min_edge_weight * edge_width_multiplier:
@@ -3011,7 +3085,19 @@ class EnhancedSemanticTracer:
                     connectionstyle="arc3,rad=0.1"  # Slightly curved edges
                 )
         
-        # Add node labels with token text and top prediction
+        # Draw continuation edges with dashed style
+        if continuation_edges:
+            nx.draw_networkx_edges(
+                G, pos,
+                edgelist=continuation_edges,
+                width=1.0,
+                alpha=0.5,
+                edge_color='gray',
+                style='dashed',
+                arrows=True,
+                arrowsize=8
+            )
+        
         # Create labels with token text and prediction
         labels = {}
         for node in G.nodes():
@@ -3065,7 +3151,7 @@ class EnhancedSemanticTracer:
                 )
         
         # Add layer labels at the top
-        for i, layer_idx in enumerate(layers):
+        for i, layer_idx in enumerate(graph_layers):
             layer_x = i * x_spacing
             max_y = max([y for _, y in pos.values()]) if pos else 0
             plt.text(layer_x, max_y + 1, f"Layer {layer_idx}", 
@@ -3089,6 +3175,12 @@ class EnhancedSemanticTracer:
                 plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markersize=5, label='Lower Weight'),
                 plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markersize=10, label='Higher Weight')
             ])
+        
+        # Add edge type legend
+        legend_elements.extend([
+            plt.Line2D([0], [0], linestyle='-', color='black', linewidth=2, label='Token Influence'),
+            plt.Line2D([0], [0], linestyle='--', color='gray', linewidth=1, label='Token Continuation')
+        ])
         
         plt.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.05), ncol=3)
         
