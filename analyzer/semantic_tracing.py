@@ -1293,261 +1293,6 @@ class EnhancedSemanticTracer:
         
         return saved_paths
 
-    def _visualize_image_token_heatmaps(
-        self,
-        trace_results: Dict[str, Dict[str, Any]],
-        target_text: str,
-        target_idx: int,
-        save_dir: str,
-        input_data: Optional[Dict[str, Any]] = None
-    ) -> List[str]:
-        """
-        Visualize heatmaps of image token influence across layers by mapping tokens
-        back to their spatial positions in the original image.
-        """
-        saved_paths = []
-        
-        # Extract special keys before integer conversion
-        special_keys = {}
-        for k, v in trace_results.items():
-            if k == "input_data" or k == "trace_data_path":
-                special_keys[k] = v
-        
-        # Handle mixed key types (string and integer)
-        int_keyed_results = {}
-        for k, v in trace_results.items():
-            # Skip special keys
-            if k == "input_data" or k == "trace_data_path":
-                continue
-                
-            try:
-                key = int(k) if isinstance(k, str) else k
-                int_keyed_results[key] = v
-            except (ValueError, TypeError):
-                print(f"Warning: Could not convert key {k} to integer, skipping.")
-                continue
-        
-        # Now replace the original dict with our sanitized version
-        trace_results = int_keyed_results
-        
-        # Determine the source of input_data (parameter or trace_results)
-        if input_data is None:
-            input_data = special_keys.get("input_data", {})
-        
-        # Get feature mapping and image information
-        if not input_data:
-            print("Error: No input_data found in trace_results or parameters. Cannot visualize image token heatmaps.")
-            return saved_paths
-        
-        # Extract required data for visualization
-        feature_mapping = input_data.get("feature_mapping", {})
-        if not feature_mapping:
-            print("Error: No feature_mapping found in input_data. Cannot visualize image token heatmaps.")
-            return saved_paths
-        
-        # Get original image and preview image for overlays
-        original_image = input_data.get("original_image")
-        spatial_preview_image = input_data.get("spatial_preview_image")
-        
-        if not original_image or not spatial_preview_image:
-            print("Error: Missing original_image or spatial_preview_image. Cannot visualize.")
-            return saved_paths
-        
-        # Get numeric layers
-        layers = sorted(trace_results.keys())
-        if not layers:
-            print("Warning: No layers found in trace_results. Cannot create heatmaps.")
-            return saved_paths
-        
-        # Extract base and patch feature information
-        base_feature_info = feature_mapping.get("base_feature", {})
-        patch_feature_info = feature_mapping.get("patch_feature", {})
-        
-        if not base_feature_info and not patch_feature_info:
-            print("Error: No valid feature mapping information found. Cannot create visualizations.")
-            return saved_paths
-        
-        if not base_feature_info:
-            print("Warning: Missing base feature mapping information. Base feature visualizations will be skipped.")
-        
-        if not patch_feature_info:
-            print("Warning: Missing patch feature mapping information. Patch feature visualizations will be skipped.")
-        
-        # Prepare output directories
-        base_heatmap_dir = os.path.join(save_dir, "base_feature_heatmaps")
-        patch_heatmap_dir = os.path.join(save_dir, "patch_feature_heatmaps")
-        os.makedirs(base_heatmap_dir, exist_ok=True)
-        os.makedirs(patch_heatmap_dir, exist_ok=True)
-        
-        # Keep track of which layers have valid visualizations
-        base_valid_layers = []
-        patch_valid_layers = []
-        
-        # Process each layer
-        for layer_idx in layers:
-            layer_data = trace_results[layer_idx]
-            
-            # Process all targets in this layer
-            targets = layer_data.get("target_tokens", [])
-            if not targets:
-                print(f"Layer {layer_idx}: No target tokens found. Skipping.")
-                continue
-            
-            # Collect all image token sources across all targets for this layer
-            image_token_weights = {}  # {token_idx: weight}
-            
-            for target in targets:
-                for source in target.get("sources", []):
-                    if source.get("type") == 2:  # Image token
-                        source_idx = source.get("index")
-                        weight = source.get("scaled_weight", 0.0)
-                        
-                        # Combine weights if multiple targets use the same source
-                        if source_idx in image_token_weights:
-                            image_token_weights[source_idx] += weight
-                        else:
-                            image_token_weights[source_idx] = weight
-            
-            if not image_token_weights:
-                print(f"Layer {layer_idx}: No image tokens with influence found. Skipping.")
-                continue
-            
-            # Normalize weights for visualization
-            max_weight = max(image_token_weights.values())
-            if max_weight <= 0:
-                print(f"Layer {layer_idx}: All image token weights are zero or negative. Skipping.")
-                continue
-                
-            normalized_weights = {idx: weight / max_weight for idx, weight in image_token_weights.items()}
-            
-            # 1. Visualize base features
-            if base_feature_info.get("positions") and base_feature_info.get("grid"):
-                base_grid_h, base_grid_w = base_feature_info["grid"]
-                
-                # Initialize empty heatmap
-                base_heatmap = np.zeros((base_grid_h, base_grid_w), dtype=np.float32)
-                
-                # Fill the heatmap with normalized weights
-                mapped_tokens = 0
-                for token_idx, weight in normalized_weights.items():
-                    # Convert token_idx to int if it's a string
-                    if isinstance(token_idx, str):
-                        token_idx = int(token_idx)
-                        
-                    position = base_feature_info["positions"].get(token_idx)
-                    if position:
-                        r, c = position
-                        if 0 <= r < base_grid_h and 0 <= c < base_grid_w:
-                            base_heatmap[r, c] = weight
-                            mapped_tokens += 1
-                
-                # Create visualization if we have data
-                if mapped_tokens > 0 and np.max(base_heatmap) > 0:
-                    print(f"Layer {layer_idx}: Creating base feature heatmap with {mapped_tokens} mapped tokens.")
-                    base_path = self._create_base_feature_overlay(
-                        heatmap=base_heatmap,
-                        original_image=original_image,
-                        grid_size=(base_grid_h, base_grid_w),
-                        layer_idx=layer_idx,
-                        target_idx=target_idx,
-                        title=f"Base Image Token Influence - Layer {layer_idx}",
-                        save_path=os.path.join(base_heatmap_dir, f"base_influence_layer_{layer_idx}_{target_idx}.png")
-                    )
-                    if base_path:
-                        saved_paths.append(base_path)
-                        base_valid_layers.append(layer_idx)
-                else:
-                    print(f"Layer {layer_idx}: No valid base feature mapping. Max value: {np.max(base_heatmap)}")
-            
-            # 2. Visualize patch features
-            if patch_feature_info.get("positions") and patch_feature_info.get("grid_unpadded"):
-                prob_grid_h, prob_grid_w = patch_feature_info["grid_unpadded"]
-                
-                # Initialize empty heatmap
-                patch_heatmap = np.zeros((prob_grid_h, prob_grid_w), dtype=np.float32)
-                
-                # Fill the heatmap with normalized weights
-                mapped_tokens = 0
-                for token_idx, weight in normalized_weights.items():
-                    # Convert token_idx to int if it's a string
-                    if isinstance(token_idx, str):
-                        token_idx = int(token_idx)
-                        
-                    position = patch_feature_info["positions"].get(token_idx)
-                    if position:
-                        r, c = position
-                        if 0 <= r < prob_grid_h and 0 <= c < prob_grid_w:
-                            patch_heatmap[r, c] = weight
-                            mapped_tokens += 1
-                
-                # Create visualization if we have data
-                if mapped_tokens > 0 and np.max(patch_heatmap) > 0:
-                    print(f"Layer {layer_idx}: Creating patch feature heatmap with {mapped_tokens} mapped tokens.")
-                    # Get required dimensions
-                    resized_dims_wh = feature_mapping.get("resized_dimensions", (0, 0))
-                    patch_size = feature_mapping.get("patch_size", 14)  # Default to 14 if not specified
-                    
-                    patch_path = self._create_patch_feature_overlay(
-                        heatmap=patch_heatmap,
-                        spatial_preview_image=spatial_preview_image,
-                        feature_mapping=feature_mapping,
-                        patch_size=patch_size,
-                        layer_idx=layer_idx,
-                        target_idx=target_idx,
-                        title=f"Patch Image Token Influence - Layer {layer_idx}",
-                        save_path=os.path.join(patch_heatmap_dir, f"patch_influence_layer_{layer_idx}_{target_idx}.png")
-                    )
-                    if patch_path:
-                        saved_paths.append(patch_path)
-                        patch_valid_layers.append(layer_idx)
-                else:
-                    print(f"Layer {layer_idx}: No valid patch feature mapping. Max value: {np.max(patch_heatmap)}")
-        
-        # Create composite visualizations if we have multiple layers
-        if len(saved_paths) > 0:
-            # Create composite for base feature heatmaps
-            base_paths = [p for p in saved_paths if "base_influence" in p]
-            if base_paths:
-                try:
-                    print(f"Creating composite base image with {len(base_paths)} heatmaps...")
-                    base_composite_path = os.path.join(save_dir, f"composite_base_influence_{target_idx}.png")
-                    composite_path = self._create_composite_image(
-                        image_paths=base_paths,
-                        layers=base_valid_layers,
-                        output_filename=base_composite_path,
-                        title=f"Base Image Token Influence Across Layers for Target '{target_text}'"
-                    )
-                    if composite_path:
-                        saved_paths.append(composite_path)
-                        print(f"Successfully created base composite image: {composite_path}")
-                except Exception as e:
-                    print(f"Error creating base composite: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # Create composite for patch feature heatmaps
-            patch_paths = [p for p in saved_paths if "patch_influence" in p]
-            if patch_paths:
-                try:
-                    print(f"Creating composite patch image with {len(patch_paths)} heatmaps...")
-                    patch_composite_path = os.path.join(save_dir, f"composite_patch_influence_{target_idx}.png")
-                    composite_path = self._create_composite_image(
-                        image_paths=patch_paths,
-                        layers=patch_valid_layers,
-                        output_filename=patch_composite_path,
-                        title=f"Patch Image Token Influence Across Layers for Target '{target_text}'"
-                    )
-                    if composite_path:
-                        saved_paths.append(composite_path)
-                        print(f"Successfully created patch composite image: {composite_path}")
-                except Exception as e:
-                    print(f"Error creating patch composite: {e}")
-                    import traceback
-                    traceback.print_exc()
-        else:
-            print("No valid heatmaps were created. Check if image tokens have significant influence in any layer.")
-        
-        return saved_paths
 
     def _visualize_single_trace(
         self,
@@ -2150,10 +1895,12 @@ class EnhancedSemanticTracer:
         target_size: Tuple[int, int] = (336, 336),
         colormap: str = "hot",
         alpha: float = 0.7,
-        add_gridlines: bool = True
+        add_gridlines: bool = True,
+        use_grid_visualization: bool = True  # New parameter to control visualization style
     ) -> Optional[str]:
         """
         Create a heatmap overlay visualization for base image features.
+        Modified to support grid-based visualization for consistency with patch features.
         
         Args:
             heatmap: 2D numpy array with heatmap values
@@ -2167,6 +1914,7 @@ class EnhancedSemanticTracer:
             colormap: Matplotlib colormap name
             alpha: Alpha blending value for overlay
             add_gridlines: Whether to add grid lines
+            use_grid_visualization: Whether to use grid-based visualization (True) or smooth interpolation (False)
             
         Returns:
             Path to saved visualization or None if failed
@@ -2176,22 +1924,12 @@ class EnhancedSemanticTracer:
             resized_background = original_image.resize(target_size, Image.Resampling.LANCZOS)
             background_np = np.array(resized_background)
             
-            # Upscale heatmap to match image dimensions
+            # Get grid dimensions
             grid_h, grid_w = grid_size
             
-            # Use scikit-image if available, otherwise fall back to simple method
-            try:
-                from skimage.transform import resize as skimage_resize
-                upscaled_heatmap = skimage_resize(
-                    heatmap, target_size, order=1, mode='constant', 
-                    cval=0, anti_aliasing=True, preserve_range=True
-                )
-            except ImportError:
-                # Simple upscaling method
-                repeat_y = target_size[1] // grid_h
-                repeat_x = target_size[0] // grid_w
-                upscaled_heatmap = np.kron(heatmap, np.ones((repeat_y, repeat_x)))
-                upscaled_heatmap = upscaled_heatmap[:target_size[1], :target_size[0]]
+            # Calculate cell dimensions
+            cell_height = target_size[1] / grid_h
+            cell_width = target_size[0] / grid_w
             
             # Create figure and plot
             fig, ax = plt.subplots(figsize=(8, 8))
@@ -2199,34 +1937,89 @@ class EnhancedSemanticTracer:
             # Plot background image
             ax.imshow(background_np, extent=(0, target_size[0], target_size[1], 0))
             
-            # Plot heatmap overlay
-            im = ax.imshow(
-                upscaled_heatmap, 
-                alpha=alpha,
-                cmap=colormap,
-                vmin=0,
-                vmax=1,
-                extent=(0, target_size[0], target_size[1], 0),
-                interpolation="nearest"
-            )
-            
-            # Add grid lines if requested
-            if add_gridlines:
-                cell_height = target_size[1] / grid_h
-                cell_width = target_size[0] / grid_w
+            if use_grid_visualization:
+                # Grid-based approach for consistency with patch visualization
+                # Create a colored grid overlay
+                for r in range(grid_h):
+                    for c in range(grid_w):
+                        # Get heatmap value for this cell (between 0 and 1)
+                        cell_value = heatmap[r, c] if r < len(heatmap) and c < len(heatmap[0]) else 0
+                        
+                        if cell_value > 0:  # Only draw cells with influence
+                            # Calculate cell boundaries
+                            x_start = c * cell_width
+                            y_start = r * cell_height
+                            
+                            # Create colored rectangle
+                            cmap = plt.get_cmap(colormap)
+                            cell_color = cmap(cell_value)
+                            
+                            # Create rectangle with appropriate alpha
+                            rect = plt.Rectangle(
+                                (x_start, y_start),
+                                cell_width, cell_height,
+                                color=cell_color,
+                                alpha=min(cell_value * 1.5, alpha),  # Scale alpha by value, capped at max alpha
+                                linewidth=0
+                            )
+                            ax.add_patch(rect)
+                            
+                            # Optionally add text showing value
+                            if cell_value > 0.25:  # Only show text for more significant cells
+                                cell_center_x = x_start + cell_width / 2
+                                cell_center_y = y_start + cell_height / 2
+                                ax.text(
+                                    cell_center_x, cell_center_y,
+                                    f"{cell_value:.2f}",
+                                    ha='center', va='center',
+                                    color='white' if cell_value > 0.5 else 'black',
+                                    fontsize=8,
+                                    bbox=dict(facecolor='none', alpha=0, pad=0)
+                                )
+            else:
+                # Original smooth visualization approach
+                # Use scikit-image if available, otherwise fall back to simple method
+                try:
+                    from skimage.transform import resize as skimage_resize
+                    upscaled_heatmap = skimage_resize(
+                        heatmap, target_size, order=1, mode='constant', 
+                        cval=0, anti_aliasing=True, preserve_range=True
+                    )
+                except ImportError:
+                    # Simple upscaling method
+                    repeat_y = target_size[1] // grid_h
+                    repeat_x = target_size[0] // grid_w
+                    upscaled_heatmap = np.kron(heatmap, np.ones((repeat_y, repeat_x)))
+                    upscaled_heatmap = upscaled_heatmap[:target_size[1], :target_size[0]]
                 
+                # Plot heatmap overlay
+                im = ax.imshow(
+                    upscaled_heatmap, 
+                    alpha=alpha,
+                    cmap=colormap,
+                    vmin=0,
+                    vmax=1,
+                    extent=(0, target_size[0], target_size[1], 0),
+                    interpolation="nearest"
+                )
+            
+            # Add grid lines regardless of visualization type
+            if add_gridlines:
                 # Horizontal grid lines
-                for i in range(1, grid_h):
+                for i in range(grid_h + 1):
                     y = i * cell_height
                     ax.axhline(y=y, color='gray', linestyle='-', linewidth=0.5, alpha=0.5)
                 
                 # Vertical grid lines
-                for i in range(1, grid_w):
+                for i in range(grid_w + 1):
                     x = i * cell_width
                     ax.axvline(x=x, color='gray', linestyle='-', linewidth=0.5, alpha=0.5)
             
-            # Add colorbar
-            cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            # Add colorbar that works for both approaches
+            norm = plt.Normalize(vmin=0, vmax=1)
+            sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm)
+            sm.set_array([])
+            cbar = plt.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
             cbar.set_label("Normalized Influence Weight")
             
             # Set title and remove axes
@@ -2258,10 +2051,11 @@ class EnhancedSemanticTracer:
         save_path: str,
         colormap: str = "hot",
         alpha: float = 0.7,
-        add_gridlines: bool = True
+        add_gridlines: bool = True,
+        show_values: bool = True  # New parameter to control showing cell values
     ) -> Optional[str]:
         """
-        Create a heatmap overlay visualization for patch image features.
+        Create a heatmap overlay visualization for patch image features using grid-based visualization.
         
         Args:
             heatmap: 2D numpy array with heatmap values
@@ -2275,6 +2069,7 @@ class EnhancedSemanticTracer:
             colormap: Matplotlib colormap name
             alpha: Alpha blending value for overlay
             add_gridlines: Whether to add grid lines
+            show_values: Whether to show numeric values in cells
             
         Returns:
             Path to saved visualization or None if failed
@@ -2309,38 +2104,9 @@ class EnhancedSemanticTracer:
             pad_top = max(0, pad_h_total // 2)
             pad_left = max(0, pad_w_total // 2)
             
-            # Upscale heatmap by patch size first
-            try:
-                # Upscale probability map by raw patch size first
-                heatmap_unpadded = np.repeat(np.repeat(heatmap, patch_size, axis=0), patch_size, axis=1)
-                heatmap_h_unpadded, heatmap_w_unpadded = heatmap_unpadded.shape
-                
-                # Resize to match the actual content area dimensions
-                target_heatmap_size = (resized_h_actual, resized_w_actual)
-                
-                # Use scikit-image if available
-                try:
-                    from skimage.transform import resize as skimage_resize
-                    resized_heatmap = skimage_resize(
-                        heatmap_unpadded, target_heatmap_size, order=1,
-                        mode='constant', cval=0, anti_aliasing=True,
-                        preserve_range=True
-                    )
-                except ImportError:
-                    # Fallback to simpler method
-                    if heatmap_h_unpadded > 0 and heatmap_w_unpadded > 0:
-                        scale_y = target_heatmap_size[0] / heatmap_h_unpadded
-                        scale_x = target_heatmap_size[1] / heatmap_w_unpadded
-                        y_indices = np.clip((np.arange(target_heatmap_size[0]) / scale_y), 0, heatmap_h_unpadded - 1).astype(int)
-                        x_indices = np.clip((np.arange(target_heatmap_size[1]) / scale_x), 0, heatmap_w_unpadded - 1).astype(int)
-                        resized_heatmap = heatmap_unpadded[y_indices[:, None], x_indices]
-                    else:
-                        # Not enough data for resizing
-                        print("Warning: Cannot resize heatmap with zero dimensions.")
-                        return None
-            except Exception as e:
-                print(f"Error upscaling/resizing patch heatmap: {e}")
-                return None
+            # Calculate cell dimensions
+            cell_height = resized_h_actual / prob_grid_h
+            cell_width = resized_w_actual / prob_grid_w
             
             # Create figure and plot
             fig, ax = plt.subplots(figsize=(8, 8 * preview_h / max(1, preview_w)))
@@ -2348,38 +2114,63 @@ class EnhancedSemanticTracer:
             # Plot background image
             ax.imshow(background_np, extent=(0, preview_w, preview_h, 0))
             
-            # Calculate extent for overlay using padding and dimensions
-            extent = (pad_left, pad_left + resized_w_actual, pad_top + resized_h_actual, pad_top)
+            # Create colormap
+            cmap = plt.get_cmap(colormap)
             
-            # Plot heatmap overlay
-            im = ax.imshow(
-                resized_heatmap, 
-                alpha=alpha,
-                cmap=colormap,
-                vmin=0,
-                vmax=1,
-                extent=extent,
-                interpolation="nearest"
-            )
+            # Create grid-based overlay
+            for r in range(prob_grid_h):
+                for c in range(prob_grid_w):
+                    # Get heatmap value for this cell (between 0 and 1)
+                    cell_value = heatmap[r, c] if r < len(heatmap) and c < len(heatmap[0]) else 0
+                    
+                    if cell_value > 0:  # Only draw cells with influence
+                        # Calculate cell boundaries in image coordinates
+                        x_start = pad_left + c * cell_width
+                        y_start = pad_top + r * cell_height
+                        
+                        # Get color from colormap
+                        cell_color = cmap(cell_value)
+                        
+                        # Create rectangle with appropriate alpha
+                        rect = plt.Rectangle(
+                            (x_start, y_start),
+                            cell_width, cell_height,
+                            color=cell_color,
+                            alpha=min(cell_value * 1.5, alpha),  # Scale alpha by value, capped at max alpha
+                            linewidth=0
+                        )
+                        ax.add_patch(rect)
+                        
+                        # Optionally add text showing value
+                        if show_values and cell_value > 0.25:  # Only show text for more significant cells
+                            cell_center_x = x_start + cell_width / 2
+                            cell_center_y = y_start + cell_height / 2
+                            ax.text(
+                                cell_center_x, cell_center_y,
+                                f"{cell_value:.2f}",
+                                ha='center', va='center',
+                                color='white' if cell_value > 0.5 else 'black',
+                                fontsize=8,
+                                bbox=dict(facecolor='none', alpha=0, pad=0)
+                            )
             
             # Add grid lines if requested
             if add_gridlines:
-                # Calculate cell sizes
-                cell_height = resized_h_actual / prob_grid_h
-                cell_width = resized_w_actual / prob_grid_w
-                
                 # Horizontal grid lines
-                for i in range(1, prob_grid_h):
+                for i in range(prob_grid_h + 1):
                     y = pad_top + i * cell_height
                     ax.axhline(y=y, color='gray', linestyle='-', linewidth=0.5, alpha=0.5)
                 
                 # Vertical grid lines
-                for i in range(1, prob_grid_w):
+                for i in range(prob_grid_w + 1):
                     x = pad_left + i * cell_width
                     ax.axvline(x=x, color='gray', linestyle='-', linewidth=0.5, alpha=0.5)
             
             # Add colorbar
-            cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            norm = plt.Normalize(vmin=0, vmax=1)
+            sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm)
+            sm.set_array([])
+            cbar = plt.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
             cbar.set_label("Normalized Influence Weight")
             
             # Set title and remove axes
@@ -2398,6 +2189,279 @@ class EnhancedSemanticTracer:
             import traceback
             traceback.print_exc()
             return None
+
+    def _visualize_image_token_heatmaps(
+        self,
+        trace_results: Dict[str, Dict[str, Any]],
+        target_text: str,
+        target_idx: int,
+        save_dir: str,
+        input_data: Optional[Dict[str, Any]] = None,
+        use_grid_visualization: bool = True,  # New parameter to control visualization style
+        show_values: bool = True  # New parameter to control showing cell values
+    ) -> List[str]:
+        """
+        Visualize heatmaps of image token influence across layers by mapping tokens
+        back to their spatial positions in the original image.
+        Modified to ensure consistent grid-based visualization between base and patch features.
+        
+        Args:
+            trace_results: Dictionary with trace results
+            target_text: Text of the target token
+            target_idx: Index of the target token
+            save_dir: Directory to save visualizations
+            input_data: Optional input data dictionary
+            use_grid_visualization: Whether to use grid-based visualization
+            show_values: Whether to show numeric values in cells
+            
+        Returns:
+            List of paths to saved visualizations
+        """
+        saved_paths = []
+        
+        # Extract special keys before integer conversion
+        special_keys = {}
+        for k, v in trace_results.items():
+            if k == "input_data" or k == "trace_data_path":
+                special_keys[k] = v
+        
+        # Handle mixed key types (string and integer)
+        int_keyed_results = {}
+        for k, v in trace_results.items():
+            # Skip special keys
+            if k == "input_data" or k == "trace_data_path":
+                continue
+                
+            try:
+                key = int(k) if isinstance(k, str) else k
+                int_keyed_results[key] = v
+            except (ValueError, TypeError):
+                print(f"Warning: Could not convert key {k} to integer, skipping.")
+                continue
+        
+        # Now replace the original dict with our sanitized version
+        trace_results = int_keyed_results
+        
+        # Determine the source of input_data (parameter or trace_results)
+        if input_data is None:
+            input_data = special_keys.get("input_data", {})
+        
+        # Get feature mapping and image information
+        if not input_data:
+            print("Error: No input_data found in trace_results or parameters. Cannot visualize image token heatmaps.")
+            return saved_paths
+        
+        # Extract required data for visualization
+        feature_mapping = input_data.get("feature_mapping", {})
+        if not feature_mapping:
+            print("Error: No feature_mapping found in input_data. Cannot visualize image token heatmaps.")
+            return saved_paths
+        
+        # Get original image and preview image for overlays
+        original_image = input_data.get("original_image")
+        spatial_preview_image = input_data.get("spatial_preview_image")
+        
+        if not original_image or not spatial_preview_image:
+            print("Error: Missing original_image or spatial_preview_image. Cannot visualize.")
+            return saved_paths
+        
+        # Get numeric layers
+        layers = sorted(trace_results.keys())
+        if not layers:
+            print("Warning: No layers found in trace_results. Cannot create heatmaps.")
+            return saved_paths
+        
+        # Extract base and patch feature information
+        base_feature_info = feature_mapping.get("base_feature", {})
+        patch_feature_info = feature_mapping.get("patch_feature", {})
+        
+        if not base_feature_info and not patch_feature_info:
+            print("Error: No valid feature mapping information found. Cannot create visualizations.")
+            return saved_paths
+        
+        if not base_feature_info:
+            print("Warning: Missing base feature mapping information. Base feature visualizations will be skipped.")
+        
+        if not patch_feature_info:
+            print("Warning: Missing patch feature mapping information. Patch feature visualizations will be skipped.")
+        
+        # Prepare output directories
+        base_heatmap_dir = os.path.join(save_dir, "base_feature_heatmaps")
+        patch_heatmap_dir = os.path.join(save_dir, "patch_feature_heatmaps")
+        os.makedirs(base_heatmap_dir, exist_ok=True)
+        os.makedirs(patch_heatmap_dir, exist_ok=True)
+        
+        # Keep track of which layers have valid visualizations
+        base_valid_layers = []
+        patch_valid_layers = []
+        
+        # Process each layer
+        for layer_idx in layers:
+            layer_data = trace_results[layer_idx]
+            
+            # Process all targets in this layer
+            targets = layer_data.get("target_tokens", [])
+            if not targets:
+                print(f"Layer {layer_idx}: No target tokens found. Skipping.")
+                continue
+            
+            # Collect all image token sources across all targets for this layer
+            image_token_weights = {}  # {token_idx: weight}
+            
+            for target in targets:
+                for source in target.get("sources", []):
+                    if source.get("type") == 2:  # Image token
+                        source_idx = source.get("index")
+                        weight = source.get("scaled_weight", 0.0)
+                        
+                        # Combine weights if multiple targets use the same source
+                        if source_idx in image_token_weights:
+                            image_token_weights[source_idx] += weight
+                        else:
+                            image_token_weights[source_idx] = weight
+            
+            if not image_token_weights:
+                print(f"Layer {layer_idx}: No image tokens with influence found. Skipping.")
+                continue
+            
+            # Normalize weights for visualization
+            max_weight = max(image_token_weights.values())
+            if max_weight <= 0:
+                print(f"Layer {layer_idx}: All image token weights are zero or negative. Skipping.")
+                continue
+                
+            normalized_weights = {idx: weight / max_weight for idx, weight in image_token_weights.items()}
+            
+            # 1. Visualize base features
+            if base_feature_info.get("positions") and base_feature_info.get("grid"):
+                base_grid_h, base_grid_w = base_feature_info["grid"]
+                
+                # Initialize empty heatmap
+                base_heatmap = np.zeros((base_grid_h, base_grid_w), dtype=np.float32)
+                
+                # Fill the heatmap with normalized weights
+                mapped_tokens = 0
+                for token_idx, weight in normalized_weights.items():
+                    # Convert token_idx to int if it's a string
+                    if isinstance(token_idx, str):
+                        token_idx = int(token_idx)
+                        
+                    position = base_feature_info["positions"].get(token_idx)
+                    if position:
+                        r, c = position
+                        if 0 <= r < base_grid_h and 0 <= c < base_grid_w:
+                            base_heatmap[r, c] = weight
+                            mapped_tokens += 1
+                
+                # Create visualization if we have data
+                if mapped_tokens > 0 and np.max(base_heatmap) > 0:
+                    print(f"Layer {layer_idx}: Creating base feature heatmap with {mapped_tokens} mapped tokens.")
+                    base_path = self._create_base_feature_overlay(
+                        heatmap=base_heatmap,
+                        original_image=original_image,
+                        grid_size=(base_grid_h, base_grid_w),
+                        layer_idx=layer_idx,
+                        target_idx=target_idx,
+                        title=f"Base Image Token Influence - Layer {layer_idx}",
+                        save_path=os.path.join(base_heatmap_dir, f"base_influence_layer_{layer_idx}_{target_idx}.png"),
+                        use_grid_visualization=use_grid_visualization  # Pass the grid visualization parameter
+                    )
+                    if base_path:
+                        saved_paths.append(base_path)
+                        base_valid_layers.append(layer_idx)
+                else:
+                    print(f"Layer {layer_idx}: No valid base feature mapping. Max value: {np.max(base_heatmap)}")
+            
+            # 2. Visualize patch features
+            if patch_feature_info.get("positions") and patch_feature_info.get("grid_unpadded"):
+                prob_grid_h, prob_grid_w = patch_feature_info["grid_unpadded"]
+                
+                # Initialize empty heatmap
+                patch_heatmap = np.zeros((prob_grid_h, prob_grid_w), dtype=np.float32)
+                
+                # Fill the heatmap with normalized weights
+                mapped_tokens = 0
+                for token_idx, weight in normalized_weights.items():
+                    # Convert token_idx to int if it's a string
+                    if isinstance(token_idx, str):
+                        token_idx = int(token_idx)
+                        
+                    position = patch_feature_info["positions"].get(token_idx)
+                    if position:
+                        r, c = position
+                        if 0 <= r < prob_grid_h and 0 <= c < prob_grid_w:
+                            patch_heatmap[r, c] = weight
+                            mapped_tokens += 1
+                
+                # Create visualization if we have data
+                if mapped_tokens > 0 and np.max(patch_heatmap) > 0:
+                    print(f"Layer {layer_idx}: Creating patch feature heatmap with {mapped_tokens} mapped tokens.")
+                    # Get required dimensions
+                    resized_dims_wh = feature_mapping.get("resized_dimensions", (0, 0))
+                    patch_size = feature_mapping.get("patch_size", 14)  # Default to 14 if not specified
+                    
+                    patch_path = self._create_patch_feature_overlay(
+                        heatmap=patch_heatmap,
+                        spatial_preview_image=spatial_preview_image,
+                        feature_mapping=feature_mapping,
+                        patch_size=patch_size,
+                        layer_idx=layer_idx,
+                        target_idx=target_idx,
+                        title=f"Patch Image Token Influence - Layer {layer_idx}",
+                        save_path=os.path.join(patch_heatmap_dir, f"patch_influence_layer_{layer_idx}_{target_idx}.png"),
+                        show_values=show_values  # Pass the show values parameter
+                    )
+                    if patch_path:
+                        saved_paths.append(patch_path)
+                        patch_valid_layers.append(layer_idx)
+                else:
+                    print(f"Layer {layer_idx}: No valid patch feature mapping. Max value: {np.max(patch_heatmap)}")
+        
+        # Create composite visualizations if we have multiple layers
+        if len(saved_paths) > 0:
+            # Create composite for base feature heatmaps
+            base_paths = [p for p in saved_paths if "base_influence" in p]
+            if base_paths:
+                try:
+                    print(f"Creating composite base image with {len(base_paths)} heatmaps...")
+                    base_composite_path = os.path.join(save_dir, f"composite_base_influence_{target_idx}.png")
+                    composite_path = self._create_composite_image(
+                        image_paths=base_paths,
+                        layers=base_valid_layers,
+                        output_filename=base_composite_path,
+                        title=f"Base Image Token Influence Across Layers for Target '{target_text}'"
+                    )
+                    if composite_path:
+                        saved_paths.append(composite_path)
+                        print(f"Successfully created base composite image: {composite_path}")
+                except Exception as e:
+                    print(f"Error creating base composite: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Create composite for patch feature heatmaps
+            patch_paths = [p for p in saved_paths if "patch_influence" in p]
+            if patch_paths:
+                try:
+                    print(f"Creating composite patch image with {len(patch_paths)} heatmaps...")
+                    patch_composite_path = os.path.join(save_dir, f"composite_patch_influence_{target_idx}.png")
+                    composite_path = self._create_composite_image(
+                        image_paths=patch_paths,
+                        layers=patch_valid_layers,
+                        output_filename=patch_composite_path,
+                        title=f"Patch Image Token Influence Across Layers for Target '{target_text}'"
+                    )
+                    if composite_path:
+                        saved_paths.append(composite_path)
+                        print(f"Successfully created patch composite image: {composite_path}")
+                except Exception as e:
+                    print(f"Error creating patch composite: {e}")
+                    import traceback
+                    traceback.print_exc()
+        else:
+            print("No valid heatmaps were created. Check if image tokens have significant influence in any layer.")
+        
+        return saved_paths
 
     def _create_composite_image(
         self,
