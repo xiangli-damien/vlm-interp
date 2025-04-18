@@ -2576,7 +2576,9 @@ class EnhancedSemanticTracer:
         min_node_size: int = 800,
         max_node_size: int = 2000,
         debug_mode: bool = False,
-        dpi: int = 150
+        dpi: int = 150,
+        show_continuation_edges: bool = False,  # New parameter to control continuation edges
+        use_exponential_scaling: bool = True  # New parameter for exponential weight scaling
     ) -> List[str]:
         """
         Visualizes the semantic trace as a flow graph showing token connections across layers.
@@ -2586,8 +2588,8 @@ class EnhancedSemanticTracer:
         - Tokens as nodes colored by type (image=red, text=blue, generated=green)
         - Connections between source and target tokens across layers
         - Line thickness representing saliency score contributions
-        - Variable node size representing token importance
-        - Each token showing its text and highest predicted logit
+        - Variable node size representing token importance (exponential scaling optional)
+        - Each token showing its text and highest predicted token
         
         Args:
             trace_results: Dictionary with trace results for each layer
@@ -2605,6 +2607,8 @@ class EnhancedSemanticTracer:
             max_node_size: Maximum node size for visualization
             debug_mode: Whether to print debug information
             dpi: DPI for PNG output
+            show_continuation_edges: Whether to show dashed continuation edges between layers
+            use_exponential_scaling: Whether to use exponential scaling for node sizes and edge widths
             
         Returns:
             List of saved file paths
@@ -2612,6 +2616,8 @@ class EnhancedSemanticTracer:
         import matplotlib.pyplot as plt
         import networkx as nx
         import matplotlib as mpl
+        import math
+        import numpy as np
         
         saved_paths = []
         
@@ -2627,7 +2633,7 @@ class EnhancedSemanticTracer:
             # Skip special keys
             if k == "input_data" or k == "trace_data_path":
                 continue
-                
+                    
             try:
                 key = int(k) if isinstance(k, str) else k
                 int_keyed_results[key] = v
@@ -2667,6 +2673,9 @@ class EnhancedSemanticTracer:
         # Track all unique token indices
         all_token_indices = set()
         
+        # Special handling for start token and other special tokens
+        special_token_indices = set()  # Collect indices of special tokens to ensure they show up
+        
         if debug_mode:
             print("DEBUG MODE: Processing trace results to create flow graph")
             print(f"Found {len(layers)} layers: {layers}")
@@ -2688,6 +2697,12 @@ class EnhancedSemanticTracer:
                 
                 # Add to tracking collections
                 all_token_indices.add(target_token_idx)
+                
+                # Check for special tokens like <s> or <image>
+                target_text = target.get("text", "")
+                if target_text in ["<s>", "<pad>", "<bos>", "<eos>", "<image>"]:
+                    special_token_indices.add(target_token_idx)
+                
                 if target_token_idx not in layer_tokens[layer_idx]:
                     layer_tokens[layer_idx].append(target_token_idx)
                 
@@ -2704,15 +2719,22 @@ class EnhancedSemanticTracer:
                     top_predictions = logit_lens.get("top_predictions", [])
                     if top_predictions and len(top_predictions) > 0:
                         pred_text = top_predictions[0].get('token_text', '')
-                        prob = top_predictions[0].get('probability', 0)
                         # Escape special characters that might cause font rendering issues
                         pred_text = self._sanitize_text_for_display(pred_text)
                         top_pred = f"→{pred_text}"
                 
+                # Improved handling of special token text
+                token_display_text = target.get("text", "")
+                if token_display_text:
+                    token_display_text = self._sanitize_text_for_display(token_display_text)
+                    # Ensure special tokens display properly
+                    if token_display_text in ["<s>", "<image>", "<pad>", "<bos>", "<eos>"]:
+                        token_display_text = f"'{token_display_text}'"
+                
                 # Store node metadata
                 node_metadata[node_id] = {
                     "type": target.get("type", 0),
-                    "text": self._sanitize_text_for_display(target.get("text", "")),
+                    "text": token_display_text,
                     "idx": target_token_idx,
                     "layer": layer_idx,
                     "weight": target.get("weight", 1.0),
@@ -2734,6 +2756,11 @@ class EnhancedSemanticTracer:
                     
                     # Just add to tracking collections for now
                     all_token_indices.add(source_idx)
+                    
+                    # Also track special tokens in sources
+                    source_text = source.get("text", "")
+                    if source_text in ["<s>", "<pad>", "<bos>", "<eos>", "<image>"]:
+                        special_token_indices.add(source_idx)
         
         # PHASE 2: Now process source nodes, ensuring they come from previous layers
         for layer_idx in layers:
@@ -2794,6 +2821,10 @@ class EnhancedSemanticTracer:
                                 source_text = old_target.get("text", "Unknown")
                                 source_type = old_target.get("type", 0)
                                 break
+                        
+                        # Improved handling of special token text
+                        if source_text in ["<s>", "<image>", "<pad>", "<bos>", "<eos>"]:
+                            source_text = f"'{source_text}'"
                         
                         # Get top prediction if available for the source
                         source_top_pred = ""
@@ -2884,32 +2915,32 @@ class EnhancedSemanticTracer:
                     if debug_mode:
                         print(f"  Added edge: {source_node_id} -> {target_node_id} with weight {source_weight:.3f}")
         
-        # Add special edges between the same token in adjacent layers
-        # This helps ensure continuity of token paths across layers
-        for token_idx in all_token_indices:
-            token_layers = sorted(token_to_node.get(token_idx, {}).keys())
-            
-            for i in range(len(token_layers) - 1):
-                current_layer = token_layers[i]
-                next_layer = token_layers[i+1]
+        # Add special edges between the same token in adjacent layers - only if requested
+        if show_continuation_edges:
+            for token_idx in all_token_indices:
+                token_layers = sorted(token_to_node.get(token_idx, {}).keys())
                 
-                # Only connect adjacent layers in our selected layers list
-                if current_layer in layers and next_layer in layers and layers.index(next_layer) == layers.index(current_layer) + 1:
-                    src_node_id = token_to_node[token_idx][current_layer]
-                    dst_node_id = token_to_node[token_idx][next_layer]
+                for i in range(len(token_layers) - 1):
+                    current_layer = token_layers[i]
+                    next_layer = token_layers[i+1]
                     
-                    # Only add if both nodes are in the graph
-                    if src_node_id in G.nodes() and dst_node_id in G.nodes():
-                        # Add a continuation edge with special weight
-                        G.add_edge(
-                            src_node_id,
-                            dst_node_id,
-                            weight=0.3,  # Reduced from 0.5 to make them less prominent
-                            is_continuation=True
-                        )
+                    # Only connect adjacent layers in our selected layers list
+                    if current_layer in layers and next_layer in layers and layers.index(next_layer) == layers.index(current_layer) + 1:
+                        src_node_id = token_to_node[token_idx][current_layer]
+                        dst_node_id = token_to_node[token_idx][next_layer]
                         
-                        if debug_mode:
-                            print(f"Added continuation edge: {src_node_id} -> {dst_node_id}")
+                        # Only add if both nodes are in the graph
+                        if src_node_id in G.nodes() and dst_node_id in G.nodes():
+                            # Add a continuation edge with special weight
+                            G.add_edge(
+                                src_node_id,
+                                dst_node_id,
+                                weight=0.3,  # Reduced from 0.5 to make them less prominent
+                                is_continuation=True
+                            )
+                            
+                            if debug_mode:
+                                print(f"Added continuation edge: {src_node_id} -> {dst_node_id}")
         
         if debug_mode:
             print(f"\nDEBUG: Graph construction complete")
@@ -2937,9 +2968,9 @@ class EnhancedSemanticTracer:
         
         max_nodes_in_layer = max(nodes_per_layer.values()) if nodes_per_layer else 1
         
-        # IMPORTANT: Significantly increased spacing to avoid node overlap
-        x_spacing = 6.0  # Much larger horizontal spacing between layers
-        y_spacing = 3.0  # Much larger vertical spacing between nodes within a layer
+        # Increased spacing to avoid node overlap
+        x_spacing = 6.0  # Horizontal spacing between layers
+        y_spacing = 3.0  # Vertical spacing between nodes within a layer
         
         # Get all layers present in the graph (some might have been removed)
         graph_layers = sorted(set(node_metadata[n]["layer"] for n in G.nodes()))
@@ -2963,7 +2994,15 @@ class EnhancedSemanticTracer:
             num_nodes = len(layer_node_list)
             if num_nodes > 0:
                 # Sort nodes by token index for readability
-                layer_node_list.sort(key=lambda n: node_metadata[n]["idx"])
+                # BUT ensure special tokens like <s> are always at top/bottom based on position
+                layer_node_list.sort(key=lambda n: (
+                    # Start token <s> should be at top (lowest y-value)
+                    0 if node_metadata[n]["text"] == "'<s>'" else
+                    # Image tokens should be below start token
+                    1 if node_metadata[n]["text"] == "'<image>'" else
+                    # Other tokens are sorted by index
+                    node_metadata[n]["idx"] + 10  # Add offset to ensure special tokens come first
+                ))
                 
                 # Calculate vertical spacing with much more room between nodes
                 total_height = (num_nodes - 1) * y_spacing
@@ -2981,6 +3020,9 @@ class EnhancedSemanticTracer:
         # Create figure
         plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
         
+        # Set some better fonts that support special characters
+        plt.rcParams['font.family'] = 'DejaVu Sans'
+        
         # Define colors for different token types with better contrast
         token_colors = {
             0: "#2ecc71",  # Generated = green
@@ -2988,7 +3030,7 @@ class EnhancedSemanticTracer:
             2: "#e74c3c"   # Image = red
         }
         
-        # Calculate node sizes based on weights
+        # Calculate node sizes based on weights with exponential scaling if requested
         if use_variable_node_size:
             # Get all weights
             all_weights = [
@@ -3007,7 +3049,18 @@ class EnhancedSemanticTracer:
                     
                     # Scale node size based on weight
                     if weight_range > 0:
-                        size = min_node_size + (max_node_size - min_node_size) * ((weight - min_weight) / weight_range)
+                        # Normalized weight between 0 and 1
+                        norm_weight = (weight - min_weight) / weight_range
+                        
+                        if use_exponential_scaling:
+                            # Exponential scaling (stronger emphasis on higher weights)
+                            # Using a power function with exponent 0.5 (square root is milder than quadratic)
+                            # This makes small differences more visible
+                            scaled_weight = math.pow(norm_weight, 0.5)
+                            size = min_node_size + (max_node_size - min_node_size) * scaled_weight
+                        else:
+                            # Standard linear scaling
+                            size = min_node_size + (max_node_size - min_node_size) * norm_weight
                     else:
                         size = (min_node_size + max_node_size) / 2
                     
@@ -3046,9 +3099,16 @@ class EnhancedSemanticTracer:
         for u, v, data in G.edges(data=True):
             if data.get('is_continuation', False):
                 continue  # Skip continuation edges in this pass
-                
+                    
             weight = data.get("weight", 0.0)
-            width = weight * edge_width_multiplier 
+            
+            # Apply exponential scaling to edge widths if requested
+            if use_exponential_scaling:
+                # Using square root scaling for better visualization
+                width = math.sqrt(weight) * edge_width_multiplier
+            else:
+                width = weight * edge_width_multiplier
+                
             if width >= min_edge_weight * edge_width_multiplier:
                 nx.draw_networkx_edges(
                     G, pos,
@@ -3062,9 +3122,16 @@ class EnhancedSemanticTracer:
         for u, v, data in G.edges(data=True):
             if data.get('is_continuation', False):
                 continue  # Skip continuation edges in this pass
-                
+                    
             weight = data.get("weight", 0.0)
-            width = weight * edge_width_multiplier
+            
+            # Apply exponential scaling to edge widths if requested
+            if use_exponential_scaling:
+                # Using square root scaling for better visualization
+                width = math.sqrt(weight) * edge_width_multiplier
+            else:
+                width = weight * edge_width_multiplier
+                
             if width >= min_edge_weight * edge_width_multiplier:
                 nx.draw_networkx_edges(
                     G, pos,
@@ -3076,19 +3143,20 @@ class EnhancedSemanticTracer:
                     connectionstyle="arc3,rad=0.1"  # Slightly curved edges
                 )
         
-        # Draw continuation edges with dashed style
-        continuation_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('is_continuation', False)]
-        if continuation_edges:
-            nx.draw_networkx_edges(
-                G, pos,
-                edgelist=continuation_edges,
-                width=1.0,
-                alpha=0.5,
-                edge_color='gray',
-                style='dashed',
-                arrows=True,
-                arrowsize=8
-            )
+        # Draw continuation edges with dashed style (only if requested)
+        if show_continuation_edges:
+            continuation_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('is_continuation', False)]
+            if continuation_edges:
+                nx.draw_networkx_edges(
+                    G, pos,
+                    edgelist=continuation_edges,
+                    width=1.0,
+                    alpha=0.5,
+                    edge_color='gray',
+                    style='dashed',
+                    arrows=True,
+                    arrowsize=8
+                )
         
         # Create simplified labels with only token text and top prediction
         labels = {}
@@ -3101,7 +3169,7 @@ class EnhancedSemanticTracer:
             label = f"{token_text}"
             if top_pred:
                 label += f"\n{top_pred}"
-                
+                    
             labels[node] = label
         
         # Calculate appropriate font sizes
@@ -3166,11 +3234,16 @@ class EnhancedSemanticTracer:
                 plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markersize=10, label='High Influence')
             ])
         
-        # Add edge type legend
-        legend_elements.extend([
-            plt.Line2D([0], [0], linestyle='-', color='black', linewidth=2, label='Token Influence'),
-            plt.Line2D([0], [0], linestyle='--', color='gray', linewidth=1, label='Token Continuation')
-        ])
+        # Add edge type legend (only if we're showing continuation edges)
+        if show_continuation_edges:
+            legend_elements.extend([
+                plt.Line2D([0], [0], linestyle='-', color='black', linewidth=2, label='Token Influence'),
+                plt.Line2D([0], [0], linestyle='--', color='gray', linewidth=1, label='Token Continuation')
+            ])
+        else:
+            legend_elements.extend([
+                plt.Line2D([0], [0], linestyle='-', color='black', linewidth=2, label='Token Influence')
+            ])
         
         plt.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.05), ncol=3)
         
@@ -3210,6 +3283,10 @@ class EnhancedSemanticTracer:
         """
         if not text:
             return ""
+            
+        # Special handling for common tokens
+        if text in ["<s>", "<pad>", "<bos>", "<eos>", "<image>"]:
+            return text
             
         # Replace common problematic characters
         replacements = {
