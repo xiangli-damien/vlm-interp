@@ -2570,16 +2570,15 @@ class EnhancedSemanticTracer:
         max_layers: int = None,
         output_format: str = "both",  # "png", "svg", or "both"
         align_tokens_by_layer: bool = True,
-        show_orphaned_nodes: bool = False,  # Changed default to False to reduce clutter
-        min_edge_weight: float = 0.05,  # Increased to filter out very weak connections
+        show_orphaned_nodes: bool = False,  
+        min_edge_weight: float = 0.05,
         use_variable_node_size: bool = True,
-        min_node_size: int = 800,  # Increased from 400 for better text display
-        max_node_size: int = 2000,  # Increased from 1200 for better text display
-        font_family: str = "Arial, Helvetica, sans-serif",  # Simplified font list
-        debug_mode: bool = False,  # Debug mode for troubleshooting
-        dpi: int = 150,  # Reduced from 300 to make file size smaller
-        max_fig_width: int = 16,  # Maximum figure width in inches
-        max_fig_height: int = 12  # Maximum figure height in inches
+        min_node_size: int = 800,
+        max_node_size: int = 2000,
+        font_family: str = None,  # Now optional, will use matplotlib defaults
+        debug_mode: bool = False,
+        dpi: int = 150,
+        dynamic_scaling: bool = True  # New parameter to control dynamic sizing
     ) -> List[str]:
         """
         Visualizes the semantic trace as a flow graph showing token connections across layers.
@@ -2606,11 +2605,10 @@ class EnhancedSemanticTracer:
             use_variable_node_size: Whether to vary node size based on weight
             min_node_size: Minimum node size for visualization
             max_node_size: Maximum node size for visualization
-            font_family: Font families to use, comma-separated for fallbacks
+            font_family: Font families to use (if None, uses matplotlib defaults)
             debug_mode: Whether to print debug information
-            dpi: DPI for PNG output (lower for smaller file size)
-            max_fig_width: Maximum figure width in inches
-            max_fig_height: Maximum figure height in inches
+            dpi: DPI for PNG output
+            dynamic_scaling: Whether to dynamically scale figure size based on content
             
         Returns:
             List of saved file paths
@@ -2933,9 +2931,20 @@ class EnhancedSemanticTracer:
         # Calculate positions for nodes
         pos = {}
         
-        # Set standard spacing
-        x_spacing = 2.0  # Increased from 1.0 to give more horizontal space
-        y_spacing = 1.5  # Increased from 1.0 to give more vertical space
+        # Set spacing based on graph size - more dynamic spacing for larger graphs
+        # Calculate the number of nodes per layer for spacing adjustments
+        nodes_per_layer = {}
+        for node in G.nodes():
+            layer = node_metadata[node]["layer"]
+            if layer not in nodes_per_layer:
+                nodes_per_layer[layer] = 0
+            nodes_per_layer[layer] += 1
+        
+        max_nodes_in_layer = max(nodes_per_layer.values()) if nodes_per_layer else 1
+        
+        # Adjust spacing based on graph density
+        x_spacing = 3.0  # Increased horizontal spacing
+        y_spacing = max(1.5, 0.5 + (max_nodes_in_layer / 20))  # Dynamic vertical spacing
         
         # Get all layers present in the graph (some might have been removed)
         graph_layers = sorted(set(node_metadata[n]["layer"] for n in G.nodes()))
@@ -2943,6 +2952,7 @@ class EnhancedSemanticTracer:
         if debug_mode:
             print(f"\nDEBUG: Calculating node positions")
             print(f"Layers in graph: {graph_layers}")
+            print(f"Using x_spacing: {x_spacing}, y_spacing: {y_spacing}")
             
         if align_tokens_by_layer:
             # Organize nodes in strict columns by layer
@@ -2967,15 +2977,19 @@ class EnhancedSemanticTracer:
                     layer_node_list.sort(key=lambda n: node_metadata[n]["idx"])
                     
                     # Calculate vertical spacing
-                    total_height = (num_nodes - 1) * y_spacing
+                    # For layers with many nodes, increase spacing exponentially
+                    layer_y_spacing = y_spacing * (1 + (num_nodes / 50))  # Dynamic spacing
+                    
+                    # Calculate total height needed
+                    total_height = (num_nodes - 1) * layer_y_spacing
                     start_y = -total_height / 2
                     
                     for i, node_id in enumerate(layer_node_list):
-                        # Position with regular vertical spacing
-                        pos[node_id] = (layer_x, start_y + i * y_spacing)
+                        # Position with dynamic vertical spacing
+                        pos[node_id] = (layer_x, start_y + i * layer_y_spacing)
                         
-                        if debug_mode and i < 3:  # Show first few nodes only to avoid verbose output
-                            print(f"Positioned node {node_id} at ({layer_x}, {start_y + i * y_spacing})")
+                        if debug_mode and i < 3:  # Show first few nodes only
+                            print(f"Positioned node {node_id} at ({layer_x}, {start_y + i * layer_y_spacing})")
         else:
             # More flexible positioning using a spring layout with constraints
             fixed_pos = {}
@@ -3001,48 +3015,65 @@ class EnhancedSemanticTracer:
                 sorted_nodes = sorted(nodes.keys(), key=lambda n: nodes[n])
                 num_nodes = len(sorted_nodes)
                 
+                # Increase spacing for layers with many nodes
+                layer_y_spacing = y_spacing * (1 + (num_nodes / 50))
+                
                 # Distribute evenly
+                total_height = (num_nodes - 1) * layer_y_spacing
+                start_y = -total_height / 2
+                
                 for i, node in enumerate(sorted_nodes):
                     # Use fixed x from layer, calculated y from position
                     x = fixed_pos[node][0]
-                    y = -num_nodes/2 * y_spacing + i * y_spacing
+                    y = start_y + i * layer_y_spacing
                     init_pos[node] = (x, y)
             
             # Use spring layout with fixed x positions
             pos = nx.spring_layout(
                 G, 
                 pos=init_pos,
-                fixed=list(G.nodes()),  # Fix all positions initially
-                k=0.3,  # Spring constant
-                iterations=50  # More iterations for better arrangement
+                fixed=[n for n in G.nodes()],  # Fix all positions
+                k=0.3,
+                iterations=50
             )
+        
+        # Calculate figure size based on graph properties
+        if dynamic_scaling:
+            # Scale based on number of layers and max nodes in any layer
+            width_per_layer = 2.0
+            height_per_node = 0.6
             
-            # Now adjust only y-positions while keeping x-positions fixed by layer
-            for node, (x, y) in pos.items():
-                layer = node_metadata[node]["layer"]
-                layer_index = graph_layers.index(layer)
-                pos[node] = (layer_index * x_spacing, y)  # Keep fixed x by layer
+            # Add margins for labels and better spacing
+            margin_width = 4
+            margin_height = 4
+            
+            # Calculate dimensions
+            fig_width = (len(graph_layers) * width_per_layer * x_spacing / 3.0) + margin_width
+            fig_height = (max_nodes_in_layer * height_per_node * y_spacing) + margin_height
+            
+            # Set reasonable minimum dimensions
+            fig_width = max(fig_width, 10)
+            fig_height = max(fig_height, 8)
+            
+            # Safety cap for extremely large graphs
+            fig_width = min(fig_width, 40)
+            fig_height = min(fig_height, 30)
+        else:
+            # Default fallback dimensions
+            fig_width, fig_height = 16, 12
         
-        # Now render the graph
-        # Calculate figure size based on number of layers and nodes
-        max_nodes_per_layer = max([len([n for n in G.nodes() if node_metadata.get(n, {}).get("layer") == l]) 
-                                for l in graph_layers], default=1)
+        if debug_mode:
+            print(f"Using figure dimensions: width={fig_width}, height={fig_height}")
         
-        # Calculate suggested figure dimensions
-        fig_width = max(len(graph_layers) * 2.5, 8)  # Width scales with layers
-        fig_height = max(max_nodes_per_layer * 0.7, 6)  # Height scales with max nodes in any layer
+        # Create figure
+        plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
         
-        # Apply maximum constraints to limit file size
-        fig_width = min(fig_width, max_fig_width)
-        fig_height = min(fig_height, max_fig_height)
-        
-        plt.figure(figsize=(fig_width, fig_height))
-        
-        # Try to use a widely available font that handles special characters
-        try:
-            plt.rcParams['font.family'] = font_family.split(',')[0].strip()
-        except Exception as e:
-            print(f"Warning: Could not set font family: {e}")
+        # Handle font settings more robustly
+        if font_family:
+            try:
+                plt.rcParams['font.family'] = font_family.split(',')[0].strip()
+            except Exception as e:
+                print(f"Warning: Could not set font family: {e}")
         
         # Define colors for different token types with better contrast
         token_colors = {
@@ -3104,10 +3135,6 @@ class EnhancedSemanticTracer:
         # Draw edges with width based on saliency/weight
         edge_width_multiplier = 5.0  # Controls overall edge thickness
         
-        # Draw regular edges
-        regular_edges = [(u, v) for u, v, d in G.edges(data=True) if not d.get('is_continuation', False)]
-        continuation_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('is_continuation', False)]
-        
         # Draw edges in two passes for better visualization
         # First a white "halo" for contrast
         for u, v, data in G.edges(data=True):
@@ -3144,6 +3171,7 @@ class EnhancedSemanticTracer:
                 )
         
         # Draw continuation edges with dashed style
+        continuation_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('is_continuation', False)]
         if continuation_edges:
             nx.draw_networkx_edges(
                 G, pos,
@@ -3177,16 +3205,17 @@ class EnhancedSemanticTracer:
             labels[node] = label
         
         # Calculate appropriate font sizes based on node sizes
-        base_font_size = 10  # Increased from 8
+        # Use a more conservative base font size
+        base_font_size = 9  # Reduced from 10
         font_sizes = []
         for i, node in enumerate(G.nodes()):
             is_target = node_metadata.get(node, {}).get("is_target", False)
             # Scale font size relative to node size
             if use_variable_node_size:
-                font_size = base_font_size * (node_sizes[i] / min_node_size) ** 0.3  # Scale more gradually
+                font_size = base_font_size * (node_sizes[i] / min_node_size) ** 0.25  # Scale more gradually
             else:
                 font_size = base_font_size * 1.2 if is_target else base_font_size
-            font_sizes.append(min(font_size, 14))  # Cap at reasonable maximum
+            font_sizes.append(min(font_size, 12))  # Cap at reasonable maximum
         
         # Custom label drawing with better text handling
         for i, node in enumerate(G.nodes()):
@@ -3195,9 +3224,10 @@ class EnhancedSemanticTracer:
             
             # Handle multiline labels
             lines = label.split('\n')
-            line_height = font_sizes[i] * 0.0018 * fig_height  # Scale by figure height
+            # Scale line height based on figure size and font
+            line_height = font_sizes[i] * (0.0018 * fig_height)
             
-            # Calculate total text height for better vertical centering
+            # Calculate total text height for vertical centering
             total_text_height = line_height * (len(lines) - 1)
             
             # Draw each line of the label
@@ -3210,20 +3240,23 @@ class EnhancedSemanticTracer:
                     horizontalalignment='center',
                     verticalalignment='center',
                     bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.2'),
-                    zorder=100  # Ensure labels are on top
+                    zorder=100,  # Ensure labels are on top
+                    family='sans-serif'  # Use default sans-serif font for better compatibility
                 )
         
         # Add layer labels at the top
         for i, layer_idx in enumerate(graph_layers):
             layer_x = i * x_spacing
-            max_y = max([y for _, y in pos.values()]) if pos else 0
+            # Find the highest node position plus a margin
+            max_y = max([y for _, y in pos.values()], default=0)
             plt.text(layer_x, max_y + 1, f"Layer {layer_idx}", 
-                    ha='center', va='center', fontsize=12, fontweight='bold')
+                    ha='center', va='center', fontsize=12, fontweight='bold',
+                    family='sans-serif')  # Use default sans-serif font
         
         # Set title
         if title is None:
             title = f"Semantic Trace Flow Graph for Token '{target_text}' (idx: {target_idx})"
-        plt.title(title, fontsize=14)
+        plt.title(title, fontsize=14, family='sans-serif')
         
         # Add legend for token types
         legend_elements = [
@@ -3245,11 +3278,12 @@ class EnhancedSemanticTracer:
             plt.Line2D([0], [0], linestyle='--', color='gray', linewidth=1, label='Token Continuation')
         ])
         
-        plt.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.05), ncol=3)
+        plt.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.05), 
+                ncol=3, prop={'family': 'sans-serif'})
         
-        # Remove axis
+        # Remove axis and ensure layout has proper padding
         plt.axis('off')
-        plt.tight_layout()
+        plt.tight_layout(pad=2.0)  # Increased padding for better margins
         
         # Save in desired formats
         if output_format in ["png", "both"]:
@@ -3258,8 +3292,8 @@ class EnhancedSemanticTracer:
             saved_paths.append(png_path)
         
         if output_format in ["svg", "both"]:
-            # Handle special characters in SVG output
-            mpl.rcParams['svg.fonttype'] = 'none'  # Use system fonts in SVG
+            # Use non-font embedding for SVG for better compatibility
+            mpl.rcParams['svg.fonttype'] = 'none'
             
             svg_path = os.path.join(save_dir, f"flow_graph_{target_idx}.svg")
             plt.savefig(svg_path, format='svg', bbox_inches='tight')
