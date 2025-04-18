@@ -2575,10 +2575,10 @@ class EnhancedSemanticTracer:
         use_variable_node_size: bool = True,
         min_node_size: int = 800,
         max_node_size: int = 2000,
-        font_family: str = None,  # Now optional, will use matplotlib defaults
+        font_family: str = None,  # Optional, will use matplotlib defaults if None
         debug_mode: bool = False,
         dpi: int = 150,
-        dynamic_scaling: bool = True  # New parameter to control dynamic sizing
+        dynamic_scaling: bool = True  # Controls dynamic sizing
     ) -> List[str]:
         """
         Visualizes the semantic trace as a flow graph showing token connections across layers.
@@ -2615,7 +2615,6 @@ class EnhancedSemanticTracer:
         """
         import matplotlib.pyplot as plt
         import networkx as nx
-        from matplotlib.font_manager import FontProperties
         import matplotlib as mpl
         
         saved_paths = []
@@ -2637,7 +2636,8 @@ class EnhancedSemanticTracer:
                 key = int(k) if isinstance(k, str) else k
                 int_keyed_results[key] = v
             except (ValueError, TypeError):
-                print(f"Warning: Could not convert key {k} to integer, skipping.")
+                if debug_mode:
+                    print(f"Warning: Could not convert key {k} to integer, skipping.")
                 continue
         
         # Now replace the original dict with our sanitized version
@@ -3068,12 +3068,8 @@ class EnhancedSemanticTracer:
         # Create figure
         plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
         
-        # Handle font settings more robustly
-        if font_family:
-            try:
-                plt.rcParams['font.family'] = font_family.split(',')[0].strip()
-            except Exception as e:
-                print(f"Warning: Could not set font family: {e}")
+        # Handle font settings in a simpler way that avoids parser errors
+        # Avoid setting font family entirely - use matplotlib defaults 
         
         # Define colors for different token types with better contrast
         token_colors = {
@@ -3240,8 +3236,7 @@ class EnhancedSemanticTracer:
                     horizontalalignment='center',
                     verticalalignment='center',
                     bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.2'),
-                    zorder=100,  # Ensure labels are on top
-                    family='sans-serif'  # Use default sans-serif font for better compatibility
+                    zorder=100  # Ensure labels are on top
                 )
         
         # Add layer labels at the top
@@ -3250,15 +3245,14 @@ class EnhancedSemanticTracer:
             # Find the highest node position plus a margin
             max_y = max([y for _, y in pos.values()], default=0)
             plt.text(layer_x, max_y + 1, f"Layer {layer_idx}", 
-                    ha='center', va='center', fontsize=12, fontweight='bold',
-                    family='sans-serif')  # Use default sans-serif font
+                    ha='center', va='center', fontsize=12, fontweight='bold')
         
         # Set title
         if title is None:
             title = f"Semantic Trace Flow Graph for Token '{target_text}' (idx: {target_idx})"
-        plt.title(title, fontsize=14, family='sans-serif')
+        plt.title(title, fontsize=14)
         
-        # Add legend for token types
+        # Add legend for token types - DO NOT specify font family
         legend_elements = [
             plt.Line2D([0], [0], marker='o', color='w', markerfacecolor="#3498db", markersize=10, label='Text Token'),
             plt.Line2D([0], [0], marker='o', color='w', markerfacecolor="#e74c3c", markersize=10, label='Image Token'),
@@ -3278,8 +3272,8 @@ class EnhancedSemanticTracer:
             plt.Line2D([0], [0], linestyle='--', color='gray', linewidth=1, label='Token Continuation')
         ])
         
-        plt.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.05), 
-                ncol=3, prop={'family': 'sans-serif'})
+        # Create legend WITHOUT specifying font properties - this was causing the error
+        plt.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.05), ncol=3)
         
         # Remove axis and ensure layout has proper padding
         plt.axis('off')
@@ -3303,6 +3297,7 @@ class EnhancedSemanticTracer:
         
         print(f"Flow graph visualization saved to {', '.join(saved_paths)}")
         return saved_paths
+
 
     def _sanitize_text_for_display(self, text):
         """
@@ -3348,6 +3343,7 @@ class EnhancedSemanticTracer:
                 result += '·'  # Middle dot as placeholder
         
         return result
+    
     def analyze_last_token(
         self,
         input_data: Dict[str, Any],
