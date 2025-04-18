@@ -2990,19 +2990,10 @@ class EnhancedSemanticTracer:
             # Layer-specific x-coordinate
             layer_x = graph_layers.index(layer_idx) * x_spacing
             
+            layer_node_list.sort(key=lambda n: node_metadata[n]["idx"])
             # Distribute nodes vertically
             num_nodes = len(layer_node_list)
-            if num_nodes > 0:
-                # Sort nodes by token index for readability
-                # BUT ensure special tokens like <s> are always at top/bottom based on position
-                layer_node_list.sort(key=lambda n: (
-                    # Start token <s> should be at top (lowest y-value)
-                    0 if node_metadata[n]["text"] == "'<s>'" else
-                    # Image tokens should be below start token
-                    1 if node_metadata[n]["text"] == "'<image>'" else
-                    # Other tokens are sorted by index
-                    node_metadata[n]["idx"] + 10  # Add offset to ensure special tokens come first
-                ))
+            if num_nodes > 0:    
                 
                 # Calculate vertical spacing with much more room between nodes
                 total_height = (num_nodes - 1) * y_spacing
@@ -3158,19 +3149,17 @@ class EnhancedSemanticTracer:
                     arrowsize=8
                 )
         
-        # Create simplified labels with only token text and top prediction
+        # Create single-line labels: token_text and top_pred joined on one line
         labels = {}
         for node in G.nodes():
             meta = node_metadata.get(node, {})
             token_text = meta.get('text', '')
-            top_pred = meta.get('top_pred', '')
-            
-            # Simplified label - just token text and top prediction
-            label = f"{token_text}"
+            top_pred   = meta.get('top_pred', '')
             if top_pred:
-                label += f"\n{top_pred}"
-                    
-            labels[node] = label
+                # e.g. "Eiffel →tower"
+                labels[node] = f"{token_text} {top_pred}"
+            else:
+                labels[node] = token_text
         
         # Calculate appropriate font sizes
         base_font_size = 10
@@ -3183,30 +3172,18 @@ class EnhancedSemanticTracer:
                 font_size = base_font_size * 1.2 if is_target else base_font_size
             font_sizes.append(min(font_size, 12))
         
-        # Custom label drawing with better text handling
+        # Draw each label as a single centered line
         for i, node in enumerate(G.nodes()):
-            x, y = pos[node]
-            label = labels.get(node, "")
-            
-            # Handle multiline labels
-            lines = label.split('\n')
-            line_height = font_sizes[i] * 0.0015 * fig_height
-            
-            # Calculate total text height for vertical centering
-            total_text_height = line_height * (len(lines) - 1)
-            
-            # Draw each line of the label
-            for j, line in enumerate(lines):
-                y_offset = j * line_height - total_text_height / 2
-                plt.text(
-                    x, y - y_offset,
-                    line,
-                    fontsize=font_sizes[i],
-                    horizontalalignment='center',
-                    verticalalignment='center',
-                    bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.2'),
-                    zorder=100  # Ensure labels are on top
-                )
+            x, y   = pos[node]
+            label  = labels.get(node, "")
+            plt.text(
+                x, y,
+                label,
+                fontsize=font_sizes[i],
+                ha='center', va='center',
+                bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.2'),
+                zorder=100
+            )
         
         # Add layer labels at the top
         for i, layer_idx in enumerate(graph_layers):

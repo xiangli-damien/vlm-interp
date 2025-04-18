@@ -166,7 +166,8 @@ def run_saliency_workflow(
     output_dir: str = "saliency_analysis",
     image_size: Tuple[int, int] = (336, 336),
     layer_batch_size: int = 2,
-    save_plots: bool = True
+    save_plots: bool = True,
+    top_k_image_tokens: Optional[int] = 10
 ) -> Dict[str, Any]:
     """
     Performs token-by-token generation with gradient-based saliency analysis workflow.
@@ -278,7 +279,8 @@ def run_saliency_workflow(
                 
                 target_idx = current_input_ids.shape[1] - 1 # Target is last token of input
                 flow_metrics = analyze_layerwise_saliency_flow(
-                    current_saliency_scores, text_indices, image_indices, target_idx, cpu_offload=True
+                    current_saliency_scores, text_indices, image_indices, target_idx, 
+                    cpu_offload=True, top_k_image_tokens=top_k_image_tokens  # Pass the top-k parameter
                 )
                 
                 if save_plots and flow_metrics:
@@ -287,8 +289,9 @@ def run_saliency_workflow(
                     plot_path = os.path.join(output_dir, plot_filename)
                     visualize_information_flow(
                         flow_metrics, 
-                        f"{model_name_short} - Saliency Flow for Token {step_idx+1} ('{new_token_text}')", 
-                        plot_path
+                        f"{model_name_short} - Saliency Flow for Token {step_idx+1} ('{new_token_text}')",
+                        plot_path,
+                        use_top_k=top_k_image_tokens is not None  # Add parameter to use top-k in visualization
                     )
                 
                 token_results[f"token_{step_idx+1}"] = {
@@ -323,6 +326,7 @@ def run_saliency_workflow(
                 "num_tokens": num_tokens,
                 "image_size": image_size,
                 "layer_batch_size": layer_batch_size,
+                "top_k_image_tokens": top_k_image_tokens,  # Add to config
                 "prompt": prompt_text,
                 "image_source": image_source if isinstance(image_source, str) else "PIL Input"
             }

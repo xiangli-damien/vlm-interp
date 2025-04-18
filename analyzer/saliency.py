@@ -17,7 +17,8 @@ def compute_flow_metrics_optimized(
     text_indices: torch.Tensor,
     image_indices: torch.Tensor,
     target_idx: int,
-    normalize: bool = False
+    normalize: bool = False,
+    top_k_image_tokens: Optional[int] = None  # New parameter
 ) -> Dict[str, float]:
     """
     Computes information flow metrics from different token types (text, image, generated)
@@ -31,6 +32,8 @@ def compute_flow_metrics_optimized(
         image_indices: 1D tensor of indices for image tokens
         target_idx: The index of the target token (row index in the matrix)
         normalize: If True, normalizes to represent percentages of total flow
+        top_k_image_tokens: If provided, only consider the top-k image tokens with 
+            highest saliency scores when calculating the mean. If None, uses all image tokens.
 
     Returns:
         Dict containing flow metrics between different token types and the target
@@ -83,22 +86,39 @@ def compute_flow_metrics_optimized(
         if count > 0:
             values = target_row[valid_sources_mask]
             flow_sum = values.sum().item()
-            flow_mean = values.mean().item()
+            
+            # For image tokens, optionally consider only top-k
+            if prefix == "Siq" and top_k_image_tokens is not None and count > top_k_image_tokens:
+                # Get top-k values for image tokens
+                top_k_values, _ = torch.topk(values, k=min(top_k_image_tokens, count))
+                metrics[f"{prefix}_top{top_k_image_tokens}_mean"] = top_k_values.mean().item()
+                metrics[f"{prefix}_top{top_k_image_tokens}_sum"] = top_k_values.sum().item()
+            
+            # Store standard metrics regardless
+            metrics[f"{prefix}_mean"] = values.mean().item()
             metrics[f"{prefix}_sum"] = flow_sum
-            metrics[f"{prefix}_mean"] = flow_mean
             total_flow_sum_causal += flow_sum
         else:
             metrics[f"{prefix}_sum"] = 0.0
             metrics[f"{prefix}_mean"] = 0.0
+            if prefix == "Siq" and top_k_image_tokens is not None:
+                metrics[f"{prefix}_top{top_k_image_tokens}_mean"] = 0.0
+                metrics[f"{prefix}_top{top_k_image_tokens}_sum"] = 0.0
 
     # --- Normalization (Optional) ---
     if normalize:
         if total_flow_sum_causal > 1e-8: # Avoid division by zero
              for prefix in ["Stq", "Siq", "Sgq"]:
                  metrics[f"{prefix}_percent"] = (metrics[f"{prefix}_sum"] / total_flow_sum_causal) * 100.0
+                 # Also normalize top-k metrics if they exist
+                 if prefix == "Siq" and top_k_image_tokens is not None and metrics[f"{prefix}_count"] > top_k_image_tokens:
+                     top_k_sum = metrics.get(f"{prefix}_top{top_k_image_tokens}_sum", 0.0)
+                     metrics[f"{prefix}_top{top_k_image_tokens}_percent"] = (top_k_sum / total_flow_sum_causal) * 100.0
         else:
              for prefix in ["Stq", "Siq", "Sgq"]:
                  metrics[f"{prefix}_percent"] = 0.0
+                 if prefix == "Siq" and top_k_image_tokens is not None and metrics[f"{prefix}_count"] > 0:
+                     metrics[f"{prefix}_top{top_k_image_tokens}_percent"] = 0.0
 
     # --- Token Counts ---
     metrics["token_counts"] = {
@@ -165,7 +185,8 @@ def analyze_layerwise_saliency_flow(
     text_indices: torch.Tensor,
     image_indices: torch.Tensor,
     target_token_idx: int,
-    cpu_offload: bool = True
+    cpu_offload: bool = True,
+    top_k_image_tokens: Optional[int] = 10  # New parameter with default value
 ) -> Dict[int, Dict[str, float]]:
     """
     Analyzes layer-wise information flow based on computed saliency scores.
@@ -181,13 +202,17 @@ def analyze_layerwise_saliency_flow(
         target_token_idx: The index of the target token for flow analysis
         cpu_offload: If True, attempts to move saliency tensors to CPU before
                      computing metrics to conserve GPU memory
+        top_k_image_tokens: If provided, only consider the top-k image tokens with 
+                           highest saliency scores when calculating the mean. Default is 10.
 
     Returns:
         Dictionary mapping layer numerical index to flow metrics dictionary
     """
     layer_flow_metrics: Dict[int, Dict[str, float]] = {}
     print(f"\nAnalyzing layer-wise flow based on saliency scores for target token index: {target_token_idx}")
-
+    if top_k_image_tokens:
+        print(f"Using top-{top_k_image_tokens} image tokens for mean saliency calculation")
+    
     if not saliency_scores:
          print("Warning: No saliency scores provided for analysis.")
          return {}
@@ -249,7 +274,6 @@ def analyze_layerwise_saliency_flow(
                  del saliency_matrix_2d # Clean up
                  continue
 
-
         # --- Compute Flow Metrics ---
         try:
             metrics = compute_flow_metrics_optimized(
@@ -257,7 +281,8 @@ def analyze_layerwise_saliency_flow(
                 text_indices,
                 image_indices,
                 target_token_idx,
-                normalize=True # Calculate percentages as well
+                normalize=True, # Calculate percentages as well
+                top_k_image_tokens=top_k_image_tokens  # Pass the top-k parameter
             )
             layer_flow_metrics[layer_num] = metrics
         except Exception as e:
@@ -270,7 +295,6 @@ def analyze_layerwise_saliency_flow(
         if layer_num % 10 == 0: # Periodic GC
              gc.collect()
              if torch.cuda.is_available(): torch.cuda.empty_cache()
-
 
     print(f"Saliency flow analysis complete for {len(layer_flow_metrics)} layers.")
     return layer_flow_metrics

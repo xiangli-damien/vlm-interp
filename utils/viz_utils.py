@@ -40,9 +40,9 @@ def visualize_information_flow(
 
     Args:
         metrics: Dictionary where keys are layer indices and values are
-                dictionaries containing flow metrics
-        title: Main title for the plot figure
-        save_path: Path to save the plot image
+                 dictionaries containing flow metrics
+        title:   Main title for the plot figure
+        save_path: Path to save the plot image (optional)
     """
     if not metrics:
         print("Warning: No metrics data provided to visualize_information_flow.")
@@ -50,66 +50,61 @@ def visualize_information_flow(
 
     # Define consistent colors and markers for different flow types
     flow_styles = {
-        "Siq_mean": {"color": "#FF4500", "marker": "o", "label": "Image→Target (Mean)"},
-        "Stq_mean": {"color": "#1E90FF", "marker": "^", "label": "Text→Target (Mean)"},
-        "Sgq_mean": {"color": "#32CD32", "marker": "s", "label": "Generated→Target (Mean)"},
-        "Siq_sum": {"color": "#FF4500", "marker": "o", "label": "Image→Target (Sum)", "linestyle": '--'},
-        "Stq_sum": {"color": "#1E90FF", "marker": "^", "label": "Text→Target (Sum)", "linestyle": '--'},
-        "Sgq_sum": {"color": "#32CD32", "marker": "s", "label": "Generated→Target (Sum)", "linestyle": '--'}
+        "Siq_mean": {"marker": "o", "label": "Image→Target (Mean)"},
+        "Stq_mean": {"marker": "^", "label": "Text→Target (Mean)"},
+        "Sgq_mean": {"marker": "s", "label": "Generated→Target (Mean)"},
+        "Siq_sum": {"marker": "o", "label": "Image→Target (Sum)", "linestyle": '--'},
+        "Stq_sum": {"marker": "^", "label": "Text→Target (Sum)", "linestyle": '--'},
+        "Sgq_sum": {"marker": "s", "label": "Generated→Target (Sum)", "linestyle": '--'}
     }
 
     # Extract layer indices and available metric keys
     layers = sorted(metrics.keys())
-    if not layers:
-        print("Warning: Metrics dictionary is empty or contains no valid layer indices.")
-        return
-
     available_metric_keys = set()
     for layer_idx in layers:
-        if isinstance(metrics[layer_idx], dict):
-             available_metric_keys.update(metrics[layer_idx].keys())
+        available_metric_keys.update(metrics[layer_idx].keys())
 
-    # Collect data for plotting, handling missing metrics gracefully
-    plot_data: Dict[str, List[Optional[float]]] = {key: [] for key in flow_styles if key in available_metric_keys}
-    for layer in layers:
-         layer_metrics = metrics.get(layer, {})
-         for metric_key in plot_data.keys():
-              plot_data[metric_key].append(layer_metrics.get(metric_key))
+    # Build plotting data
+    plot_data: Dict[str, List[Optional[float]]] = {
+        key: [metrics[layer].get(key) for layer in layers]
+        for key in flow_styles
+        if key in available_metric_keys
+    }
 
-    # Create figure with two subplots (Mean and Sum)
+    # Create figure with two subplots
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7), sharex=True)
 
-    # --- Plot 1: Mean Information Flow ---
+    # --- Mean flow subplot ---
     ax1.set_title("Mean Information Flow per Layer")
     ax1.set_xlabel("Layer Index")
     ax1.set_ylabel("Mean Attention / Saliency")
-    mean_keys = ["Siq_mean", "Stq_mean", "Sgq_mean"]
-    for key in mean_keys:
+    for key in ["Siq_mean", "Stq_mean", "Sgq_mean"]:
         if key in plot_data:
             style = flow_styles[key]
-            valid_layers = [l for l, v in zip(layers, plot_data[key]) if v is not None]
-            valid_values = [v for v in plot_data[key] if v is not None]
-            if valid_layers:
-                 ax1.plot(valid_layers, valid_values, marker=style["marker"], color=style["color"], label=style["label"], linewidth=2)
+            values = plot_data[key]
+            ax1.plot(layers, values, marker=style["marker"], label=style["label"], linewidth=2)
     ax1.legend(loc="best")
     ax1.grid(True, linestyle=':', alpha=0.6)
 
-    # --- Plot 2: Sum Information Flow ---
+    # --- Sum flow subplot ---
     ax2.set_title("Total Information Flow per Layer")
     ax2.set_xlabel("Layer Index")
     ax2.set_ylabel("Summed Attention / Saliency")
-    sum_keys = ["Siq_sum", "Stq_sum", "Sgq_sum"]
-    for key in sum_keys:
-         if key in plot_data:
-             style = flow_styles[key]
-             valid_layers = [l for l, v in zip(layers, plot_data[key]) if v is not None]
-             valid_values = [v for v in plot_data[key] if v is not None]
-             if valid_layers:
-                 ax2.plot(valid_layers, valid_values, marker=style["marker"], color=style["color"], label=style["label"], linestyle=style.get("linestyle", '-'), linewidth=2)
+    for key in ["Siq_sum", "Stq_sum", "Sgq_sum"]:
+        if key in plot_data:
+            style = flow_styles[key]
+            values = plot_data[key]
+            ax2.plot(
+                layers, values,
+                marker=style["marker"],
+                linestyle=style.get("linestyle", '-'),
+                label=style["label"],
+                linewidth=2
+            )
     ax2.legend(loc="best")
     ax2.grid(True, linestyle=':', alpha=0.6)
 
-    # Add overall figure title
+    # Overall title and layout
     fig.suptitle(title, fontsize=16, y=1.02)
     plt.tight_layout(rect=[0, 0.03, 1, 0.98])
 
@@ -123,6 +118,7 @@ def visualize_information_flow(
 
     plt.show()
     plt.close(fig)
+
 
 
 def visualize_attention_heatmap(
