@@ -43,14 +43,14 @@ class SemanticTracingVisualizer:
         os.makedirs(output_dir, exist_ok=True)
     
     def visualize_from_csv(
-        self,
-        csv_path: str,
-        metadata_path: Optional[str] = None,
-        image_path: Optional[str] = None,
-        target_token: Optional[Dict[str, Any]] = None,
-        flow_graph_params: Optional[Dict[str, Any]] = None,
-        heatmap_params: Optional[Dict[str, Any]] = None,
-    ) -> List[str]:
+    self,
+    csv_path: str,
+    metadata_path: Optional[str] = None,
+    image_path: Optional[str] = None,
+    target_token: Optional[Dict[str, Any]] = None,
+    flow_graph_params: Optional[Dict[str, Any]] = None,
+    heatmap_params: Optional[Dict[str, Any]] = None,
+) -> List[str]:
         """
         Generate visualizations from a saved CSV trace file.
         
@@ -131,9 +131,17 @@ class SemanticTracingVisualizer:
             traceback.print_exc()
         
         # 2. Create heatmap visualizations if we have an image and feature mapping
-        if image_path and os.path.exists(image_path) and "feature_mapping" in metadata:
+        image_exists = image_path is not None and os.path.exists(image_path)
+        feature_mapping_exists = "feature_mapping" in metadata and metadata["feature_mapping"]
+        
+        if not image_exists:
+            print(f"Warning: Image path is missing or invalid: {image_path}")
+        if not feature_mapping_exists:
+            print(f"Warning: Feature mapping not found in metadata")
+        
+        if image_exists and feature_mapping_exists:
             try:
-                print("Creating heatmap visualizations...")
+                print(f"Creating heatmap visualizations with image path: {image_path}")
                 heatmap_paths = self.create_heatmaps(
                     df, target_text, target_idx, image_path, 
                     save_dir, metadata["feature_mapping"], **heatmap_params
@@ -210,8 +218,8 @@ class SemanticTracingVisualizer:
         show_orphaned_nodes: bool = False,  
         min_edge_weight: float = 0.05,
         use_variable_node_size: bool = True,
-        min_node_size: int = 800,
-        max_node_size: int = 2000,
+        min_node_size: int = 600,
+        max_node_size: int = 1500,
         debug_mode: bool = False,
         dpi: int = 150,
         show_continuation_edges: bool = False,
@@ -587,7 +595,7 @@ class SemanticTracingVisualizer:
         return saved_paths
     
     def _calculate_flow_graph_node_positions(self, G, node_metadata, align_tokens_by_layer):
-        """Calculate positions for nodes in the flow graph"""
+        """Calculate positions for nodes in the flow graph with optimized spacing"""
         # Get all layers present in the graph
         graph_layers = sorted(set(node_metadata[n]["layer"] for n in G.nodes()))
         
@@ -601,8 +609,8 @@ class SemanticTracingVisualizer:
         
         # Calculate vertical spacing based on the maximum nodes in any layer
         max_nodes_in_layer = max(len(nodes) for nodes in layer_nodes.values())
-        x_spacing = 6.0  # Horizontal spacing between layers
-        y_spacing = 3.0  # Vertical spacing between nodes
+        x_spacing = 4.0  # Reduced from 6.0
+        y_spacing = 2.0  # Reduced from 3.0
         
         # Position nodes with fixed x by layer, distributed y with increased spacing
         pos = {}
@@ -675,7 +683,6 @@ class SemanticTracingVisualizer:
         return node_sizes
     
     def _calculate_flow_graph_dimensions(self, G, node_metadata):
-        """Calculate appropriate figure dimensions based on graph size"""
         # Get all layers present in the graph
         graph_layers = sorted(set(node_metadata[n]["layer"] for n in G.nodes()))
         
@@ -689,9 +696,8 @@ class SemanticTracingVisualizer:
         
         max_nodes_in_layer = max(nodes_per_layer.values()) if nodes_per_layer else 1
         
-        # Calculate dimensions
-        fig_width = len(graph_layers) * 3 + 3  # Width scales with layers
-        fig_height = max(12, max_nodes_in_layer * 1.2)  # Height scales with max nodes
+        fig_width = min(16, len(graph_layers) * 2 + 2)  # Width scales with layers, max 16 inches
+        fig_height = min(12, max(6, max_nodes_in_layer * 0.8))  # Height scales with max nodes, min 6, max 12 inches
         
         return fig_width, fig_height
     

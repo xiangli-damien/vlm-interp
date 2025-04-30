@@ -359,8 +359,6 @@ def run_semantic_tracing_analysis(
     debug_mode: bool = False
 ) -> Dict[str, Any]:
     """
-    Run semantic tracing analysis and save results to CSV files.
-    
     Args:
         model_id: HuggingFace model ID
         image_path: Path to the image file
@@ -391,8 +389,10 @@ def run_semantic_tracing_analysis(
     print(f"Prompt: {prompt}")
     print(f"Output Directory: {output_dir}")
     
-    # Create output directory if it doesn't exist
+    # Create organized output directory structure
     os.makedirs(output_dir, exist_ok=True)
+    csv_dir = os.path.join(output_dir, "csv_data")
+    os.makedirs(csv_dir, exist_ok=True)
     
     # Print analysis mode information
     mode_str = "Analyzing last token in prompt" if analyze_last_token else \
@@ -416,7 +416,7 @@ def run_semantic_tracing_analysis(
         model=model,
         processor=processor,
         top_k=top_k,
-        output_dir=output_dir,
+        output_dir=csv_dir,  # Use the CSV directory
         logit_lens_concepts=concepts_to_track,
         normalize_weights=normalize_weights,
         debug=debug_mode
@@ -458,7 +458,7 @@ def run_semantic_tracing_analysis(
         "target_tokens": [],
         "full_sequence": trace_results.get("full_sequence", {}),
         "analysis_time": time.time() - start_time,
-        "image_path": image_path
+        "image_path": image_path  # Store the original image path
     }
     
     # Extract CSV paths from results
@@ -474,7 +474,7 @@ def run_semantic_tracing_analysis(
         output_info["target_tokens"] = [trace_results["target_token"]]
     
     # Save analysis summary
-    summary_path = os.path.join(output_dir, "analysis_summary.json")
+    summary_path = os.path.join(csv_dir, "analysis_summary.json")
     try:
         import json
         with open(summary_path, 'w') as f:
@@ -500,7 +500,7 @@ def run_semantic_tracing_analysis(
     
     print(f"\n=== Analysis Complete ===")
     print(f"Analysis time: {output_info['analysis_time']:.2f} seconds")
-    print(f"CSV data saved to: {output_dir}")
+    print(f"CSV data saved to: {csv_dir}")
     
     # Clean up memory
     del model, processor, tracer, input_data, trace_results
@@ -536,8 +536,13 @@ def create_visualizations_from_csv(
     if output_dir is None:
         # If not specified, use a directory next to the CSV file
         csv_dir = os.path.dirname(csv_path)
-        csv_basename = os.path.basename(csv_path).split('.')[0]
-        output_dir = os.path.join(csv_dir, f"{csv_basename}_visualizations")
+        project_dir = os.path.dirname(csv_dir)  # Go up one level to project dir
+        vis_dir = os.path.join(project_dir, "visualizations")
+        output_dir = vis_dir
+    else:
+        # If output_dir is specified, use it as the base and add 'visualizations'
+        vis_dir = os.path.join(output_dir, "visualizations")
+        output_dir = vis_dir
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -565,6 +570,7 @@ def create_visualizations_from_csv(
     print(f"\n=== Creating Visualizations from CSV ===")
     print(f"CSV: {csv_path}")
     print(f"Output Directory: {output_dir}")
+    print(f"Image Path: {image_path}")
     
     # Create a visualizer instance
     visualizer = SemanticTracingVisualizer(output_dir=output_dir)
@@ -742,7 +748,8 @@ def run_semantic_tracing_test(
         # Prepare results to return
         test_results = {
             "analysis_results": analysis_results,
-            "visualization_paths": []
+            "visualization_paths": [],
+            "image_path": image_url  # Store image path for reference
         }
         
         # 2. Run visualization if not skipped
@@ -764,7 +771,7 @@ def run_semantic_tracing_test(
                 vis_paths = create_visualizations_from_csv(
                     csv_path=csv_path,
                     metadata_path=analysis_results.get("metadata_path", ""),
-                    image_path=image_url,
+                    image_path=image_url,  # Pass the image path directly
                     output_dir=output_dir,
                     flow_graph_params=flow_graph_params
                 )
@@ -785,7 +792,7 @@ def run_semantic_tracing_test(
         # Display results summary
         if "target_tokens" in analysis_results:
             print(f"\nAnalyzed {len(analysis_results['target_tokens'])} tokens:")
-            for i, token_info in enumerate(analysis_results["target_tokens"]):
+            for i, token_info in enumerate(analysis_results['target_tokens']):
                 print(f"  {i+1}. '{token_info['text']}' at position {token_info['index']}")
         
         if "full_sequence" in analysis_results and "text" in analysis_results["full_sequence"]:
