@@ -26,10 +26,10 @@ from analyzer.workflows import (
     run_logit_lens_workflow,
     run_saliency_workflow,
     # Semantic tracing modular functions
-    run_semantic_tracing_analysis,  # Runs only the analysis part
-    visualize_semantic_tracing_results,  # Creates visualizations from analysis results
-    visualize_semantic_tracing_from_csv,  # Creates visualizations directly from saved CSV
-    run_semantic_tracing_experiment  # Full experiment (analysis + visualization)
+    run_semantic_tracing_analysis,
+    create_visualizations_from_csv,
+    process_all_csvs_in_directory,
+    run_semantic_tracing_test
 )
 
 # Semantic Tracing Analyzer and Visualizer
@@ -49,9 +49,9 @@ __all__ = [
     "run_logit_lens_workflow",
     "run_saliency_workflow",
     "run_semantic_tracing_analysis",
-    "visualize_semantic_tracing_results",
-    "visualize_semantic_tracing_from_csv",
-    "run_semantic_tracing_experiment",
+    "create_visualizations_from_csv",
+    "process_all_csvs_in_directory",
+    "run_semantic_tracing_test",
 ]
 
 # Add stepwise_logit_lens_workflow if available

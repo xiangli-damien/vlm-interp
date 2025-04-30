@@ -340,6 +340,7 @@ def run_saliency_workflow(
 
     return final_results
 
+
 def run_semantic_tracing_analysis(
     model_id: str,
     image_path: str, 
@@ -529,7 +530,7 @@ def create_visualizations_from_csv(
     Returns:
         List of paths to created visualization files
     """
-    from semantic_tracing_visualizer import SemanticTracingVisualizer
+    from analyzer.semantic_tracing_visualizer import SemanticTracingVisualizer
     
     # Determine output directory
     if output_dir is None:
@@ -643,3 +644,165 @@ def process_all_csvs_in_directory(
     print(f"Created {total_vis} total visualizations")
     
     return results
+
+def run_semantic_tracing_test(
+    model_id: str,
+    image_url: str,
+    prompt_text: str,
+    output_dir: Optional[str] = None,
+    num_tokens: int = 1,
+    top_k: int = 3,
+    concepts_to_track: Optional[List[str]] = None,
+    load_in_4bit: bool = True,
+    analyze_last_token: bool = False,
+    single_forward_pass: bool = False,
+    # Visualization parameters
+    skip_visualization: bool = False,
+    output_format: str = "both",
+    show_orphaned_nodes: bool = False,
+    min_edge_weight: float = 0.05,
+    use_variable_node_size: bool = True
+) -> Dict[str, Any]:
+    """
+    Run semantic tracing test with simplified parameters.
+    
+    Args:
+        model_id: HuggingFace model ID
+        image_url: URL or path to the image
+        prompt_text: Text prompt to use
+        output_dir: Directory to save results
+        num_tokens: Number of tokens to generate and analyze
+        top_k: Number of top contributing tokens to track
+        concepts_to_track: List of concepts to track
+        load_in_4bit: Whether to use 4-bit quantization
+        analyze_last_token: Analyze last token in prompt
+        single_forward_pass: Use single forward pass
+        skip_visualization: Skip visualization step
+        output_format: Output format (png, svg, or both)
+        show_orphaned_nodes: Show nodes with no connections
+        min_edge_weight: Minimum edge weight threshold
+        use_variable_node_size: Vary node size based on importance
+        
+    Returns:
+        Dictionary with test results
+    """
+    # Extract short model name for output directory
+    model_short_name = model_id.split('/')[-1].replace("-hf", "")
+    
+    # Set default output directory if not provided
+    if output_dir is None:
+        base_dir = os.path.join(os.getcwd(), "results")
+        output_dir = os.path.join(base_dir, f"semantic_tracing_{model_short_name}")
+    
+    # Define default concepts if none provided
+    if concepts_to_track is None:
+        concepts_to_track = ["person", "object", "building", "nature", "sign", "color"]
+    
+    # Print analysis configuration
+    print(f"\n{'='*50}")
+    print(f"RUNNING SEMANTIC TRACING TEST WITH {model_id.split('/')[-1].upper()}")
+    print(f"{'='*50}")
+    print(f"Model: {model_id}")
+    print(f"Image: {image_url}")
+    print(f"Prompt: {prompt_text}")
+    print(f"Output Directory: {output_dir}")
+    print(f"Tokens to analyze: {num_tokens}")
+    print(f"Concepts to track: {concepts_to_track}")
+    print(f"Analysis mode: {'Last token' if analyze_last_token else 'Multiple tokens'}")
+    print(f"Using single forward pass: {single_forward_pass}")
+    
+    # Clean memory if helper function is available
+    try:
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("Memory cleaned before starting.")
+    except ImportError:
+        print("Warning: Unable to clean memory.")
+    
+    start_time = time.time()
+    
+    try:
+        # 1. Run analysis only
+        analysis_results = run_semantic_tracing_analysis(
+            model_id=model_id,
+            image_path=image_url,
+            prompt=prompt_text,
+            output_dir=output_dir,
+            top_k=top_k,
+            num_tokens=num_tokens,
+            load_in_4bit=load_in_4bit,
+            concepts_to_track=concepts_to_track,
+            normalize_weights=True,
+            single_forward_pass=single_forward_pass,
+            analyze_last_token=analyze_last_token
+        )
+        
+        # Prepare results to return
+        test_results = {
+            "analysis_results": analysis_results,
+            "visualization_paths": []
+        }
+        
+        # 2. Run visualization if not skipped
+        if not skip_visualization:
+            # Set flow graph parameters
+            flow_graph_params = {
+                "output_format": output_format,
+                "align_tokens_by_layer": True,
+                "show_orphaned_nodes": show_orphaned_nodes,
+                "min_edge_weight": min_edge_weight,
+                "use_variable_node_size": use_variable_node_size
+            }
+            
+            print("\nRunning visualization step...")
+            
+            # Visualize each CSV file
+            all_vis_paths = []
+            for csv_path in analysis_results.get("csv_files", []):
+                vis_paths = create_visualizations_from_csv(
+                    csv_path=csv_path,
+                    metadata_path=analysis_results.get("metadata_path", ""),
+                    image_path=image_url,
+                    output_dir=output_dir,
+                    flow_graph_params=flow_graph_params
+                )
+                all_vis_paths.extend(vis_paths)
+            
+            test_results["visualization_paths"] = all_vis_paths
+            
+            print(f"\nCreated {len(all_vis_paths)} visualization files")
+        
+        # Calculate and add total time
+        total_time = time.time() - start_time
+        test_results["total_time"] = total_time
+        
+        # Print summary information
+        print(f"\n=== Test Complete ===")
+        print(f"Total time: {total_time:.2f} seconds")
+        
+        # Display results summary
+        if "target_tokens" in analysis_results:
+            print(f"\nAnalyzed {len(analysis_results['target_tokens'])} tokens:")
+            for i, token_info in enumerate(analysis_results["target_tokens"]):
+                print(f"  {i+1}. '{token_info['text']}' at position {token_info['index']}")
+        
+        if "full_sequence" in analysis_results and "text" in analysis_results["full_sequence"]:
+            print(f"\nGenerated text: {analysis_results['full_sequence']['text']}")
+        
+        return test_results
+        
+    except Exception as e:
+        print(f"Error in semantic tracing test: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        return {"error": str(e), "traceback": traceback.format_exc()}
+    
+    finally:
+        # Clean memory again
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
