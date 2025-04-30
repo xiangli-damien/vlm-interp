@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Initialization file for the VLM Analysis analyzer module.
 
@@ -26,11 +25,16 @@ except ImportError:
 from analyzer.workflows import (
     run_logit_lens_workflow,
     run_saliency_workflow,
-    run_semantic_tracing_experiment  # Add the new workflow function
+    # Semantic tracing modular functions
+    run_semantic_tracing_analysis,  # Runs only the analysis part
+    visualize_semantic_tracing_results,  # Creates visualizations from analysis results
+    visualize_semantic_tracing_from_csv,  # Creates visualizations directly from saved CSV
+    run_semantic_tracing_experiment  # Full experiment (analysis + visualization)
 )
 
-# Semantic Tracing Analyzer
+# Semantic Tracing Analyzer and Visualizer
 from analyzer.semantic_tracing import EnhancedSemanticTracer
+from semantic_tracing_visualizer import SemanticTracingVisualizer
 
 __all__ = [
     # Analyzers & Components
@@ -38,17 +42,18 @@ __all__ = [
     "calculate_saliency_scores",
     "analyze_layerwise_saliency_flow",
     "compute_flow_metrics_optimized",
-    "EnhancedSemanticTracer",  # Add the new analyzer class
+    "EnhancedSemanticTracer",
+    "SemanticTracingVisualizer",
     
     # Workflows
     "run_logit_lens_workflow",
     "run_saliency_workflow",
-    "run_semantic_tracing_experiment",  # Add the new workflow function
+    "run_semantic_tracing_analysis",
+    "visualize_semantic_tracing_results",
+    "visualize_semantic_tracing_from_csv",
+    "run_semantic_tracing_experiment",
 ]
 
 # Add stepwise_logit_lens_workflow if available
 if run_stepwise_logit_lens_workflow is not None:
     __all__.append("run_stepwise_logit_lens_workflow")
-
-# Commented out as it's currently a placeholder
-# "LLaVANextTokenLogitLensAnalyzer",

@@ -156,7 +156,6 @@ def run_logit_lens_workflow(
 
     return results
 
-
 def run_saliency_workflow(
     model: torch.nn.Module,
     processor: Any,
@@ -341,78 +340,68 @@ def run_saliency_workflow(
 
     return final_results
 
-def run_semantic_tracing_experiment(
-    model_id: str = "llava-hf/llava-v1.6-mistral-7b-hf",
-    image_path: str = None, 
-    prompt: str = "What can you see in this image?",
-    output_dir: str = "semantic_tracing_results",
+def run_semantic_tracing_analysis(
+    model_id: str,
+    image_path: str, 
+    prompt: str,
+    output_dir: str,
     top_k: int = 3,
     num_tokens: int = 1,
-    use_4bit: bool = True,
+    load_in_4bit: bool = True,
     target_token_idx: Optional[int] = None,
     image_size: Tuple[int, int] = (336, 336),
     concepts_to_track: Optional[List[str]] = None,
     normalize_weights: bool = True,
     single_forward_pass: bool = False,
     analyze_last_token: bool = False,
-    output_format: str = "both",
-    align_tokens_by_layer: bool = True,
-    show_orphaned_nodes: bool = True,
-    min_edge_weight: float = 0.00,
-    use_variable_node_size: bool = True,
     debug_mode: bool = False
-):
+) -> Dict[str, Any]:
     """
-    Run a complete semantic tracing experiment, with support for multi-token analysis.
+    Run semantic tracing analysis and save results to CSV files.
     
     Args:
-        model_id: HuggingFace model ID for LLaVA-Next
+        model_id: HuggingFace model ID
         image_path: Path to the image file
         prompt: Text prompt to use
         output_dir: Directory to save results
         top_k: Number of top contributing tokens to track at each step
         num_tokens: Number of tokens to generate and analyze
-        use_4bit: Whether to load the model in 4-bit precision
+        load_in_4bit: Whether to load the model in 4-bit precision
         target_token_idx: Index of specific token to analyze (if None, uses first generated token)
         image_size: Size to resize the image to
         concepts_to_track: List of concepts to track with logit lens
         normalize_weights: Whether to normalize token importance weights between layers
         single_forward_pass: Use one forward pass for all layers (reduces memory usage)
         analyze_last_token: Whether to analyze the last token in the given prompt
-        output_format: Format for flow graph output (png, svg, or both)
-        align_tokens_by_layer: Whether to align tokens in columns for each layer
-        show_orphaned_nodes: Whether to show nodes with no connections
-        min_edge_weight: Minimum edge weight to display (filters weak connections)
-        use_variable_node_size: Whether to vary node size based on weight
-        debug_mode: Whether to print detailed debug information during flow graph creation
+        debug_mode: Whether to print detailed debug information
     
     Returns:
-        Dictionary with experiment results
+        Dictionary with paths to saved CSV files and metadata
     """
     from utils.data_utils import load_image
     from utils.model_utils import load_model
-    import time
+    from analyzer.semantic_tracing import EnhancedSemanticTracer
     
     start_time = time.time()
-    print(f"=== Starting Semantic Tracing Experiment ===")
+    print(f"=== Starting Semantic Tracing Analysis ===")
     print(f"Model: {model_id}")
     print(f"Image: {image_path}")
     print(f"Prompt: {prompt}")
     print(f"Output Directory: {output_dir}")
     
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
     # Print analysis mode information
-    if analyze_last_token:
-        print(f"Mode: Analyzing last token in prompt")
-    elif single_forward_pass:
-        print(f"Mode: Single forward pass, generating {num_tokens} token(s)")
-    else:
-        print(f"Mode: Multi-token analysis, generating {num_tokens} token(s)")
+    mode_str = "Analyzing last token in prompt" if analyze_last_token else \
+               f"Analyzing {num_tokens} token(s)" + (" with single forward pass" if single_forward_pass else "")
+    print(f"Mode: {mode_str}")
     
     # 1. Load model and processor
     print("\nLoading model and processor...")
     model, processor = load_model(
         model_id=model_id,
-        load_in_4bit=use_4bit, 
+        load_in_4bit=load_in_4bit, 
         enable_gradients=True
     )
     
@@ -460,28 +449,197 @@ def run_semantic_tracing_experiment(
             batch_compute=not single_forward_pass
         )
     
-    # 6. Visualize results with enhanced parameters
-    print("\nVisualizing results...")
-    flow_graph_params = {
-        "output_format": output_format,
-        "align_tokens_by_layer": align_tokens_by_layer,
-        "show_orphaned_nodes": show_orphaned_nodes,
-        "min_edge_weight": min_edge_weight,
-        "use_variable_node_size": use_variable_node_size,
-        "debug_mode": debug_mode
+    # Prepare output information
+    output_info = {
+        "csv_files": [],
+        "metadata_path": trace_results.get("metadata_path"),
+        "target_tokens": [],
+        "full_sequence": trace_results.get("full_sequence", {}),
+        "analysis_time": time.time() - start_time,
+        "image_path": image_path
     }
     
-    visualization_paths = tracer.visualize_trace(
-        trace_results,
-        flow_graph_params=flow_graph_params
+    # Extract CSV paths from results
+    if "trace_results" in trace_results:
+        for key, value in trace_results["trace_results"].items():
+            if isinstance(value, dict) and "trace_data_path" in value:
+                output_info["csv_files"].append(value["trace_data_path"])
+    
+    # Extract target token information
+    if "target_tokens" in trace_results:
+        output_info["target_tokens"] = trace_results["target_tokens"]
+    elif "target_token" in trace_results:
+        output_info["target_tokens"] = [trace_results["target_token"]]
+    
+    # Save analysis summary
+    summary_path = os.path.join(output_dir, "analysis_summary.json")
+    try:
+        import json
+        with open(summary_path, 'w') as f:
+            # Create a JSON-serializable version of the output info
+            summary_info = {
+                "model_id": model_id,
+                "image_path": image_path,
+                "prompt": prompt,
+                "num_tokens": num_tokens,
+                "top_k": top_k,
+                "analyze_last_token": analyze_last_token,
+                "single_forward_pass": single_forward_pass,
+                "csv_files": output_info["csv_files"],
+                "metadata_path": output_info["metadata_path"],
+                "target_tokens": output_info["target_tokens"],
+                "full_sequence": output_info["full_sequence"],
+                "analysis_time": output_info["analysis_time"]
+            }
+            json.dump(summary_info, f, indent=2)
+        output_info["summary_path"] = summary_path
+    except Exception as e:
+        print(f"Error saving analysis summary: {e}")
+    
+    print(f"\n=== Analysis Complete ===")
+    print(f"Analysis time: {output_info['analysis_time']:.2f} seconds")
+    print(f"CSV data saved to: {output_dir}")
+    
+    # Clean up memory
+    del model, processor, tracer, input_data, trace_results
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return output_info
+
+def create_visualizations_from_csv(
+    csv_path: str,
+    metadata_path: str,
+    image_path: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    flow_graph_params: Optional[Dict[str, Any]] = None,
+    heatmap_params: Optional[Dict[str, Any]] = None
+) -> List[str]:
+    """
+    Create visualizations from saved semantic tracing CSV files.
+    
+    Args:
+        csv_path: Path to the CSV file with trace data
+        metadata_path: Path to the metadata JSON file
+        image_path: Path to the original image (required for heatmaps)
+        output_dir: Directory to save visualizations
+        flow_graph_params: Parameters for flow graph visualization
+        heatmap_params: Parameters for heatmap visualization
+        
+    Returns:
+        List of paths to created visualization files
+    """
+    from semantic_tracing_visualizer import SemanticTracingVisualizer
+    
+    # Determine output directory
+    if output_dir is None:
+        # If not specified, use a directory next to the CSV file
+        csv_dir = os.path.dirname(csv_path)
+        csv_basename = os.path.basename(csv_path).split('.')[0]
+        output_dir = os.path.join(csv_dir, f"{csv_basename}_visualizations")
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Set default flow graph parameters if not provided
+    if flow_graph_params is None:
+        flow_graph_params = {
+            "output_format": "both",
+            "align_tokens_by_layer": True,
+            "show_orphaned_nodes": False,
+            "min_edge_weight": 0.05,
+            "use_variable_node_size": True,
+            "debug_mode": False
+        }
+    
+    # Set default heatmap parameters if not provided
+    if heatmap_params is None:
+        heatmap_params = {
+            "use_grid_visualization": True,
+            "show_values": True,
+            "composite_only": True
+        }
+    
+    start_time = time.time()
+    print(f"\n=== Creating Visualizations from CSV ===")
+    print(f"CSV: {csv_path}")
+    print(f"Output Directory: {output_dir}")
+    
+    # Create a visualizer instance
+    visualizer = SemanticTracingVisualizer(output_dir=output_dir)
+    
+    # Create visualizations from the CSV
+    visualization_paths = visualizer.visualize_from_csv(
+        csv_path=csv_path,
+        metadata_path=metadata_path,
+        image_path=image_path,
+        flow_graph_params=flow_graph_params,
+        heatmap_params=heatmap_params
     )
     
-    # 7. Add visualization paths to results
-    trace_results["visualization_paths"] = visualization_paths
-    
     end_time = time.time()
-    print(f"\n=== Experiment Complete ===")
-    print(f"Total time: {end_time - start_time:.2f} seconds")
-    print(f"Results saved to: {output_dir}")
+    print(f"\n=== Visualization Complete ===")
+    print(f"Visualization time: {end_time - start_time:.2f} seconds")
+    print(f"Created {len(visualization_paths)} visualization files in {output_dir}")
     
-    return trace_results
+    return visualization_paths
+
+def process_all_csvs_in_directory(
+    directory: str,
+    metadata_path: str,
+    image_path: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    flow_graph_params: Optional[Dict[str, Any]] = None,
+    heatmap_params: Optional[Dict[str, Any]] = None
+) -> Dict[str, List[str]]:
+    """
+    Create visualizations for all CSV files in a directory.
+    
+    Args:
+        directory: Directory containing CSV files
+        metadata_path: Path to the metadata JSON file
+        image_path: Path to the original image
+        output_dir: Directory to save visualizations
+        flow_graph_params: Parameters for flow graph visualization
+        heatmap_params: Parameters for heatmap visualization
+        
+    Returns:
+        Dictionary mapping CSV files to lists of created visualization paths
+    """
+    import glob
+    
+    # Set default output directory
+    if output_dir is None:
+        output_dir = os.path.join(directory, "visualizations")
+    
+    # Find all CSV files in the directory
+    csv_files = glob.glob(os.path.join(directory, "**/*.csv"), recursive=True)
+    
+    # Process each CSV file
+    results = {}
+    for csv_file in csv_files:
+        print(f"\nProcessing CSV file: {os.path.basename(csv_file)}")
+        
+        # Create subdirectory for this CSV's visualizations
+        csv_basename = os.path.basename(csv_file).split('.')[0]
+        csv_output_dir = os.path.join(output_dir, csv_basename)
+        
+        # Create visualizations
+        vis_paths = create_visualizations_from_csv(
+            csv_path=csv_file,
+            metadata_path=metadata_path,
+            image_path=image_path,
+            output_dir=csv_output_dir,
+            flow_graph_params=flow_graph_params,
+            heatmap_params=heatmap_params
+        )
+        
+        results[csv_file] = vis_paths
+    
+    # Print summary
+    total_vis = sum(len(paths) for paths in results.values())
+    print(f"\n=== Visualization Processing Complete ===")
+    print(f"Processed {len(csv_files)} CSV files")
+    print(f"Created {total_vis} total visualizations")
+    
+    return results
