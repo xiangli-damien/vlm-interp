@@ -4,6 +4,7 @@ Initialization file for the VLM Analysis analyzer module.
 This module contains:
 - Core analyzer classes/functions for specific analysis types (logit_lens, saliency).
 - Workflow functions that orchestrate common end-to-end analysis procedures.
+- Enhanced semantic tracing components for detailed information flow analysis.
 """
 
 # Core Analyzer Components
@@ -34,7 +35,7 @@ from analyzer.workflows import (
 
 # Semantic Tracing Analyzer and Visualizer
 from analyzer.semantic_tracing import EnhancedSemanticTracer
-from analyzer.semantic_tracing_visualizer import SemanticTracingVisualizer
+from analyzer.semantic_tracing_visualizer import EnhancedSemanticTracingVisualizer
 
 __all__ = [
     # Analyzers & Components
@@ -43,7 +44,7 @@ __all__ = [
     "analyze_layerwise_saliency_flow",
     "compute_flow_metrics_optimized",
     "EnhancedSemanticTracer",
-    "SemanticTracingVisualizer",
+    "EnhancedSemanticTracingVisualizer",
     
     # Workflows
     "run_logit_lens_workflow",

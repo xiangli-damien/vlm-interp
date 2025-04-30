@@ -1,9 +1,3 @@
-"""
-Visualizer for semantic tracing results. This module provides visualization tools
-for semantic tracing data, allowing for the creation of flow graphs and heatmaps
-from saved CSV data, decoupled from the tracing process.
-"""
-
 import os
 import json
 import math
@@ -14,14 +8,16 @@ import matplotlib as mpl
 import networkx as nx
 from PIL import Image, ImageDraw, ImageFont
 import seaborn as sns
+import requests
+import io
 from typing import Dict, Any, Optional, List, Tuple, Union, Set
 from collections import defaultdict
 
 
-class SemanticTracingVisualizer:
+class EnhancedSemanticTracingVisualizer:
     """
     Visualizes semantic tracing results from CSV data, creating flow graphs and heatmaps.
-    Works independently from the tracing process, allowing for visualization without rerunning analysis.
+    Provides improved spacing for flow graphs and modular visualization functions.
     """
     
     def __init__(
@@ -42,31 +38,118 @@ class SemanticTracingVisualizer:
         # Create output directories
         os.makedirs(output_dir, exist_ok=True)
     
+    def download_image(self, image_url: str, save_dir: str) -> Optional[str]:
+        """
+        Download image from URL and save it locally.
+        
+        Args:
+            image_url: URL of the image
+            save_dir: Directory to save the downloaded image
+            
+        Returns:
+            Local path to the downloaded image or None if download failed
+        """
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(save_dir, exist_ok=True)
+            
+            # Extract filename from URL or use a default name
+            if '/' in image_url:
+                filename = image_url.split('/')[-1]
+                # Remove query parameters if any
+                if '?' in filename:
+                    filename = filename.split('?')[0]
+            else:
+                filename = "downloaded_image.jpg"
+            
+            # Ensure the filename has an extension
+            if not any(filename.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif']):
+                filename += '.jpg'
+            
+            local_path = os.path.join(save_dir, filename)
+            
+            # Check if already downloaded
+            if os.path.exists(local_path):
+                print(f"Using previously downloaded image at: {local_path}")
+                return local_path
+            
+            # Download the image
+            print(f"Downloading image from {image_url}...")
+            response = requests.get(image_url, stream=True, timeout=10)
+            response.raise_for_status()  # Raise exception for HTTP errors
+            
+            # Save the image
+            with open(local_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            print(f"Image saved to {local_path}")
+            return local_path
+            
+        except Exception as e:
+            print(f"Error downloading image: {e}")
+            return None
+    
+    def get_local_image_path(self, image_path: str, save_dir: str) -> Optional[str]:
+        """
+        Ensure we have a local image path, downloading if necessary.
+        
+        Args:
+            image_path: Path or URL to the image
+            save_dir: Directory to save downloaded images
+            
+        Returns:
+            Local path to the image or None if invalid
+        """
+        # Check if it's a URL
+        if image_path.startswith(('http://', 'https://')):
+            # Download the image
+            download_dir = os.path.join(save_dir, "downloaded_images")
+            return self.download_image(image_path, download_dir)
+        
+        # Check if it's a valid local path
+        elif os.path.exists(image_path):
+            return image_path
+            
+        else:
+            print(f"Warning: Image path is invalid: {image_path}")
+            return None
+    
     def visualize_from_csv(
-    self,
-    csv_path: str,
-    metadata_path: Optional[str] = None,
-    image_path: Optional[str] = None,
-    target_token: Optional[Dict[str, Any]] = None,
-    flow_graph_params: Optional[Dict[str, Any]] = None,
-    heatmap_params: Optional[Dict[str, Any]] = None,
-) -> List[str]:
+        self,
+        csv_path: str,
+        metadata_path: Optional[str] = None,
+        image_path: Optional[str] = None,
+        target_token: Optional[Dict[str, Any]] = None,
+        create_flow_graph: bool = True,
+        create_heatmaps: bool = True,
+        create_data_vis: bool = True,
+        flow_graph_params: Optional[Dict[str, Any]] = None,
+        heatmap_params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, List[str]]:
         """
         Generate visualizations from a saved CSV trace file.
         
         Args:
             csv_path: Path to the CSV file with trace data
             metadata_path: Optional path to JSON metadata file
-            image_path: Path to original image used in the trace (required for heatmaps)
+            image_path: Path or URL to original image used in the trace
             target_token: Optional information about the target token
+            create_flow_graph: Whether to create flow graph visualization
+            create_heatmaps: Whether to create heatmap visualizations
+            create_data_vis: Whether to create trace data visualizations
             flow_graph_params: Parameters for flow graph visualization
             heatmap_params: Parameters for heatmap visualization
             
         Returns:
-            List of paths to generated visualization files
+            Dictionary mapping visualization types to lists of generated file paths
         """
         print(f"Generating visualizations from CSV: {csv_path}")
-        saved_paths = []
+        results = {
+            "flow_graph": [],
+            "heatmap": [],
+            "data_vis": []
+        }
         
         # Set default parameters
         if flow_graph_params is None:
@@ -89,14 +172,14 @@ class SemanticTracingVisualizer:
         # Load CSV data
         if not os.path.exists(csv_path):
             print(f"Error: CSV file not found at {csv_path}")
-            return saved_paths
+            return results
         
         try:
             df = pd.read_csv(csv_path)
             print(f"Loaded trace data with {len(df)} rows")
         except Exception as e:
             print(f"Error loading CSV file: {e}")
-            return saved_paths
+            return results
         
         # Load metadata if available
         metadata = {}
@@ -118,56 +201,63 @@ class SemanticTracingVisualizer:
         save_dir = os.path.join(self.output_dir, f"token_{target_idx}_{target_text}")
         os.makedirs(save_dir, exist_ok=True)
         
-        # 1. Create flow graph visualization
-        try:
-            print("Creating token flow graph visualization...")
-            flow_graph_paths = self.create_flow_graph(
-                df, target_text, target_idx, save_dir, **flow_graph_params
-            )
-            saved_paths.extend(flow_graph_paths)
-        except Exception as e:
-            print(f"Error creating flow graph visualization: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        # 2. Create heatmap visualizations if we have an image and feature mapping
-        image_exists = image_path is not None and os.path.exists(image_path)
-        feature_mapping_exists = "feature_mapping" in metadata and metadata["feature_mapping"]
-        
-        if not image_exists:
-            print(f"Warning: Image path is missing or invalid: {image_path}")
-        if not feature_mapping_exists:
-            print(f"Warning: Feature mapping not found in metadata")
-        
-        if image_exists and feature_mapping_exists:
+        # 1. Create flow graph visualization if requested
+        if create_flow_graph:
             try:
-                print(f"Creating heatmap visualizations with image path: {image_path}")
-                heatmap_paths = self.create_heatmaps(
-                    df, target_text, target_idx, image_path, 
-                    save_dir, metadata["feature_mapping"], **heatmap_params
+                print("Creating token flow graph visualization...")
+                flow_graph_paths = self.create_flow_graph_from_csv(
+                    df, target_text, target_idx, save_dir, **flow_graph_params
                 )
-                saved_paths.extend(heatmap_paths)
+                results["flow_graph"] = flow_graph_paths
+            except Exception as e:
+                print(f"Error creating flow graph visualization: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # 2. Create heatmap visualizations if requested and if we have an image
+        if create_heatmaps and image_path:
+            try:
+                # Get local image path (download if needed)
+                local_image_path = self.get_local_image_path(image_path, save_dir)
+                
+                if local_image_path and os.path.exists(local_image_path):
+                    print(f"Creating heatmap visualizations with image: {local_image_path}")
+                    
+                    # Check if we have feature mapping
+                    feature_mapping_exists = "feature_mapping" in metadata and metadata["feature_mapping"]
+                    
+                    if feature_mapping_exists:
+                        heatmap_paths = self.create_heatmaps_from_csv(
+                            df, target_text, target_idx, local_image_path,
+                            save_dir, metadata["feature_mapping"], **heatmap_params
+                        )
+                        results["heatmap"] = heatmap_paths
+                    else:
+                        print("Skipping heatmap visualizations: missing feature mapping")
+                else:
+                    print(f"Skipping heatmap visualizations: image not available")
             except Exception as e:
                 print(f"Error creating heatmap visualizations: {e}")
                 import traceback
                 traceback.print_exc()
-        else:
-            print("Skipping heatmap visualizations: missing image path or feature mapping")
         
-        # 3. Create trace data visualizations
-        try:
-            print("Creating trace data visualizations...")
-            data_vis_paths = self.create_trace_data_visualizations(
-                df, target_text, target_idx, save_dir
-            )
-            saved_paths.extend(data_vis_paths)
-        except Exception as e:
-            print(f"Error creating trace data visualizations: {e}")
-            import traceback
-            traceback.print_exc()
+        # 3. Create trace data visualizations if requested
+        if create_data_vis:
+            try:
+                print("Creating trace data visualizations...")
+                data_vis_paths = self.create_trace_data_visualizations_from_csv(
+                    df, target_text, target_idx, save_dir
+                )
+                results["data_vis"] = data_vis_paths
+            except Exception as e:
+                print(f"Error creating trace data visualizations: {e}")
+                import traceback
+                traceback.print_exc()
         
-        print(f"Visualization complete. Generated {len(saved_paths)} files.")
-        return saved_paths
+        # Count total visualizations
+        total_files = sum(len(files) for files in results.values())
+        print(f"Visualization complete. Generated {total_files} files.")
+        return results
     
     def _extract_target_token_info(self, df: pd.DataFrame, metadata: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -207,7 +297,10 @@ class SemanticTracingVisualizer:
             "id": int(highest_row["token_id"])
         }
     
-    def create_flow_graph(
+    #
+    # STANDALONE FLOW GRAPH VISUALIZATION
+    #
+    def create_flow_graph_from_csv(
         self,
         trace_data: pd.DataFrame,
         target_text: str,
@@ -226,7 +319,7 @@ class SemanticTracingVisualizer:
         use_exponential_scaling: bool = True
     ) -> List[str]:
         """
-        Create a flow graph visualization from trace data.
+        Create a flow graph visualization from trace data with improved spacing.
         
         Args:
             trace_data: DataFrame with trace data
@@ -396,8 +489,8 @@ class SemanticTracingVisualizer:
             print("No nodes left in graph after filtering. Cannot create visualization.")
             return saved_paths
         
-        # Calculate positions for nodes
-        pos = self._calculate_flow_graph_node_positions(G, node_metadata, align_tokens_by_layer)
+        # Calculate positions for nodes with improved spacing
+        pos = self._calculate_flow_graph_node_positions_improved(G, node_metadata, align_tokens_by_layer)
         
         # Calculate node sizes based on weights
         node_sizes = self._calculate_flow_graph_node_sizes(
@@ -416,8 +509,8 @@ class SemanticTracingVisualizer:
             for node in G.nodes()
         ]
         
-        # Create the visualization
-        fig_width, fig_height = self._calculate_flow_graph_dimensions(G, node_metadata)
+        # Create the visualization with improved dimensions
+        fig_width, fig_height = self._calculate_flow_graph_dimensions_improved(G, node_metadata)
         plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
         
         # Try to set a font that supports special characters
@@ -573,7 +666,9 @@ class SemanticTracingVisualizer:
         
         # Remove axis
         plt.axis('off')
-        plt.tight_layout(pad=3.0)
+        
+        # Use a larger padding to accommodate the legend
+        plt.tight_layout(pad=4.0, rect=[0, 0.05, 1, 0.95])
         
         # Save in requested formats
         if output_format in ["png", "both"]:
@@ -594,8 +689,18 @@ class SemanticTracingVisualizer:
         print(f"Flow graph visualization saved: {saved_paths}")
         return saved_paths
     
-    def _calculate_flow_graph_node_positions(self, G, node_metadata, align_tokens_by_layer):
-        """Calculate positions for nodes in the flow graph with optimized spacing"""
+    def _calculate_flow_graph_node_positions_improved(self, G, node_metadata, align_tokens_by_layer):
+        """
+        Calculate positions for nodes in the flow graph with improved spacing.
+        
+        Args:
+            G: NetworkX graph object
+            node_metadata: Dictionary with node metadata
+            align_tokens_by_layer: Whether to align tokens in columns by layer
+            
+        Returns:
+            Dictionary with node positions
+        """
         # Get all layers present in the graph
         graph_layers = sorted(set(node_metadata[n]["layer"] for n in G.nodes()))
         
@@ -609,10 +714,23 @@ class SemanticTracingVisualizer:
         
         # Calculate vertical spacing based on the maximum nodes in any layer
         max_nodes_in_layer = max(len(nodes) for nodes in layer_nodes.values())
-        x_spacing = 4.0  # Reduced from 6.0
-        y_spacing = 2.0  # Reduced from 3.0
         
-        # Position nodes with fixed x by layer, distributed y with increased spacing
+        # IMPROVED: Increase spacing for better readability
+        x_spacing = 8.0  # Increased from 4.0
+        
+        # Calculate y-spacing dynamically based on number of nodes
+        base_y_spacing = 2.0
+        if max_nodes_in_layer > 15:
+            # For very dense graphs, use smaller spacing
+            y_spacing = max(1.5, 8.0 / max_nodes_in_layer)
+        elif max_nodes_in_layer > 8:
+            # For moderately dense graphs
+            y_spacing = max(2.0, 16.0 / max_nodes_in_layer)
+        else:
+            # For sparse graphs, use larger spacing
+            y_spacing = 2.5
+        
+        # Position nodes with fixed x by layer, distributed y with dynamic spacing
         pos = {}
         for layer_idx, layer_node_list in layer_nodes.items():
             # Layer-specific x-coordinate
@@ -632,6 +750,39 @@ class SemanticTracingVisualizer:
                     pos[node_id] = (layer_x, start_y + i * y_spacing)
         
         return pos
+    
+    def _calculate_flow_graph_dimensions_improved(self, G, node_metadata):
+        """
+        Calculate appropriate dimensions for the flow graph based on content.
+        
+        Args:
+            G: NetworkX graph object
+            node_metadata: Dictionary with node metadata
+            
+        Returns:
+            Tuple of (width, height) in inches
+        """
+        # Get all layers present in the graph
+        graph_layers = sorted(set(node_metadata[n]["layer"] for n in G.nodes()))
+        
+        # Count nodes per layer
+        nodes_per_layer = {}
+        for node in G.nodes():
+            layer = node_metadata[node]["layer"]
+            if layer not in nodes_per_layer:
+                nodes_per_layer[layer] = 0
+            nodes_per_layer[layer] += 1
+        
+        max_nodes_in_layer = max(nodes_per_layer.values()) if nodes_per_layer else 1
+        
+        # IMPROVED: Scale dimensions more generously based on content
+        # Width scales with number of layers
+        fig_width = min(24, max(12, len(graph_layers) * 2.5))
+        
+        # Height scales with maximum nodes in any layer
+        fig_height = min(20, max(8, max_nodes_in_layer * 1.0))
+        
+        return fig_width, fig_height
     
     def _calculate_flow_graph_node_sizes(
         self, G, node_metadata, use_variable_node_size, min_node_size, max_node_size, use_exponential_scaling
@@ -682,26 +833,63 @@ class SemanticTracingVisualizer:
         
         return node_sizes
     
-    def _calculate_flow_graph_dimensions(self, G, node_metadata):
-        # Get all layers present in the graph
-        graph_layers = sorted(set(node_metadata[n]["layer"] for n in G.nodes()))
+    def _sanitize_text_for_display(self, text):
+        """
+        Sanitize text to avoid font rendering issues with special characters.
         
-        # Count nodes per layer
-        nodes_per_layer = {}
-        for node in G.nodes():
-            layer = node_metadata[node]["layer"]
-            if layer not in nodes_per_layer:
-                nodes_per_layer[layer] = 0
-            nodes_per_layer[layer] += 1
+        Args:
+            text: Input text that may contain special characters (can be string or any other type)
+            
+        Returns:
+            Sanitized text that should render properly in matplotlib
+        """
+        # Convert to string if not already a string
+        if not isinstance(text, str):
+            text = str(text)
+            
+        if not text:
+            return ""
+            
+        # Special handling for common tokens
+        if text in ["<s>", "<pad>", "<bos>", "<eos>", "<image>"]:
+            return text
+            
+        # Replace common problematic characters
+        replacements = {
+            # Replace various quotes
+            '"': '"', '"': '"', ''': "'", ''': "'",
+            # Replace emoji and special symbols with simple alternatives
+            '→': '->',
+            '←': '<-',
+            '⟨': '<',
+            '⟩': '>',
+            '⇒': '=>',
+            '⇐': '<=',
+            '≤': '<=',
+            '≥': '>=',
+            '…': '...',
+        }
         
-        max_nodes_in_layer = max(nodes_per_layer.values()) if nodes_per_layer else 1
+        # Apply replacements
+        for old, new in replacements.items():
+            text = text.replace(old, new)
         
-        fig_width = min(16, len(graph_layers) * 2 + 2)  # Width scales with layers, max 16 inches
-        fig_height = min(12, max(6, max_nodes_in_layer * 0.8))  # Height scales with max nodes, min 6, max 12 inches
+        # Filter out other potentially problematic characters
+        result = ""
+        for char in text:
+            # Keep ASCII characters and common symbols
+            if ord(char) < 128 or char in '°±²³½¼¾×÷':
+                result += char
+            else:
+                # Replace other non-ASCII characters with a placeholder
+                result += '·'  # Middle dot as placeholder
         
-        return fig_width, fig_height
+        return result
     
-    def create_heatmaps(
+    #
+    # STANDALONE HEATMAP VISUALIZATION
+    #
+    def create_heatmaps_from_csv(
         self,
         trace_data: pd.DataFrame,
         target_text: str,
@@ -761,7 +949,7 @@ class SemanticTracingVisualizer:
         spatial_preview_image = original_image.copy()
         if "resized_dimensions" in feature_mapping:
             width, height = feature_mapping["resized_dimensions"]
-            spatial_preview_image = spatial_preview_image.resize((width, height), Image.Resampling.LANCZOS)
+            spatial_preview_image = spatial_preview_image.resize((width, height), Image.LANCZOS)
         
         # Extract base and patch feature information
         base_feature_info = feature_mapping.get("base_feature", {})
@@ -887,33 +1075,21 @@ class SemanticTracingVisualizer:
         # Create composite visualizations if we have multiple layers
         if base_valid_layers:
             try:
-                if not composite_only and base_heatmap_paths:
-                    # Create composite from individual heatmaps
-                    base_composite_path = os.path.join(save_dir, f"composite_base_influence_{target_idx}.png")
-                    base_composite = self._create_composite_heatmap(
-                        base_heatmap_paths, 
-                        base_valid_layers, 
-                        base_composite_path,
-                        f"Base Image Token Influence Across Layers for Target '{target_text}'"
-                    )
-                    if base_composite:
-                        saved_paths.append(base_composite)
-                else:
-                    # Create composite directly from trace data
-                    base_composite_path = os.path.join(save_dir, f"composite_base_influence_{target_idx}.png")
-                    base_composite = self._create_direct_composite_heatmap(
-                        trace_data, 
-                        original_image,
-                        feature_mapping,
-                        "base",
-                        base_valid_layers,
-                        target_text,
-                        target_idx,
-                        base_composite_path,
-                        use_grid_visualization
-                    )
-                    if base_composite:
-                        saved_paths.append(base_composite)
+                # Create composite directly from trace data
+                base_composite_path = os.path.join(save_dir, f"composite_base_influence_{target_idx}.png")
+                base_composite = self._create_direct_composite_heatmap(
+                    trace_data, 
+                    original_image,
+                    feature_mapping,
+                    "base",
+                    base_valid_layers,
+                    target_text,
+                    target_idx,
+                    base_composite_path,
+                    use_grid_visualization
+                )
+                if base_composite:
+                    saved_paths.append(base_composite)
             except Exception as e:
                 print(f"Error creating base composite: {e}")
                 import traceback
@@ -921,162 +1097,28 @@ class SemanticTracingVisualizer:
         
         if patch_valid_layers:
             try:
-                if not composite_only and patch_heatmap_paths:
-                    # Create composite from individual heatmaps
-                    patch_composite_path = os.path.join(save_dir, f"composite_patch_influence_{target_idx}.png")
-                    patch_composite = self._create_composite_heatmap(
-                        patch_heatmap_paths, 
-                        patch_valid_layers, 
-                        patch_composite_path,
-                        f"Patch Image Token Influence Across Layers for Target '{target_text}'"
-                    )
-                    if patch_composite:
-                        saved_paths.append(patch_composite)
-                else:
-                    # Create composite directly from trace data
-                    patch_composite_path = os.path.join(save_dir, f"composite_patch_influence_{target_idx}.png")
-                    patch_composite = self._create_direct_composite_heatmap(
-                        trace_data, 
-                        spatial_preview_image,
-                        feature_mapping,
-                        "patch",
-                        patch_valid_layers,
-                        target_text,
-                        target_idx,
-                        patch_composite_path,
-                        use_grid_visualization,
-                        show_values
-                    )
-                    if patch_composite:
-                        saved_paths.append(patch_composite)
+                # Create composite directly from trace data
+                patch_composite_path = os.path.join(save_dir, f"composite_patch_influence_{target_idx}.png")
+                patch_composite = self._create_direct_composite_heatmap(
+                    trace_data, 
+                    spatial_preview_image,
+                    feature_mapping,
+                    "patch",
+                    patch_valid_layers,
+                    target_text,
+                    target_idx,
+                    patch_composite_path,
+                    use_grid_visualization,
+                    show_values
+                )
+                if patch_composite:
+                    saved_paths.append(patch_composite)
             except Exception as e:
                 print(f"Error creating patch composite: {e}")
                 import traceback
                 traceback.print_exc()
         
         return saved_paths
-    
-    def _create_direct_composite_heatmap(
-        self,
-        trace_data: pd.DataFrame,
-        image: Image.Image,
-        feature_mapping: Dict[str, Any],
-        feature_type: str,  # "base" or "patch"
-        valid_layers: List[int],
-        target_text: str,
-        target_idx: int,
-        save_path: str,
-        use_grid_visualization: bool = True,
-        show_values: bool = False
-    ) -> Optional[str]:
-        """
-        Create a composite heatmap directly from trace data without generating individual heatmaps first.
-        
-        Args:
-            trace_data: DataFrame with trace data
-            image: Original or spatial preview image
-            feature_mapping: Feature mapping information
-            feature_type: Type of feature map ("base" or "patch")
-            valid_layers: List of valid layer indices
-            target_text: Text of the target token
-            target_idx: Index of the target token
-            save_path: Path to save the composite heatmap
-            use_grid_visualization: Whether to use grid-based visualization
-            show_values: Whether to show numeric values in cells
-            
-        Returns:
-            Path to saved composite heatmap or None if failed
-        """
-        if not valid_layers:
-            return None
-        
-        # Get the appropriate feature information
-        if feature_type == "base":
-            feature_info = feature_mapping.get("base_feature", {})
-            grid_key = "grid"
-            title = f"Base Image Token Influence Across Layers for Target '{target_text}'"
-        else:  # patch
-            feature_info = feature_mapping.get("patch_feature", {})
-            grid_key = "grid_unpadded"
-            title = f"Patch Image Token Influence Across Layers for Target '{target_text}'"
-        
-        if not feature_info or grid_key not in feature_info or "positions" not in feature_info:
-            return None
-        
-        # Get grid dimensions
-        grid_h, grid_w = feature_info[grid_key]
-        positions = feature_info["positions"]
-        
-        # Convert string keys to integers if necessary
-        if all(isinstance(k, str) for k in positions.keys()):
-            positions = {int(k): v for k, v in positions.items()}
-        
-        # Create a composite heatmap by averaging across layers
-        composite_heatmap = np.zeros((grid_h, grid_w), dtype=np.float32)
-        layer_count = np.zeros((grid_h, grid_w), dtype=np.float32)
-        
-        # Process each layer
-        for layer_idx in valid_layers:
-            # Find all image tokens in this layer
-            layer_data = trace_data[trace_data["layer"] == layer_idx]
-            image_tokens = layer_data[layer_data["token_type"] == 2]
-            
-            if image_tokens.empty:
-                continue
-            
-            # Calculate normalized weights
-            max_weight = image_tokens["predicted_top_prob"].max()
-            if max_weight <= 0:
-                continue
-            
-            # Process each image token
-            for _, row in image_tokens.iterrows():
-                token_idx = row["token_index"]
-                weight = row["predicted_top_prob"] / max_weight  # Normalize
-                
-                position = positions.get(token_idx)
-                if position:
-                    r, c = position
-                    if 0 <= r < grid_h and 0 <= c < grid_w:
-                        composite_heatmap[r, c] += weight
-                        layer_count[r, c] += 1
-        
-        # Average the heatmap
-        mask = layer_count > 0
-        composite_heatmap[mask] /= layer_count[mask]
-        
-        # Normalize the composite heatmap
-        max_val = np.max(composite_heatmap)
-        if max_val > 0:
-            composite_heatmap /= max_val
-        
-        # Create the visualization
-        if feature_type == "base":
-            result_path = self._create_base_feature_overlay(
-                heatmap=composite_heatmap,
-                original_image=image,
-                grid_size=(grid_h, grid_w),
-                layer_idx=-1,  # Composite
-                target_idx=target_idx,
-                title=title,
-                save_path=save_path,
-                use_grid_visualization=use_grid_visualization
-            )
-        else:  # patch
-            patch_size = feature_mapping.get("patch_size", 14)
-            result_path = self._create_patch_feature_overlay(
-                heatmap=composite_heatmap,
-                spatial_preview_image=image,
-                feature_mapping=feature_mapping,
-                patch_size=patch_size,
-                layer_idx=-1,  # Composite
-                target_idx=target_idx,
-                title=title,
-                save_path=save_path,
-                show_values=show_values
-            )
-        
-        return result_path
     
     def _create_base_feature_overlay(
         self,
@@ -1115,7 +1157,7 @@ class SemanticTracingVisualizer:
         """
         try:
             # Resize original image for overlay
-            resized_background = original_image.resize(target_size, Image.Resampling.LANCZOS)
+            resized_background = original_image.resize(target_size, Image.LANCZOS)
             background_np = np.array(resized_background)
             
             # Get grid dimensions
@@ -1384,173 +1426,150 @@ class SemanticTracingVisualizer:
             traceback.print_exc()
             return None
     
-    def _create_composite_heatmap(
+    def _create_direct_composite_heatmap(
         self,
-        image_paths: List[str],
-        layers: List[int],
-        output_filename: str,
-        title: str,
-        background_color: Tuple[int, int, int] = (255, 255, 255)
+        trace_data: pd.DataFrame,
+        image: Image.Image,
+        feature_mapping: Dict[str, Any],
+        feature_type: str,  # "base" or "patch"
+        valid_layers: List[int],
+        target_text: str,
+        target_idx: int,
+        save_path: str,
+        use_grid_visualization: bool = True,
+        show_values: bool = False
     ) -> Optional[str]:
         """
-        Creates a composite image grid from individual heatmap visualizations.
+        Create a composite heatmap directly from trace data without generating individual heatmaps first.
         
         Args:
-            image_paths: List of file paths to the individual images
-            layers: List of layer indices corresponding to each image
-            output_filename: Path to save the composite image
-            title: Title for the composite image
-            background_color: RGB background color
+            trace_data: DataFrame with trace data
+            image: Original or spatial preview image
+            feature_mapping: Feature mapping information
+            feature_type: Type of feature map ("base" or "patch")
+            valid_layers: List of valid layer indices
+            target_text: Text of the target token
+            target_idx: Index of the target token
+            save_path: Path to save the composite heatmap
+            use_grid_visualization: Whether to use grid-based visualization
+            show_values: Whether to show numeric values in cells
             
         Returns:
-            Path to saved composite image or None if failed
+            Path to saved composite heatmap or None if failed
         """
-        try:
-            # Internal padding constants
-            padding = 10
-            label_padding = 25
-            
-            if not image_paths:
-                print(f"Error: No image paths provided for composite.")
-                return None
-            
-            if len(image_paths) != len(layers):
-                print(f"Warning: Mismatch between image paths ({len(image_paths)}) and layers ({len(layers)}).")
-                # Match paths and layers based on filename
-                path_layer_map = {}
-                for p in image_paths:
-                    try:
-                        # More robust layer extraction from filename
-                        filename = os.path.basename(p)
-                        parts = filename.split('_')
-                        layer_num = None
-                        
-                        # Look for "layer_X" pattern in filename
-                        for i, part in enumerate(parts):
-                            if part == "layer" and i+1 < len(parts) and parts[i+1].isdigit():
-                                layer_num = int(parts[i+1])
-                                break
-                        
-                        # Fallback: Try other patterns commonly found in filenames
-                        if layer_num is None:
-                            for part in parts:
-                                if part.isdigit() and 0 <= int(part) < 100:  # Reasonable layer range
-                                    layer_num = int(part)
-                                    break
-                        
-                        if layer_num is not None:
-                            path_layer_map[layer_num] = p
-                        else:
-                            print(f"Could not extract layer number from filename: {filename}")
-                    except (IndexError, ValueError) as e:
-                        print(f"Could not extract layer number from filename: {os.path.basename(p)}: {e}")
-                    
-                # Rebuild lists based on layers
-                matched_paths = [path_layer_map.get(l) for l in layers]
-                filtered_layers = [l for l, p in zip(layers, matched_paths) if p is not None]
-                filtered_paths = [p for p in matched_paths if p is not None]
-                
-                if not filtered_paths:
-                    print(f"Error: No images could be matched to layers.")
-                    return None
-                
-                image_paths = filtered_paths
-                layers = filtered_layers
-            
-            # Load first image to get dimensions
-            with Image.open(image_paths[0]) as img:
-                img_w, img_h = img.size
-                img_mode = img.mode
-            
-            # Calculate grid dimensions
-            num_images = len(image_paths)
-            cols = math.ceil(math.sqrt(num_images))
-            rows = math.ceil(num_images / cols)
-            
-            # Calculate canvas dimensions
-            cell_w = img_w + padding
-            cell_h = img_h + padding + label_padding
-            title_height = 50
-            canvas_w = cols * cell_w + padding
-            canvas_h = rows * cell_h + padding + title_height
-            
-            # Create canvas and draw object
-            canvas = Image.new(img_mode, (canvas_w, canvas_h), background_color)
-            draw = ImageDraw.Draw(canvas)
-            
-            # Define fonts
-            try:
-                DEFAULT_FONT = ImageFont.truetype("arial.ttf", 18)
-                DEFAULT_FONT_SMALL = ImageFont.truetype("arial.ttf", 12)
-            except IOError:
-                DEFAULT_FONT = ImageFont.load_default()
-                DEFAULT_FONT_SMALL = ImageFont.load_default()
-            
-            # Add title
-            try:
-                title_bbox = draw.textbbox((0, 0), title, font=DEFAULT_FONT)
-                title_w = title_bbox[2] - title_bbox[0]
-                title_h = title_bbox[3] - title_bbox[1]
-            except AttributeError:
-                title_w, title_h = draw.textlength(title, font=DEFAULT_FONT), 20
-            
-            title_x = (canvas_w - title_w) // 2
-            title_y = padding
-            draw.text((title_x, title_y), title, fill=(0, 0, 0), font=DEFAULT_FONT)
-            
-            # Paste images and add labels
-            current_col = 0
-            current_row = 0
-            
-            for i, (img_path, layer_idx) in enumerate(zip(image_paths, layers)):
-                try:
-                    with Image.open(img_path) as img:
-                        if img.mode != canvas.mode:
-                            img = img.convert(canvas.mode)
-                        
-                        paste_x = padding + current_col * cell_w
-                        paste_y = padding + current_row * cell_h + title_height
-                        
-                        canvas.paste(img, (paste_x, paste_y))
-                        
-                        label_text = f"Layer {layer_idx}"
-                        try:
-                            label_bbox = draw.textbbox((0, 0), label_text, font=DEFAULT_FONT_SMALL)
-                            label_w = label_bbox[2] - label_bbox[0]
-                        except AttributeError:
-                            label_w = draw.textlength(label_text, font=DEFAULT_FONT_SMALL)
-                        
-                        label_x = paste_x + (img_w - label_w) // 2
-                        label_y = paste_y + img_h + (padding // 2)
-                        
-                        draw.text((label_x, label_y), label_text, fill=(50, 50, 50), font=DEFAULT_FONT_SMALL)
-                except Exception as e:
-                    print(f"Error processing image {img_path}: {e}")
-                
-                current_col += 1
-                if current_col >= cols:
-                    current_col = 0
-                    current_row += 1
-            
-            # Save the composite image
-            canvas.save(output_filename)
-            print(f"Saved composite image to: {output_filename}")
-            return output_filename
-        
-        except Exception as e:
-            print(f"Error creating composite image: {e}")
-            import traceback
-            traceback.print_exc()
+        if not valid_layers:
             return None
+        
+        # Get the appropriate feature information
+        if feature_type == "base":
+            feature_info = feature_mapping.get("base_feature", {})
+            grid_key = "grid"
+            title = f"Base Image Token Influence Across Layers for Target '{target_text}'"
+        else:  # patch
+            feature_info = feature_mapping.get("patch_feature", {})
+            grid_key = "grid_unpadded"
+            title = f"Patch Image Token Influence Across Layers for Target '{target_text}'"
+        
+        if not feature_info or grid_key not in feature_info or "positions" not in feature_info:
+            return None
+        
+        # Get grid dimensions
+        grid_h, grid_w = feature_info[grid_key]
+        positions = feature_info["positions"]
+        
+        # Convert string keys to integers if necessary
+        if all(isinstance(k, str) for k in positions.keys()):
+            positions = {int(k): v for k, v in positions.items()}
+        
+        # Create a composite heatmap by averaging across layers
+        composite_heatmap = np.zeros((grid_h, grid_w), dtype=np.float32)
+        layer_count = np.zeros((grid_h, grid_w), dtype=np.float32)
+        
+        # Process each layer
+        for layer_idx in valid_layers:
+            # Find all image tokens in this layer
+            layer_data = trace_data[trace_data["layer"] == layer_idx]
+            image_tokens = layer_data[layer_data["token_type"] == 2]
+            
+            if image_tokens.empty:
+                continue
+            
+            # Calculate normalized weights
+            max_weight = image_tokens["predicted_top_prob"].max()
+            if max_weight <= 0:
+                continue
+            
+            # Process each image token
+            for _, row in image_tokens.iterrows():
+                token_idx = row["token_index"]
+                weight = row["predicted_top_prob"] / max_weight  # Normalize
+                
+                position = positions.get(token_idx)
+                if position:
+                    r, c = position
+                    if 0 <= r < grid_h and 0 <= c < grid_w:
+                        composite_heatmap[r, c] += weight
+                        layer_count[r, c] += 1
+        
+        # Average the heatmap
+        mask = layer_count > 0
+        composite_heatmap[mask] /= layer_count[mask]
+        
+        # Normalize the composite heatmap
+        max_val = np.max(composite_heatmap)
+        if max_val > 0:
+            composite_heatmap /= max_val
+        
+        # Create the visualization
+        if feature_type == "base":
+            result_path = self._create_base_feature_overlay(
+                heatmap=composite_heatmap,
+                original_image=image,
+                grid_size=(grid_h, grid_w),
+                layer_idx=-1,  # Composite
+                target_idx=target_idx,
+                title=title,
+                save_path=save_path,
+                use_grid_visualization=use_grid_visualization
+            )
+        else:  # patch
+            patch_size = feature_mapping.get("patch_size", 14)
+            result_path = self._create_patch_feature_overlay(
+                heatmap=composite_heatmap,
+                spatial_preview_image=image,
+                feature_mapping=feature_mapping,
+                patch_size=patch_size,
+                layer_idx=-1,  # Composite
+                target_idx=target_idx,
+                title=title,
+                save_path=save_path,
+                show_values=show_values
+            )
+        
+        return result_path
     
-    def create_trace_data_visualizations(
+    #
+    # STANDALONE TRACE DATA VISUALIZATION
+    #
+    def create_trace_data_visualizations_from_csv(
         self,
         trace_data: pd.DataFrame,
         target_text: str,
         target_idx: int,
         save_dir: str
     ) -> List[str]:
-        """Visualize trace data with various plots"""
+        """
+        Visualize trace data with various plots.
+        
+        Args:
+            trace_data: DataFrame with trace data
+            target_text: Text of the target token
+            target_idx: Index of the target token
+            save_dir: Directory to save visualizations
+            
+        Returns:
+            List of paths to saved visualizations
+        """
         saved_paths = []
         
         if trace_data.empty:
@@ -1662,56 +1681,68 @@ class SemanticTracingVisualizer:
             import traceback
             traceback.print_exc()
             return saved_paths
+
+
+# Helper function to run the visualizer from a CSV file
+def visualize_semantic_tracing_csv(
+    csv_path: str,
+    metadata_path: Optional[str] = None,
+    image_path: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    create_flow_graph: bool = True,
+    create_heatmaps: bool = True,
+    create_data_vis: bool = True,
+    flow_graph_params: Optional[Dict[str, Any]] = None,
+    heatmap_params: Optional[Dict[str, Any]] = None
+) -> Dict[str, List[str]]:
+    """
+    Convenience function to run the visualizer on a CSV file.
     
-    def _sanitize_text_for_display(self, text):
-        """
-        Sanitize text to avoid font rendering issues with special characters.
+    Args:
+        csv_path: Path to the CSV file with trace data
+        metadata_path: Optional path to JSON metadata file
+        image_path: Path or URL to original image used in the trace
+        output_dir: Directory to save visualizations
+        create_flow_graph: Whether to create flow graph visualization
+        create_heatmaps: Whether to create heatmap visualizations
+        create_data_vis: Whether to create trace data visualizations
+        flow_graph_params: Parameters for flow graph visualization
+        heatmap_params: Parameters for heatmap visualization
         
-        Args:
-            text: Input text that may contain special characters (can be string or any other type)
-            
-        Returns:
-            Sanitized text that should render properly in matplotlib
-        """
-        # Convert to string if not already a string
-        if not isinstance(text, str):
-            text = str(text)
-            
-        if not text:
-            return ""
-            
-        # Special handling for common tokens
-        if text in ["<s>", "<pad>", "<bos>", "<eos>", "<image>"]:
-            return text
-            
-        # Replace common problematic characters
-        replacements = {
-            # Replace various quotes
-            '"': '"', '"': '"', ''': "'", ''': "'",
-            # Replace emoji and special symbols with simple alternatives
-            '→': '->',
-            '←': '<-',
-            '⟨': '<',
-            '⟩': '>',
-            '⇒': '=>',
-            '⇐': '<=',
-            '≤': '<=',
-            '≥': '>=',
-            '…': '...',
+    Returns:
+        Dictionary mapping visualization types to lists of generated file paths
+    """
+    # Set default output directory if not provided
+    if output_dir is None:
+        csv_dir = os.path.dirname(csv_path)
+        # Check if we're already in a visualizations directory
+        if "visualizations" in csv_dir:
+            output_dir = csv_dir
+        else:
+            output_dir = os.path.join(csv_dir, "visualizations")
+    
+    # Create visualizer and run it
+    visualizer = EnhancedSemanticTracingVisualizer(output_dir)
+    
+    # Set default flow graph parameters if not provided
+    if flow_graph_params is None:
+        flow_graph_params = {
+            "output_format": "both",
+            "align_tokens_by_layer": True,
+            "show_orphaned_nodes": True,  # Show all nodes by default
+            "min_edge_weight": 0.0,  # Show all edges by default
+            "use_variable_node_size": True,
+            "debug_mode": False
         }
-        
-        # Apply replacements
-        for old, new in replacements.items():
-            text = text.replace(old, new)
-        
-        # Filter out other potentially problematic characters
-        result = ""
-        for char in text:
-            # Keep ASCII characters and common symbols
-            if ord(char) < 128 or char in '°±²³½¼¾×÷':
-                result += char
-            else:
-                # Replace other non-ASCII characters with a placeholder
-                result += '·'  # Middle dot as placeholder
-        
-        return result
+    
+    # Run visualization
+    return visualizer.visualize_from_csv(
+        csv_path=csv_path,
+        metadata_path=metadata_path,
+        image_path=image_path,
+        create_flow_graph=create_flow_graph,
+        create_heatmaps=create_heatmaps,
+        create_data_vis=create_data_vis,
+        flow_graph_params=flow_graph_params,
+        heatmap_params=heatmap_params
+    )

@@ -26,7 +26,7 @@ from utils.model_utils import get_llm_attention_layer_names, load_model
 from utils.hook_utils import GradientAttentionCapture
 from utils.viz_utils import visualize_token_probabilities, visualize_information_flow
 from analyzer.semantic_tracing import EnhancedSemanticTracer
-from analyzer.semantic_tracing_visualizer import SemanticTracingVisualizer
+from analyzer.semantic_tracing_visualizer import EnhancedSemanticTracingVisualizer
 
 def run_logit_lens_workflow(
     model: torch.nn.Module,
@@ -573,7 +573,7 @@ def create_visualizations_from_csv(
     print(f"Image Path: {image_path}")
     
     # Create a visualizer instance
-    visualizer = SemanticTracingVisualizer(output_dir=output_dir)
+    visualizer = EnhancedSemanticTracingVisualizer(output_dir=output_dir)
     
     # Create visualizations from the CSV
     visualization_paths = visualizer.visualize_from_csv(
@@ -662,6 +662,7 @@ def run_semantic_tracing_test(
     load_in_4bit: bool = True,
     analyze_last_token: bool = False,
     single_forward_pass: bool = False,
+    target_token_idx: Optional[int] = None,  # Added parameter for targeting a specific token
     # Visualization parameters
     skip_visualization: bool = False,
     output_format: str = "both",
@@ -670,7 +671,7 @@ def run_semantic_tracing_test(
     use_variable_node_size: bool = True
 ) -> Dict[str, Any]:
     """
-    Run semantic tracing test with simplified parameters.
+    Run semantic tracing test with simplified parameters and enhanced visualization.
     
     Args:
         model_id: HuggingFace model ID
@@ -683,6 +684,7 @@ def run_semantic_tracing_test(
         load_in_4bit: Whether to use 4-bit quantization
         analyze_last_token: Analyze last token in prompt
         single_forward_pass: Use single forward pass
+        target_token_idx: Index of specific token to analyze (None means generate new tokens)
         skip_visualization: Skip visualization step
         output_format: Output format (png, svg, or both)
         show_orphaned_nodes: Show nodes with no connections
@@ -692,6 +694,11 @@ def run_semantic_tracing_test(
     Returns:
         Dictionary with test results
     """
+    # Import necessary functions here to avoid circular imports
+    from utils.data_utils import load_image
+    from utils.model_utils import load_model
+    from analyzer.semantic_tracing import EnhancedSemanticTracer
+    
     # Extract short model name for output directory
     model_short_name = model_id.split('/')[-1].replace("-hf", "")
     
@@ -713,9 +720,21 @@ def run_semantic_tracing_test(
     print(f"Prompt: {prompt_text}")
     print(f"Output Directory: {output_dir}")
     print(f"Tokens to analyze: {num_tokens}")
+    print(f"Target token index: {target_token_idx if target_token_idx is not None else 'None (generate new)'}")
     print(f"Concepts to track: {concepts_to_track}")
     print(f"Analysis mode: {'Last token' if analyze_last_token else 'Multiple tokens'}")
     print(f"Using single forward pass: {single_forward_pass}")
+    
+    # Create the visualizer for image handling
+    visualizer = EnhancedSemanticTracingVisualizer(output_dir=output_dir)
+    
+    # First, ensure we have a local copy of the image
+    image_dir = os.path.join(output_dir, "downloaded_images")
+    local_image_path = visualizer.get_local_image_path(image_url, image_dir)
+    
+    if not local_image_path:
+        print(f"Error: Could not obtain local image from {image_url}")
+        return {"error": f"Image not available: {image_url}"}
     
     # Clean memory if helper function is available
     try:
@@ -733,7 +752,7 @@ def run_semantic_tracing_test(
         # 1. Run analysis only
         analysis_results = run_semantic_tracing_analysis(
             model_id=model_id,
-            image_path=image_url,
+            image_path=local_image_path,  # Use local path
             prompt=prompt_text,
             output_dir=output_dir,
             top_k=top_k,
@@ -742,14 +761,15 @@ def run_semantic_tracing_test(
             concepts_to_track=concepts_to_track,
             normalize_weights=True,
             single_forward_pass=single_forward_pass,
-            analyze_last_token=analyze_last_token
+            analyze_last_token=analyze_last_token,
+            target_token_idx=target_token_idx  # Pass the target token index parameter
         )
         
         # Prepare results to return
         test_results = {
             "analysis_results": analysis_results,
             "visualization_paths": [],
-            "image_path": image_url  # Store image path for reference
+            "image_path": local_image_path  # Store local image path for reference
         }
         
         # 2. Run visualization if not skipped
@@ -765,18 +785,28 @@ def run_semantic_tracing_test(
             
             print("\nRunning visualization step...")
             
-            # Visualize each CSV file
-            all_vis_paths = []
+            # Use the standalone helper function to visualize all CSVs
+            all_vis_results = {}
+            
             for csv_path in analysis_results.get("csv_files", []):
-                vis_paths = create_visualizations_from_csv(
+                csv_vis_results = visualizer.visualize_from_csv(
                     csv_path=csv_path,
                     metadata_path=analysis_results.get("metadata_path", ""),
-                    image_path=image_url,  # Pass the image path directly
-                    output_dir=output_dir,
+                    image_path=local_image_path,
                     flow_graph_params=flow_graph_params
                 )
-                all_vis_paths.extend(vis_paths)
+                
+                # Merge results
+                for vis_type, paths in csv_vis_results.items():
+                    if vis_type not in all_vis_results:
+                        all_vis_results[vis_type] = []
+                    all_vis_results[vis_type].extend(paths)
             
+            # Flatten all visualization paths
+            all_vis_paths = []
+            for paths in all_vis_results.values():
+                all_vis_paths.extend(paths)
+                
             test_results["visualization_paths"] = all_vis_paths
             
             print(f"\nCreated {len(all_vis_paths)} visualization files")
