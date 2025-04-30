@@ -34,7 +34,7 @@ from analyzer.workflows import (
 
 # Semantic Tracing Analyzer and Visualizer
 from analyzer.semantic_tracing import EnhancedSemanticTracer
-from semantic_tracing_visualizer import SemanticTracingVisualizer
+from analyzer.semantic_tracing_visualizer import SemanticTracingVisualizer
 
 __all__ = [
     # Analyzers & Components

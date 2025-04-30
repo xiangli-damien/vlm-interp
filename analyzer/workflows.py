@@ -26,6 +26,7 @@ from utils.model_utils import get_llm_attention_layer_names, load_model
 from utils.hook_utils import GradientAttentionCapture
 from utils.viz_utils import visualize_token_probabilities, visualize_information_flow
 from analyzer.semantic_tracing import EnhancedSemanticTracer
+from analyzer.semantic_tracing_visualizer import SemanticTracingVisualizer
 
 def run_logit_lens_workflow(
     model: torch.nn.Module,
@@ -530,7 +531,6 @@ def create_visualizations_from_csv(
     Returns:
         List of paths to created visualization files
     """
-    from analyzer.semantic_tracing_visualizer import SemanticTracingVisualizer
     
     # Determine output directory
     if output_dir is None:
