@@ -1662,11 +1662,15 @@ class SemanticTracingVisualizer:
         Sanitize text to avoid font rendering issues with special characters.
         
         Args:
-            text: Input text that may contain special characters
+            text: Input text that may contain special characters (can be string or any other type)
             
         Returns:
             Sanitized text that should render properly in matplotlib
         """
+        # Convert to string if not already a string
+        if not isinstance(text, str):
+            text = str(text)
+            
         if not text:
             return ""
             
