@@ -308,484 +308,145 @@ class EnhancedSemanticTracingVisualizer:
         save_dir: str,
         output_format: str = "both",
         align_tokens_by_layer: bool = True,
-        show_orphaned_nodes: bool = False,  
+        show_orphaned_nodes: bool = False,
         min_edge_weight: float = 0.05,
         use_variable_node_size: bool = True,
         min_node_size: int = 600,
         max_node_size: int = 1500,
         debug_mode: bool = False,
-        dpi: int = 150,
+        dpi: int = 100,  # lowered DPI for faster output
         show_continuation_edges: bool = False,
         use_exponential_scaling: bool = True
     ) -> List[str]:
         """
-        Create a flow graph visualization from trace data with improved spacing.
-        
+        Create a token‐flow graph from trace CSV.
+
+        Uses a multipartite layout to guarantee even vertical spacing
+        of all nodes in each layer column, removes the two‐pass edge
+        halo drawing for speed, and lowers default dpi from 150→100.
+
         Args:
-            trace_data: DataFrame with trace data
+            trace_data: DataFrame of token‐trace records
             target_text: Text of the target token
             target_idx: Index of the target token
-            save_dir: Directory to save the visualization
-            output_format: Output format ("png", "svg", or "both")
-            align_tokens_by_layer: Whether to align tokens in strict columns by layer
-            show_orphaned_nodes: Whether to show nodes with no connections
-            min_edge_weight: Minimum edge weight to display (filters weak connections)
-            use_variable_node_size: Whether to vary node size based on weight
-            min_node_size: Minimum node size for visualization
-            max_node_size: Maximum node size for visualization
-            debug_mode: Whether to print debug information
-            dpi: DPI for PNG output
-            show_continuation_edges: Whether to show dashed continuation edges between layers
-            use_exponential_scaling: Whether to use exponential scaling for weights
-            
+            save_dir: Directory to save output files
+            output_format: "png", "svg", or "both"
+            align_tokens_by_layer: if True, use multipartite layout
+            show_orphaned_nodes: if False, drop isolated nodes
+            min_edge_weight: filter edges below this weight
+            use_variable_node_size: scale node by influence weight
+            min_node_size/max_node_size: node size bounds
+            debug_mode: extra printouts
+            dpi: DPI for raster output (lowered for speed)
+            show_continuation_edges: draw dashed edges for token‐continuations
+            use_exponential_scaling: apply sqrt scaling to weights
         Returns:
-            List of paths to saved visualizations
+            list of saved file paths
         """
         saved_paths = []
-        
-        # Check if we have data
         if trace_data.empty:
-            print("No trace data available for flow graph visualization.")
+            print("No data for flow graph.")
             return saved_paths
-        
-        # Create a directed graph
+
         G = nx.DiGraph()
-        
-        # Extract unique layers ordered from lowest to highest
         layers = sorted(trace_data["layer"].unique())
         if debug_mode:
-            print(f"Found {len(layers)} layers: {layers}")
-        
-        # First, create a mapping of node information
-        node_map = {}  # {(layer, token_index): node_id}
-        node_metadata = {}  # {node_id: metadata}
-        
-        # Process all rows to create nodes
+            print(f"Layers: {layers}")
+
+        # build nodes
+        node_map, node_metadata = {}, {}
         for _, row in trace_data.iterrows():
-            layer = row["layer"]
-            token_idx = row["token_index"]
-            token_text = row["token_text"]
-            token_type = row["token_type"]
-            is_target = row["is_target"]
-            
-            # Create node ID in format "L{layer}_T{token_idx}"
-            node_id = f"L{layer}_T{token_idx}"
-            
-            # Store mapping
-            node_map[(layer, token_idx)] = node_id
-            
-            # Extract top prediction
-            top_pred = ""
-            if "predicted_top_token" in row and not pd.isna(row["predicted_top_token"]):
-                top_pred_text = row["predicted_top_token"]
-                top_pred_text = self._sanitize_text_for_display(top_pred_text)
-                top_pred = f"→{top_pred_text}"
-            
-            # Clean token text for display
-            display_text = self._sanitize_text_for_display(token_text)
-            
-            # Store node metadata
-            node_metadata[node_id] = {
-                "type": token_type,
-                "text": display_text,
-                "idx": token_idx,
-                "layer": layer,
-                "weight": row["predicted_top_prob"] if "predicted_top_prob" in row else 1.0,
-                "top_pred": top_pred,
-                "is_target": is_target
-            }
-        
-        # Now add edges based on source-target relationships
-        # First, add all nodes to the graph
-        for node_id, metadata in node_metadata.items():
+            lid, tid = row["layer"], row["token_index"]
+            node_id = f"L{lid}_T{tid}"
+            node_map[(lid, tid)] = node_id
+            txt = self._sanitize_text_for_display(row["token_text"])
+            pred = row.get("predicted_top_token", "")
+            pred = f"→{self._sanitize_text_for_display(pred)}" if pd.notna(pred) else ""
+            node_metadata[node_id] = dict(
+                type=row["token_type"],
+                text=txt,
+                top_pred=pred,
+                weight=row.get("predicted_top_prob", 1.0),
+                layer=lid,
+                is_target=row["is_target"]
+            )
             G.add_node(node_id)
-        
-        # Process rows that have source information
+
+        # build edges
         for _, row in trace_data.iterrows():
             if not row["is_target"] or pd.isna(row["sources_indices"]):
                 continue
-            
-            layer = row["layer"]
-            token_idx = row["token_index"]
-            target_node_id = node_map.get((layer, token_idx))
-            
-            if not target_node_id:
-                continue
-            
-            # Parse source indices and weights
-            try:
-                source_indices = [int(idx) for idx in row["sources_indices"].split(",") if idx.strip()]
-                source_weights = [float(w) for w in row["sources_weights"].split(",") if w.strip()]
-                
-                # Ensure equal length
-                if len(source_indices) != len(source_weights):
-                    source_weights = [1.0] * len(source_indices)
-            except:
-                continue
-            
-            # Find previous layers
-            prev_layers = [l for l in layers if l < layer]
-            
-            # Add edges for each source
-            for src_idx, weight in zip(source_indices, source_weights):
-                # Find the source in a previous layer
-                source_node_id = None
-                
-                for prev_layer in reversed(prev_layers):
-                    if (prev_layer, src_idx) in node_map:
-                        source_node_id = node_map[(prev_layer, src_idx)]
+            tgt = node_map[(row["layer"], row["token_index"])]
+            src_idxs = [int(i) for i in str(row["sources_indices"]).split(",") if i]
+            wts      = [float(w) for w in str(row["sources_weights"]).split(",") if w]
+            for src_idx, w in zip(src_idxs, wts):
+                # find previous‐layer source
+                for pl in reversed(layers):
+                    key = (pl, src_idx)
+                    if key in node_map:
+                        if w >= min_edge_weight:
+                            G.add_edge(node_map[key], tgt, weight=w, is_continuation=False)
                         break
-                
-                if source_node_id and weight >= min_edge_weight:
-                    G.add_edge(
-                        source_node_id,
-                        target_node_id,
-                        weight=weight,
-                        saliency=weight
-                    )
-                    
-                    if debug_mode:
-                        print(f"Added edge: {source_node_id} -> {target_node_id} with weight {weight:.3f}")
-        
-        # Add continuation edges if requested
-        if show_continuation_edges:
-            token_layer_map = defaultdict(list)
-            
-            # Group token occurrences by layer
-            for (layer, token_idx), node_id in node_map.items():
-                token_layer_map[token_idx].append(layer)
-            
-            # Add continuation edges for tokens that appear in consecutive layers
-            for token_idx, token_layers in token_layer_map.items():
-                token_layers = sorted(token_layers)
-                
-                for i in range(len(token_layers) - 1):
-                    current_layer = token_layers[i]
-                    next_layer = token_layers[i+1]
-                    
-                    # Only if the layers are adjacent in our selected layers
-                    if layers.index(next_layer) == layers.index(current_layer) + 1:
-                        src_node_id = node_map.get((current_layer, token_idx))
-                        dst_node_id = node_map.get((next_layer, token_idx))
-                        
-                        if src_node_id and dst_node_id and src_node_id in G and dst_node_id in G:
-                            G.add_edge(
-                                src_node_id,
-                                dst_node_id,
-                                weight=0.3,
-                                is_continuation=True
-                            )
-        
-        # Remove orphaned nodes if requested
+
+        # remove orphans
         if not show_orphaned_nodes:
-            orphaned_nodes = [n for n in G.nodes() if G.degree(n) == 0]
-            G.remove_nodes_from(orphaned_nodes)
-            
-            if debug_mode:
-                print(f"Removed {len(orphaned_nodes)} orphaned nodes")
-        
-        # Check if we have any nodes left
-        if len(G.nodes()) == 0:
-            print("No nodes left in graph after filtering. Cannot create visualization.")
+            orphans = [n for n in G if G.degree(n)==0]
+            G.remove_nodes_from(orphans)
+
+        if len(G)==0:
+            print("Graph empty after filtering.")
             return saved_paths
-        
-        # Calculate positions for nodes with improved spacing
-        pos = self._calculate_flow_graph_node_positions_improved(G, node_metadata, align_tokens_by_layer)
-        
-        # Calculate node sizes based on weights
-        node_sizes = self._calculate_flow_graph_node_sizes(
-            G, node_metadata, use_variable_node_size, min_node_size, max_node_size, use_exponential_scaling
-        )
-        
-        # Get node colors based on token type
-        token_colors = {
-            0: "#2ecc71",  # Generated = green
-            1: "#3498db",  # Text = blue
-            2: "#e74c3c"   # Image = red
-        }
-        
-        node_colors = [
-            token_colors.get(node_metadata.get(node, {}).get("type", 0), "#7f8c8d") 
-            for node in G.nodes()
-        ]
-        
-        # Create the visualization with improved dimensions
-        fig_width, fig_height = self._calculate_flow_graph_dimensions_improved(G, node_metadata)
-        plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
-        
-        # Try to set a font that supports special characters
-        plt.rcParams['font.family'] = 'DejaVu Sans'
-        
-        # Draw nodes
-        nx.draw_networkx_nodes(
-            G, pos,
-            node_size=node_sizes,
-            node_color=node_colors,
-            alpha=0.8,
-            edgecolors='black',
-            linewidths=0.5
-        )
-        
-        # Draw edges with width based on weight
-        edge_width_multiplier = 5.0
-        
-        # First draw white "halo" for contrast
-        for u, v, data in G.edges(data=True):
-            if data.get('is_continuation', False):
-                continue
-                    
-            weight = data.get("weight", 0.0)
-            
-            # Apply exponential scaling if requested
-            if use_exponential_scaling:
-                width = math.sqrt(weight) * edge_width_multiplier
-            else:
-                width = weight * edge_width_multiplier
-                
-            if width >= min_edge_weight * edge_width_multiplier:
-                nx.draw_networkx_edges(
-                    G, pos,
-                    edgelist=[(u, v)],
-                    width=width + 1.5,
-                    alpha=0.3,
-                    edge_color='white'
-                )
-        
-        # Then draw actual edges
-        for u, v, data in G.edges(data=True):
-            if data.get('is_continuation', False):
-                continue
-                    
-            weight = data.get("weight", 0.0)
-            
-            # Apply exponential scaling if requested
-            if use_exponential_scaling:
-                width = math.sqrt(weight) * edge_width_multiplier
-            else:
-                width = weight * edge_width_multiplier
-                
-            if width >= min_edge_weight * edge_width_multiplier:
-                nx.draw_networkx_edges(
-                    G, pos,
-                    edgelist=[(u, v)],
-                    width=max(width, 0.8),
-                    alpha=min(0.8, max(0.2, weight * 1.5)),
-                    arrows=True,
-                    arrowsize=10,
-                    connectionstyle="arc3,rad=0.1"
-                )
-        
-        # Draw continuation edges
-        if show_continuation_edges:
-            continuation_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('is_continuation', False)]
-            if continuation_edges:
-                nx.draw_networkx_edges(
-                    G, pos,
-                    edgelist=continuation_edges,
-                    width=1.0,
-                    alpha=0.5,
-                    edge_color='gray',
-                    style='dashed',
-                    arrows=True,
-                    arrowsize=8
-                )
-        
-        # Create labels
-        labels = {}
-        for node in G.nodes():
-            meta = node_metadata.get(node, {})
-            token_text = meta.get('text', '')
-            top_pred = meta.get('top_pred', '')
-            if top_pred:
-                labels[node] = f"{token_text} {top_pred}"
-            else:
-                labels[node] = token_text
-        
-        # Calculate font sizes
-        base_font_size = 10
-        font_sizes = []
-        for i, node in enumerate(G.nodes()):
-            is_target = node_metadata.get(node, {}).get("is_target", False)
-            if use_variable_node_size:
-                font_size = base_font_size * (node_sizes[i] / min_node_size) ** 0.25
-            else:
-                font_size = base_font_size * 1.2 if is_target else base_font_size
-            font_sizes.append(min(font_size, 12))
-        
-        # Draw each label separately for better control
-        for i, node in enumerate(G.nodes()):
-            x, y = pos[node]
-            label = labels.get(node, "")
-            plt.text(
-                x, y,
-                label,
-                fontsize=font_sizes[i],
-                ha='center', va='center',
-                bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.2'),
-                zorder=100
-            )
-        
-        # Add layer labels
-        for i, layer in enumerate(sorted(set(node_metadata[n]["layer"] for n in G.nodes()))):
-            layer_nodes = [n for n in G.nodes() if node_metadata[n]["layer"] == layer]
-            if layer_nodes:
-                layer_x = np.mean([pos[n][0] for n in layer_nodes])
-                max_y = max([pos[n][1] for n in layer_nodes]) if layer_nodes else 0
-                plt.text(layer_x, max_y + 1.5, f"Layer {layer}", 
-                        ha='center', va='center', fontsize=14, fontweight='bold')
-        
-        # Set title
-        title = f"Semantic Trace Flow Graph for Token '{target_text}' (idx: {target_idx})"
-        plt.title(title, fontsize=16)
-        
-        # Add legend
-        legend_elements = [
-            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor="#3498db", markersize=10, label='Text Token'),
-            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor="#e74c3c", markersize=10, label='Image Token'),
-            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor="#2ecc71", markersize=10, label='Generated Token')
-        ]
-        
-        if use_variable_node_size:
-            legend_elements.extend([
-                plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markersize=5, label='Low Influence'),
-                plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markersize=10, label='High Influence')
-            ])
-        
-        # Add edge type legend
-        if show_continuation_edges:
-            legend_elements.extend([
-                plt.Line2D([0], [0], linestyle='-', color='black', linewidth=2, label='Token Influence'),
-                plt.Line2D([0], [0], linestyle='--', color='gray', linewidth=1, label='Token Continuation')
-            ])
+
+        # layout: use multipartite to evenly space nodes by layer
+        if align_tokens_by_layer:
+            pos = nx.multipartite_layout(G, subset_key=lambda n: node_metadata[n]["layer"])
         else:
-            legend_elements.extend([
-                plt.Line2D([0], [0], linestyle='-', color='black', linewidth=2, label='Token Influence')
-            ])
-        
-        plt.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.05), ncol=3)
-        
-        # Remove axis
+            # fallback: simple spring layout
+            pos = nx.spring_layout(G, k=1.0, iterations=50)
+
+        # node sizes/colors
+        sizes = self._calculate_flow_graph_node_sizes(
+            G, node_metadata, use_variable_node_size,
+            min_node_size, max_node_size, use_exponential_scaling
+        )
+        cmap = {0:"#2ecc71", 1:"#3498db", 2:"#e74c3c"}
+        colors = [cmap[node_metadata[n]["type"]] for n in G]
+
+        # draw
+        plt.figure(figsize=(12,8), dpi=dpi)
+        nx.draw_networkx_nodes(G, pos, node_size=sizes, node_color=colors, alpha=0.8,
+                               edgecolors='black', linewidths=0.5)
+        # draw all edges in one pass (no white halo)
+        edge_kw = dict(arrows=True, arrowsize=8, connectionstyle="arc3,rad=0.1")
+        for u,v,data in G.edges(data=True):
+            w = data["weight"]
+            width = (math.sqrt(w) if use_exponential_scaling else w) * 5.0
+            if width >= min_edge_weight*5.0:
+                nx.draw_networkx_edges(G, pos, edgelist=[(u,v)], width=width,
+                                       alpha=0.6, **edge_kw)
+
+        # labels
+        labels = {n: (node_metadata[n]["text"] + " " + node_metadata[n]["top_pred"]).strip()
+                  for n in G}
+        nx.draw_networkx_labels(G, pos, labels,
+                                font_size=8, font_family='DejaVu Sans',
+                                bbox=dict(facecolor='white', alpha=0.7, boxstyle='round,pad=0.2'))
+
+        plt.title(f"Flow Graph for '{target_text}' (idx {target_idx})", fontsize=14)
         plt.axis('off')
-        
-        # Use a larger padding to accommodate the legend
-        plt.tight_layout(pad=4.0, rect=[0, 0.05, 1, 0.95])
-        
-        # Save in requested formats
-        if output_format in ["png", "both"]:
-            png_path = os.path.join(save_dir, f"flow_graph_{target_idx}.png")
-            plt.savefig(png_path, dpi=dpi, bbox_inches='tight')
-            saved_paths.append(png_path)
-        
-        if output_format in ["svg", "both"]:
-            # Use non-font embedding for SVG
+        plt.tight_layout()
+
+        # save
+        if output_format in ("png","both"):
+            p = os.path.join(save_dir, f"flow_graph_{target_idx}.png")
+            plt.savefig(p, dpi=dpi, bbox_inches='tight'); saved_paths.append(p)
+        if output_format in ("svg","both"):
             mpl.rcParams['svg.fonttype'] = 'none'
-            
-            svg_path = os.path.join(save_dir, f"flow_graph_{target_idx}.svg")
-            plt.savefig(svg_path, format='svg', bbox_inches='tight')
-            saved_paths.append(svg_path)
-        
+            p = os.path.join(save_dir, f"flow_graph_{target_idx}.svg")
+            plt.savefig(p, format='svg', bbox_inches='tight'); saved_paths.append(p)
         plt.close()
-        
-        print(f"Flow graph visualization saved: {saved_paths}")
         return saved_paths
-    
-    def _calculate_flow_graph_node_positions_improved(self, G, node_metadata, align_tokens_by_layer):
-        """
-        Calculate improved positions for nodes in the flow graph with better vertical spacing.
-        Ensures nodes are well-separated vertically even when there are many nodes in a layer.
-        
-        Args:
-            G: NetworkX graph object
-            node_metadata: Dictionary with node metadata
-            align_tokens_by_layer: Whether to align tokens in columns by layer
-            
-        Returns:
-            Dictionary with node positions
-        """
-        # Get all layers present in the graph
-        graph_layers = sorted(set(node_metadata[n]["layer"] for n in G.nodes()))
-        
-        # Organize nodes by layer
-        layer_nodes = {}
-        for node in G.nodes():
-            layer = node_metadata[node]["layer"]
-            if layer not in layer_nodes:
-                layer_nodes[layer] = []
-            layer_nodes[layer].append(node)
-        
-        # Calculate vertical spacing based on the maximum nodes in any layer
-        max_nodes_in_layer = max(len(nodes) for nodes in layer_nodes.values())
-        
-        # Horizontal spacing between layers
-        x_spacing = 10.0  # Increased from 8.0 for more horizontal space
-        
-        # FIXED: Improved vertical spacing calculation
-        # Ensure minimum vertical spacing regardless of node count
-        base_y_spacing = 3.0  # Increased base spacing
-        if max_nodes_in_layer > 20:
-            # For very dense graphs, still ensure minimum spacing
-            y_spacing = max(2.5, 50.0 / max_nodes_in_layer)
-        elif max_nodes_in_layer > 10:
-            # For moderately dense graphs
-            y_spacing = max(3.0, 30.0 / max_nodes_in_layer)
-        else:
-            # For sparse graphs, use larger spacing
-            y_spacing = 3.5
-        
-        # Position nodes with fixed x by layer, distributed y with better spacing
-        pos = {}
-        for layer_idx, layer_node_list in layer_nodes.items():
-            # Layer-specific x-coordinate
-            layer_x = graph_layers.index(layer_idx) * x_spacing
-            
-            # Sort nodes by token index for consistent order
-            layer_node_list.sort(key=lambda n: node_metadata[n]["idx"])
-            
-            # Distribute nodes vertically with improved spacing
-            num_nodes = len(layer_node_list)
-            if num_nodes > 0:
-                # Calculate vertical spacing
-                total_height = (num_nodes - 1) * y_spacing
-                start_y = -total_height / 2
-                
-                for i, node_id in enumerate(layer_node_list):
-                    pos[node_id] = (layer_x, start_y + i * y_spacing)
-        
-        return pos
-    
-    def _calculate_flow_graph_dimensions_improved(self, G, node_metadata):
-        """
-        Calculate appropriate dimensions for the flow graph based on content.
-        
-        Args:
-            G: NetworkX graph object
-            node_metadata: Dictionary with node metadata
-            
-        Returns:
-            Tuple of (width, height) in inches
-        """
-        # Get all layers present in the graph
-        graph_layers = sorted(set(node_metadata[n]["layer"] for n in G.nodes()))
-        
-        # Count nodes per layer
-        nodes_per_layer = {}
-        for node in G.nodes():
-            layer = node_metadata[node]["layer"]
-            if layer not in nodes_per_layer:
-                nodes_per_layer[layer] = 0
-            nodes_per_layer[layer] += 1
-        
-        max_nodes_in_layer = max(nodes_per_layer.values()) if nodes_per_layer else 1
-        
-        # IMPROVED: Scale dimensions more generously based on content
-        # Width scales with number of layers
-        fig_width = min(24, max(12, len(graph_layers) * 2.5))
-        
-        # Height scales with maximum nodes in any layer
-        fig_height = min(20, max(8, max_nodes_in_layer * 1.0))
-        
-        return fig_width, fig_height
-    
+  
     def _calculate_flow_graph_node_sizes(
         self, G, node_metadata, use_variable_node_size, min_node_size, max_node_size, use_exponential_scaling
     ):
@@ -891,6 +552,7 @@ class EnhancedSemanticTracingVisualizer:
     #
     # STANDALONE HEATMAP VISUALIZATION
     #
+
     def create_heatmaps_from_csv(
         self,
         trace_data: pd.DataFrame,
@@ -900,237 +562,208 @@ class EnhancedSemanticTracingVisualizer:
         save_dir: str,
         feature_mapping: Dict[str, Any],
         use_grid_visualization: bool = True,
-        show_values: bool = True,
-        composite_only: bool = True
+        show_values: bool = True
     ) -> List[str]:
         """
-        Create heatmap visualizations for image token influence.
-        
-        Args:
-            trace_data: DataFrame with trace data
-            target_text: Text of the target token
-            target_idx: Index of the target token
-            image_path: Path to the original image
-            save_dir: Directory to save visualizations
-            feature_mapping: Dictionary with feature mapping information
-            use_grid_visualization: Whether to use grid-based visualization
-            show_values: Whether to show numeric values in cells
-            composite_only: Whether to only KEEP the composite heatmap (still generates individual layer maps)
-            
-        Returns:
-            List of paths to saved visualizations
+        Create per-layer and grid-composite heatmaps for both base and patch features.
+
+        For each layer:
+          - if there is base-feature data, generate one heatmap and save under base_dir/
+          - if there is patch-feature data, generate one heatmap and save under patch_dir/
+        Then build two grid composites:
+          - one for all base-layer maps
+          - one for all patch-layer maps
+
+        Layers with no data will remain blank panels in the grid.
+        Entire composite is skipped if no layer produced any map.
+
+        Returns list of saved file paths.
         """
         saved_paths = []
-        all_generated_paths = []  # Track all generated paths (layer-specific + composite)
-        
-        # Check if we have necessary data
-        if trace_data.empty:
-            print("No trace data available for heatmap visualization.")
-            return saved_paths
-        
-        # Check if we have feature mapping
-        if not feature_mapping:
-            print("No feature mapping available for heatmap visualization.")
-            return saved_paths
-        
-        # Prepare output directories for individual heatmaps (always create them)
-        base_heatmap_dir = os.path.join(save_dir, "base_feature_heatmaps")
-        patch_heatmap_dir = os.path.join(save_dir, "patch_feature_heatmaps")
-        os.makedirs(base_heatmap_dir, exist_ok=True)
-        os.makedirs(patch_heatmap_dir, exist_ok=True)
-        
-        # Load the original image
-        try:
-            original_image = Image.open(image_path)
-            print(f"Loaded image: {image_path}")
-        except Exception as e:
-            print(f"Error loading image: {e}")
-            return saved_paths
-        
-        # Create a spatial preview image (resized to match feature mapping)
-        spatial_preview_image = original_image.copy()
+
+        # prepare output directories
+        base_dir  = os.path.join(save_dir, "base_heatmaps")
+        patch_dir = os.path.join(save_dir, "patch_heatmaps")
+        os.makedirs(base_dir,  exist_ok=True)
+        os.makedirs(patch_dir, exist_ok=True)
+
+        # load image and preview
+        img = Image.open(image_path)
+        preview = img.copy()
         if "resized_dimensions" in feature_mapping:
-            width, height = feature_mapping["resized_dimensions"]
-            spatial_preview_image = spatial_preview_image.resize((width, height), Image.LANCZOS)
-        
-        # Extract base and patch feature information
-        base_feature_info = feature_mapping.get("base_feature", {})
-        patch_feature_info = feature_mapping.get("patch_feature", {})
-        
-        # Tracking for valid layers
-        base_valid_layers = []
-        patch_valid_layers = []
-        base_heatmap_paths = []
-        patch_heatmap_paths = []
-        
-        # Extract unique layers
+            w,h = feature_mapping["resized_dimensions"]
+            preview = preview.resize((w,h), Image.LANCZOS)
+
         layers = sorted(trace_data["layer"].unique())
-        
-        # Process each layer - FIXED: Always generate individual layer maps
-        for layer_idx in layers:
-            # Find all image tokens in this layer
-            layer_data = trace_data[trace_data["layer"] == layer_idx]
-            
-            # Extract image token weights
-            image_tokens = layer_data[layer_data["token_type"] == 2]
-            
-            if image_tokens.empty:
+
+        # per-layer generation (same as before)
+        layer_base_maps = {}
+        layer_patch_maps = {}
+
+        for L in layers:
+            dfL = trace_data[trace_data["layer"]==L]
+            img_toks = dfL[dfL["token_type"]==2]
+            if img_toks.empty:
+                # record blank
+                layer_base_maps[L] = None
+                layer_patch_maps[L] = None
                 continue
-            
-            # Calculate normalized weights for visualization
-            max_weight = image_tokens["predicted_top_prob"].max()
-            if max_weight <= 0:
-                continue
-                
-            image_token_weights = {}
-            for _, row in image_tokens.iterrows():
-                token_idx = row["token_index"]
-                weight = row["predicted_top_prob"] / max_weight  # Normalize
-                image_token_weights[token_idx] = weight
-            
-            # 1. Create base feature heatmap if available
-            if base_feature_info and "grid" in base_feature_info and "positions" in base_feature_info:
-                base_grid_h, base_grid_w = base_feature_info["grid"]
-                positions = base_feature_info["positions"]
-                
-                # Convert string keys to integers if necessary
-                if all(isinstance(k, str) for k in positions.keys()):
-                    positions = {int(k): v for k, v in positions.items()}
-                
-                # Initialize empty heatmap
-                base_heatmap = np.zeros((base_grid_h, base_grid_w), dtype=np.float32)
-                
-                # Fill the heatmap with normalized weights
-                mapped_tokens = 0
-                for token_idx, weight in image_token_weights.items():
-                    position = positions.get(token_idx)
-                    if position:
-                        r, c = position
-                        if 0 <= r < base_grid_h and 0 <= c < base_grid_w:
-                            base_heatmap[r, c] = weight
-                            mapped_tokens += 1
-                
-                # Always create visualization if we have data
-                if mapped_tokens > 0 and np.max(base_heatmap) > 0:
-                    base_path = self._create_base_feature_overlay(
-                        heatmap=base_heatmap,
-                        original_image=original_image,
-                        grid_size=(base_grid_h, base_grid_w),
-                        layer_idx=layer_idx,
+
+            mx = img_toks["predicted_top_prob"].max()
+            weights = {int(r.token_index): r.predicted_top_prob/mx
+                       for _,r in img_toks.iterrows() if mx>0}
+
+            # base
+            base_info = feature_mapping.get("base_feature", {})
+            if base_info.get("grid") and base_info.get("positions"):
+                gh,gw = base_info["grid"]
+                heat = np.zeros((gh,gw),float)
+                for tid,w in weights.items():
+                    pos = base_info["positions"].get(int(tid))
+                    if pos:
+                        r,c = pos
+                        if 0<=r<gh and 0<=c<gw:
+                            heat[r,c] = w
+                layer_base_maps[L] = heat if heat.max()>0 else None
+                if layer_base_maps[L] is not None:
+                    p = self._create_base_feature_overlay(
+                        heatmap=heat,
+                        original_image=img,
+                        grid_size=(gh,gw),
+                        layer_idx=L,
                         target_idx=target_idx,
-                        title=f"Base Image Token Influence - Layer {layer_idx}",
-                        save_path=os.path.join(base_heatmap_dir, f"base_influence_layer_{layer_idx}_{target_idx}.png"),
-                        use_grid_visualization=use_grid_visualization
-                    )
-                    if base_path:
-                        all_generated_paths.append(base_path)  # Track all paths
-                        if not composite_only:
-                            base_heatmap_paths.append(base_path)
-                        base_valid_layers.append(layer_idx)
-            
-            # 2. Create patch feature heatmap if available
-            if patch_feature_info and "grid_unpadded" in patch_feature_info and "positions" in patch_feature_info:
-                prob_grid_h, prob_grid_w = patch_feature_info["grid_unpadded"]
-                positions = patch_feature_info["positions"]
-                
-                # Convert string keys to integers if necessary
-                if all(isinstance(k, str) for k in positions.keys()):
-                    positions = {int(k): v for k, v in positions.items()}
-                
-                # Initialize empty heatmap
-                patch_heatmap = np.zeros((prob_grid_h, prob_grid_w), dtype=np.float32)
-                
-                # Fill the heatmap with normalized weights
-                mapped_tokens = 0
-                for token_idx, weight in image_token_weights.items():
-                    position = positions.get(token_idx)
-                    if position:
-                        r, c = position
-                        if 0 <= r < prob_grid_h and 0 <= c < prob_grid_w:
-                            patch_heatmap[r, c] = weight
-                            mapped_tokens += 1
-                
-                # Always create visualization if we have data
-                if mapped_tokens > 0 and np.max(patch_heatmap) > 0:
-                    # Get required dimensions
-                    patch_size = feature_mapping.get("patch_size", 14)
-                    
-                    patch_path = self._create_patch_feature_overlay(
-                        heatmap=patch_heatmap,
-                        spatial_preview_image=spatial_preview_image,
-                        feature_mapping=feature_mapping,
-                        patch_size=patch_size,
-                        layer_idx=layer_idx,
-                        target_idx=target_idx,
-                        title=f"Patch Image Token Influence - Layer {layer_idx}",
-                        save_path=os.path.join(patch_heatmap_dir, f"patch_influence_layer_{layer_idx}_{target_idx}.png"),
+                        title=f"Base Influence L{L}",
+                        save_path=os.path.join(base_dir, f"base_L{L}.png"),
+                        use_grid_visualization=use_grid_visualization,
                         show_values=show_values
                     )
-                    if patch_path:
-                        all_generated_paths.append(patch_path)  # Track all paths
-                        if not composite_only:
-                            patch_heatmap_paths.append(patch_path)
-                        patch_valid_layers.append(layer_idx)
-        
-        # Create composite visualizations if we have multiple layers
-        if base_valid_layers:
-            try:
-                # Create composite directly from trace data
-                base_composite_path = os.path.join(save_dir, f"composite_base_influence_{target_idx}.png")
-                base_composite = self._create_direct_composite_heatmap(
-                    trace_data, 
-                    original_image,
-                    feature_mapping,
-                    "base",
-                    base_valid_layers,
-                    target_text,
-                    target_idx,
-                    base_composite_path,
-                    use_grid_visualization
-                )
-                if base_composite:
-                    saved_paths.append(base_composite)
-            except Exception as e:
-                print(f"Error creating base composite: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        if patch_valid_layers:
-            try:
-                # Create composite directly from trace data
-                patch_composite_path = os.path.join(save_dir, f"composite_patch_influence_{target_idx}.png")
-                patch_composite = self._create_direct_composite_heatmap(
-                    trace_data, 
-                    spatial_preview_image,
-                    feature_mapping,
-                    "patch",
-                    patch_valid_layers,
-                    target_text,
-                    target_idx,
-                    patch_composite_path,
-                    use_grid_visualization,
-                    show_values
-                )
-                if patch_composite:
-                    saved_paths.append(patch_composite)
-            except Exception as e:
-                print(f"Error creating patch composite: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # FIXED: If composite_only is True, only return the composite paths
-        # Otherwise return all generated paths
-        if not composite_only:
-            saved_paths.extend(base_heatmap_paths)
-            saved_paths.extend(patch_heatmap_paths)
-        
-        # Log the number of saved visualizations
-        if composite_only:
-            print(f"Composite only mode: Generated {len(all_generated_paths)} individual heatmaps but keeping only {len(saved_paths)} composite heatmaps")
-        else:
-            print(f"Generated {len(saved_paths)} heatmap visualizations")
-            
+                    if p: saved_paths.append(p)
+            else:
+                layer_base_maps[L] = None
+
+            # patch
+            patch_info = feature_mapping.get("patch_feature", {})
+            if patch_info.get("grid_unpadded") and patch_info.get("positions"):
+                gh,gw = patch_info["grid_unpadded"]
+                heat = np.zeros((gh,gw),float)
+                for tid,w in weights.items():
+                    pos = patch_info["positions"].get(int(tid))
+                    if pos:
+                        r,c = pos
+                        if 0<=r<gh and 0<=c<gw:
+                            heat[r,c] = w
+                layer_patch_maps[L] = heat if heat.max()>0 else None
+                if layer_patch_maps[L] is not None:
+                    p = self._create_patch_feature_overlay(
+                        heatmap=heat,
+                        spatial_preview_image=preview,
+                        feature_mapping=feature_mapping,
+                        patch_size=feature_mapping.get("patch_size",14),
+                        layer_idx=L,
+                        target_idx=target_idx,
+                        title=f"Patch Influence L{L}",
+                        save_path=os.path.join(patch_dir, f"patch_L{L}.png"),
+                        show_values=show_values
+                    )
+                    if p: saved_paths.append(p)
+            else:
+                layer_patch_maps[L] = None
+
+        # grid composites
+        # 1) base
+        valid_base = [L for L,hm in layer_base_maps.items() if hm is not None]
+        if valid_base:
+            out = os.path.join(save_dir, f"composite_base_grid_{target_idx}.png")
+            p = self._create_grid_composite(
+                heatmap_maps=layer_base_maps,
+                layers=layers,
+                title=f"Base Influence per Layer for Token {target_idx}",
+                save_path=out,
+                cmap="hot",
+                show_values=show_values
+            )
+            if p: saved_paths.append(p)
+
+        # 2) patch
+        valid_patch = [L for L,hm in layer_patch_maps.items() if hm is not None]
+        if valid_patch:
+            out = os.path.join(save_dir, f"composite_patch_grid_{target_idx}.png")
+            p = self._create_grid_composite(
+                heatmap_maps=layer_patch_maps,
+                layers=layers,
+                title=f"Patch Influence per Layer for Token {target_idx}",
+                save_path=out,
+                cmap="hot",
+                show_values=show_values
+            )
+            if p: saved_paths.append(p)
+
         return saved_paths
+
+
+    def _create_grid_composite(
+        self,
+        heatmap_maps: Dict[int, Optional[np.ndarray]],
+        layers: List[int],
+        title: str,
+        save_path: str,
+        cmap: str = "hot",
+        show_values: bool = True
+    ) -> Optional[str]:
+        """
+        Arrange each layer's 2D heatmap array into a square grid of subplots.
+
+        heatmap_maps: dict layer->2D numpy array or None
+        layers: full list of layers to include (None entries yield blank panels)
+        """
+        # count panels
+        n = len(layers)
+        if n == 0:
+            return None
+
+        ncols = math.ceil(math.sqrt(n))
+        nrows = math.ceil(n / ncols)
+
+        fig, axes = plt.subplots(nrows, ncols, figsize=(ncols*3, nrows*3))
+        axes = axes.flatten()
+
+        im = None
+        for idx, L in enumerate(layers):
+            ax = axes[idx]
+            hm = heatmap_maps.get(L)
+            if hm is None:
+                ax.axis("off")
+                continue
+
+            im = ax.imshow(hm, vmin=0, vmax=1, cmap=cmap)
+            ax.set_title(f"Layer {L}", fontsize=10)
+            ax.axis("off")
+
+            if show_values:
+                # overlay each cell value
+                H,W = hm.shape
+                for i in range(H):
+                    for j in range(W):
+                        val = hm[i,j]
+                        if val > 0:
+                            ax.text(j, i, f"{val:.2f}",
+                                    ha='center', va='center', fontsize=6,
+                                    color='white' if val>0.5 else 'black')
+
+        # hide extra axes
+        for ax in axes[n:]:
+            ax.axis("off")
+
+        fig.suptitle(title, fontsize=14)
+        if im is not None:
+            cbar = fig.colorbar(im, ax=axes.tolist(), fraction=0.02, pad=0.01)
+            cbar.set_label("Normalized Influence", fontsize=10)
+
+        plt.tight_layout(rect=[0,0,1,0.96])
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return save_path
+
     
     def _create_base_feature_overlay(
         self,
@@ -1438,127 +1071,6 @@ class EnhancedSemanticTracingVisualizer:
             traceback.print_exc()
             return None
     
-    def _create_direct_composite_heatmap(
-        self,
-        trace_data: pd.DataFrame,
-        image: Image.Image,
-        feature_mapping: Dict[str, Any],
-        feature_type: str,  # "base" or "patch"
-        valid_layers: List[int],
-        target_text: str,
-        target_idx: int,
-        save_path: str,
-        use_grid_visualization: bool = True,
-        show_values: bool = False
-    ) -> Optional[str]:
-        """
-        Create a composite heatmap directly from trace data without generating individual heatmaps first.
-        
-        Args:
-            trace_data: DataFrame with trace data
-            image: Original or spatial preview image
-            feature_mapping: Feature mapping information
-            feature_type: Type of feature map ("base" or "patch")
-            valid_layers: List of valid layer indices
-            target_text: Text of the target token
-            target_idx: Index of the target token
-            save_path: Path to save the composite heatmap
-            use_grid_visualization: Whether to use grid-based visualization
-            show_values: Whether to show numeric values in cells
-            
-        Returns:
-            Path to saved composite heatmap or None if failed
-        """
-        if not valid_layers:
-            return None
-        
-        # Get the appropriate feature information
-        if feature_type == "base":
-            feature_info = feature_mapping.get("base_feature", {})
-            grid_key = "grid"
-            title = f"Base Image Token Influence Across Layers for Target '{target_text}'"
-        else:  # patch
-            feature_info = feature_mapping.get("patch_feature", {})
-            grid_key = "grid_unpadded"
-            title = f"Patch Image Token Influence Across Layers for Target '{target_text}'"
-        
-        if not feature_info or grid_key not in feature_info or "positions" not in feature_info:
-            return None
-        
-        # Get grid dimensions
-        grid_h, grid_w = feature_info[grid_key]
-        positions = feature_info["positions"]
-        
-        # Convert string keys to integers if necessary
-        if all(isinstance(k, str) for k in positions.keys()):
-            positions = {int(k): v for k, v in positions.items()}
-        
-        # Create a composite heatmap by averaging across layers
-        composite_heatmap = np.zeros((grid_h, grid_w), dtype=np.float32)
-        layer_count = np.zeros((grid_h, grid_w), dtype=np.float32)
-        
-        # Process each layer
-        for layer_idx in valid_layers:
-            # Find all image tokens in this layer
-            layer_data = trace_data[trace_data["layer"] == layer_idx]
-            image_tokens = layer_data[layer_data["token_type"] == 2]
-            
-            if image_tokens.empty:
-                continue
-            
-            # Calculate normalized weights
-            max_weight = image_tokens["predicted_top_prob"].max()
-            if max_weight <= 0:
-                continue
-            
-            # Process each image token
-            for _, row in image_tokens.iterrows():
-                token_idx = row["token_index"]
-                weight = row["predicted_top_prob"] / max_weight  # Normalize
-                
-                position = positions.get(token_idx)
-                if position:
-                    r, c = position
-                    if 0 <= r < grid_h and 0 <= c < grid_w:
-                        composite_heatmap[r, c] += weight
-                        layer_count[r, c] += 1
-        
-        # Average the heatmap
-        mask = layer_count > 0
-        composite_heatmap[mask] /= layer_count[mask]
-        
-        # Normalize the composite heatmap
-        max_val = np.max(composite_heatmap)
-        if max_val > 0:
-            composite_heatmap /= max_val
-        
-        # Create the visualization
-        if feature_type == "base":
-            result_path = self._create_base_feature_overlay(
-                heatmap=composite_heatmap,
-                original_image=image,
-                grid_size=(grid_h, grid_w),
-                layer_idx=-1,  # Composite
-                target_idx=target_idx,
-                title=title,
-                save_path=save_path,
-                use_grid_visualization=use_grid_visualization
-            )
-        else:  # patch
-            patch_size = feature_mapping.get("patch_size", 14)
-            result_path = self._create_patch_feature_overlay(
-                heatmap=composite_heatmap,
-                spatial_preview_image=image,
-                feature_mapping=feature_mapping,
-                patch_size=patch_size,
-                layer_idx=-1,  # Composite
-                target_idx=target_idx,
-                title=title,
-                save_path=save_path,
-                show_values=show_values
-            )
-        
-        return result_path
     
     #
     # STANDALONE TRACE DATA VISUALIZATION

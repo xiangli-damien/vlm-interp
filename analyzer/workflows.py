@@ -788,6 +788,13 @@ def run_semantic_tracing_test(
                 "min_edge_weight": min_edge_weight,
                 "use_variable_node_size": use_variable_node_size
             }
+
+            heatmap_params = {
+                "use_grid_visualization": True,
+                "show_values": True,
+                "composite_only": True,
+            }
+
             
             print("\nRunning visualization step...")
             
@@ -817,7 +824,8 @@ def run_semantic_tracing_test(
                     csv_path=csv_path,
                     metadata_path=analysis_results.get("metadata_path", ""),
                     image_path=local_image_path,
-                    flow_graph_params=flow_graph_params
+                    flow_graph_params=flow_graph_params,
+                    heatmap_params=heatmap_params
                 )
                 
                 # Merge results for this token
