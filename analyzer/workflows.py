@@ -671,7 +671,7 @@ def run_semantic_tracing_test(
     use_variable_node_size: bool = True
 ) -> Dict[str, Any]:
     """
-    Run semantic tracing test with simplified parameters and enhanced visualization.
+    Run semantic tracing test with improved multi-token handling.
     
     Args:
         model_id: HuggingFace model ID
@@ -772,6 +772,12 @@ def run_semantic_tracing_test(
             "image_path": local_image_path  # Store local image path for reference
         }
         
+        # FIXED: Check if we have valid CSV files
+        if not analysis_results.get("csv_files"):
+            print("\nNo CSV files generated for visualization. Analysis may have failed.")
+            test_results["error"] = "No CSV files generated"
+            return test_results
+        
         # 2. Run visualization if not skipped
         if not skip_visualization:
             # Set flow graph parameters
@@ -788,19 +794,41 @@ def run_semantic_tracing_test(
             # Use the standalone helper function to visualize all CSVs
             all_vis_results = {}
             
-            for csv_path in analysis_results.get("csv_files", []):
-                csv_vis_results = visualizer.visualize_from_csv(
+            # FIXED: Process each token's CSV independently with unique output directories
+            for idx, csv_path in enumerate(analysis_results.get("csv_files", [])):
+                # Extract token info for creating unique directory
+                trace_id = csv_path.split("trace_")[-1].split("_")[0] if "trace_" in csv_path else str(idx+1)
+                
+                # Create specific visualization directory for this token
+                if "target_tokens" in analysis_results and idx < len(analysis_results["target_tokens"]):
+                    token_info = analysis_results["target_tokens"][idx]
+                    token_idx = token_info.get("index", f"unknown_{idx}")
+                    token_text = token_info.get("text", f"token_{idx}")
+                    token_dir = os.path.join(output_dir, f"token_{token_idx}_{token_text}")
+                else:
+                    token_dir = os.path.join(output_dir, f"token_trace_{trace_id}")
+                
+                os.makedirs(token_dir, exist_ok=True)
+                
+                # Create a token-specific visualizer
+                token_visualizer = EnhancedSemanticTracingVisualizer(output_dir=token_dir)
+                
+                csv_vis_results = token_visualizer.visualize_from_csv(
                     csv_path=csv_path,
                     metadata_path=analysis_results.get("metadata_path", ""),
                     image_path=local_image_path,
                     flow_graph_params=flow_graph_params
                 )
                 
-                # Merge results
+                # Merge results for this token
+                token_vis_paths = []
                 for vis_type, paths in csv_vis_results.items():
                     if vis_type not in all_vis_results:
                         all_vis_results[vis_type] = []
                     all_vis_results[vis_type].extend(paths)
+                    token_vis_paths.extend(paths)
+                
+                print(f"Created {len(token_vis_paths)} visualization files for token {idx+1}")
             
             # Flatten all visualization paths
             all_vis_paths = []
@@ -809,7 +837,7 @@ def run_semantic_tracing_test(
                 
             test_results["visualization_paths"] = all_vis_paths
             
-            print(f"\nCreated {len(all_vis_paths)} visualization files")
+            print(f"\nTotal: Created {len(all_vis_paths)} visualization files")
         
         # Calculate and add total time
         total_time = time.time() - start_time

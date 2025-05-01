@@ -691,7 +691,8 @@ class EnhancedSemanticTracingVisualizer:
     
     def _calculate_flow_graph_node_positions_improved(self, G, node_metadata, align_tokens_by_layer):
         """
-        Calculate positions for nodes in the flow graph with improved spacing.
+        Calculate improved positions for nodes in the flow graph with better vertical spacing.
+        Ensures nodes are well-separated vertically even when there are many nodes in a layer.
         
         Args:
             G: NetworkX graph object
@@ -715,22 +716,23 @@ class EnhancedSemanticTracingVisualizer:
         # Calculate vertical spacing based on the maximum nodes in any layer
         max_nodes_in_layer = max(len(nodes) for nodes in layer_nodes.values())
         
-        # IMPROVED: Increase spacing for better readability
-        x_spacing = 8.0  # Increased from 4.0
+        # Horizontal spacing between layers
+        x_spacing = 10.0  # Increased from 8.0 for more horizontal space
         
-        # Calculate y-spacing dynamically based on number of nodes
-        base_y_spacing = 2.0
-        if max_nodes_in_layer > 15:
-            # For very dense graphs, use smaller spacing
-            y_spacing = max(1.5, 8.0 / max_nodes_in_layer)
-        elif max_nodes_in_layer > 8:
+        # FIXED: Improved vertical spacing calculation
+        # Ensure minimum vertical spacing regardless of node count
+        base_y_spacing = 3.0  # Increased base spacing
+        if max_nodes_in_layer > 20:
+            # For very dense graphs, still ensure minimum spacing
+            y_spacing = max(2.5, 50.0 / max_nodes_in_layer)
+        elif max_nodes_in_layer > 10:
             # For moderately dense graphs
-            y_spacing = max(2.0, 16.0 / max_nodes_in_layer)
+            y_spacing = max(3.0, 30.0 / max_nodes_in_layer)
         else:
             # For sparse graphs, use larger spacing
-            y_spacing = 2.5
+            y_spacing = 3.5
         
-        # Position nodes with fixed x by layer, distributed y with dynamic spacing
+        # Position nodes with fixed x by layer, distributed y with better spacing
         pos = {}
         for layer_idx, layer_node_list in layer_nodes.items():
             # Layer-specific x-coordinate
@@ -739,7 +741,7 @@ class EnhancedSemanticTracingVisualizer:
             # Sort nodes by token index for consistent order
             layer_node_list.sort(key=lambda n: node_metadata[n]["idx"])
             
-            # Distribute nodes vertically
+            # Distribute nodes vertically with improved spacing
             num_nodes = len(layer_node_list)
             if num_nodes > 0:
                 # Calculate vertical spacing
@@ -913,12 +915,13 @@ class EnhancedSemanticTracingVisualizer:
             feature_mapping: Dictionary with feature mapping information
             use_grid_visualization: Whether to use grid-based visualization
             show_values: Whether to show numeric values in cells
-            composite_only: Whether to only generate composite heatmaps
+            composite_only: Whether to only KEEP the composite heatmap (still generates individual layer maps)
             
         Returns:
             List of paths to saved visualizations
         """
         saved_paths = []
+        all_generated_paths = []  # Track all generated paths (layer-specific + composite)
         
         # Check if we have necessary data
         if trace_data.empty:
@@ -930,12 +933,11 @@ class EnhancedSemanticTracingVisualizer:
             print("No feature mapping available for heatmap visualization.")
             return saved_paths
         
-        # Prepare output directories if we're creating individual heatmaps
-        if not composite_only:
-            base_heatmap_dir = os.path.join(save_dir, "base_feature_heatmaps")
-            patch_heatmap_dir = os.path.join(save_dir, "patch_feature_heatmaps")
-            os.makedirs(base_heatmap_dir, exist_ok=True)
-            os.makedirs(patch_heatmap_dir, exist_ok=True)
+        # Prepare output directories for individual heatmaps (always create them)
+        base_heatmap_dir = os.path.join(save_dir, "base_feature_heatmaps")
+        patch_heatmap_dir = os.path.join(save_dir, "patch_feature_heatmaps")
+        os.makedirs(base_heatmap_dir, exist_ok=True)
+        os.makedirs(patch_heatmap_dir, exist_ok=True)
         
         # Load the original image
         try:
@@ -964,7 +966,7 @@ class EnhancedSemanticTracingVisualizer:
         # Extract unique layers
         layers = sorted(trace_data["layer"].unique())
         
-        # Process each layer
+        # Process each layer - FIXED: Always generate individual layer maps
         for layer_idx in layers:
             # Find all image tokens in this layer
             layer_data = trace_data[trace_data["layer"] == layer_idx]
@@ -1008,8 +1010,8 @@ class EnhancedSemanticTracingVisualizer:
                             base_heatmap[r, c] = weight
                             mapped_tokens += 1
                 
-                # Create visualization if we have data and not composite_only
-                if mapped_tokens > 0 and np.max(base_heatmap) > 0 and not composite_only:
+                # Always create visualization if we have data
+                if mapped_tokens > 0 and np.max(base_heatmap) > 0:
                     base_path = self._create_base_feature_overlay(
                         heatmap=base_heatmap,
                         original_image=original_image,
@@ -1021,11 +1023,10 @@ class EnhancedSemanticTracingVisualizer:
                         use_grid_visualization=use_grid_visualization
                     )
                     if base_path:
-                        base_heatmap_paths.append(base_path)
+                        all_generated_paths.append(base_path)  # Track all paths
+                        if not composite_only:
+                            base_heatmap_paths.append(base_path)
                         base_valid_layers.append(layer_idx)
-                elif mapped_tokens > 0 and np.max(base_heatmap) > 0:
-                    # Just track valid layers for composite
-                    base_valid_layers.append(layer_idx)
             
             # 2. Create patch feature heatmap if available
             if patch_feature_info and "grid_unpadded" in patch_feature_info and "positions" in patch_feature_info:
@@ -1049,8 +1050,8 @@ class EnhancedSemanticTracingVisualizer:
                             patch_heatmap[r, c] = weight
                             mapped_tokens += 1
                 
-                # Create visualization if we have data and not composite_only
-                if mapped_tokens > 0 and np.max(patch_heatmap) > 0 and not composite_only:
+                # Always create visualization if we have data
+                if mapped_tokens > 0 and np.max(patch_heatmap) > 0:
                     # Get required dimensions
                     patch_size = feature_mapping.get("patch_size", 14)
                     
@@ -1066,11 +1067,10 @@ class EnhancedSemanticTracingVisualizer:
                         show_values=show_values
                     )
                     if patch_path:
-                        patch_heatmap_paths.append(patch_path)
+                        all_generated_paths.append(patch_path)  # Track all paths
+                        if not composite_only:
+                            patch_heatmap_paths.append(patch_path)
                         patch_valid_layers.append(layer_idx)
-                elif mapped_tokens > 0 and np.max(patch_heatmap) > 0:
-                    # Just track valid layers for composite
-                    patch_valid_layers.append(layer_idx)
         
         # Create composite visualizations if we have multiple layers
         if base_valid_layers:
@@ -1118,6 +1118,18 @@ class EnhancedSemanticTracingVisualizer:
                 import traceback
                 traceback.print_exc()
         
+        # FIXED: If composite_only is True, only return the composite paths
+        # Otherwise return all generated paths
+        if not composite_only:
+            saved_paths.extend(base_heatmap_paths)
+            saved_paths.extend(patch_heatmap_paths)
+        
+        # Log the number of saved visualizations
+        if composite_only:
+            print(f"Composite only mode: Generated {len(all_generated_paths)} individual heatmaps but keeping only {len(saved_paths)} composite heatmaps")
+        else:
+            print(f"Generated {len(saved_paths)} heatmap visualizations")
+            
         return saved_paths
     
     def _create_base_feature_overlay(
