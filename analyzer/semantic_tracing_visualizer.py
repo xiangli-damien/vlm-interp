@@ -315,6 +315,8 @@ class EnhancedSemanticTracingVisualizer:
         use_exponential_scaling: bool = True,
         output_format: str = "both",
         show_orphaned_nodes: bool = False,
+        horizontal_spacing: float = 1.0,
+        vertical_spacing: float = 0.5,
         **kwargs
     ) -> List[str]:
         """
@@ -342,34 +344,47 @@ class EnhancedSemanticTracingVisualizer:
             use_exponential_scaling: Whether to use exponential scaling for node sizes
             output_format: Output format (png, svg, or both)
             show_orphaned_nodes: Whether to show nodes with no connections
+            horizontal_spacing: Multiplier for horizontal spacing between layers
+            vertical_spacing: Multiplier for vertical spacing between nodes
             **kwargs: Additional arguments for future extensions
             
         Returns:
             List of paths to saved visualization files
         """
         import plotly.graph_objects as go
+        import networkx as nx
+        import math
         
         saved_paths = []
         if trace_data.empty:
             print("No data for interactive flow graph.")
             return saved_paths
 
-        # Build directed graph
-        G = nx.DiGraph()
+        # Extract all unique layers from the data
         layers = sorted(trace_data["layer"].unique())
         if debug_mode:
-            print(f"Detected layers: {layers}")
+            print(f"Detected {len(layers)} layers: {layers}")
 
-        # Map from (layer, token_index) to node_id, and store metadata
+        # Build directed graph
+        G = nx.DiGraph()
+        
+        # Map from (layer, token_index) to node_id and store metadata
         node_map = {}
         node_metadata = {}
         
-        # Process tokens to build graph structure
+        # Track tokens by layer for positioning
+        layer_tokens = {layer_idx: [] for layer_idx in layers}
+        
+        # STEP 1: Build node mapping and metadata
         for _, row in trace_data.iterrows():
             layer_idx = row["layer"]
-            token_idx_i = row["token_index"]
-            node_id = f"L{layer_idx}_T{token_idx_i}"
-            node_map[(layer_idx, token_idx_i)] = node_id
+            token_idx = row["token_index"]
+            node_id = f"L{layer_idx}_T{token_idx}"
+            node_map[(layer_idx, token_idx)] = node_id
+
+            # Add token to its layer group for positioning
+            if token_idx not in layer_tokens[layer_idx]:
+                layer_tokens[layer_idx].append(token_idx)
 
             # Sanitize display text and predicted top token
             txt = self._sanitize_text_for_display(row["token_text"])
@@ -385,11 +400,11 @@ class EnhancedSemanticTracingVisualizer:
                 "weight": row.get("predicted_top_prob", 1.0),
                 "layer": layer_idx,
                 "is_target": row["is_target"],
-                "token_idx": token_idx_i  # Store original token index for path highlighting
+                "token_idx": token_idx  # Store original token index for highlighting
             }
             G.add_node(node_id)
 
-        # Build edges based on source-target relationships
+        # STEP 2: Build edges based on source-target relationships
         for _, row in trace_data.iterrows():
             if not row["is_target"] or pd.isna(row.get("sources_indices", None)):
                 continue
@@ -415,35 +430,79 @@ class EnhancedSemanticTracingVisualizer:
                         G.add_edge(node_map[key], target_node, weight=weight)
                         break
 
-        # Remove orphaned nodes if requested
+        # STEP 3: Remove orphaned nodes if requested
         if not show_orphaned_nodes:
             orphans = [n for n in G.nodes() if G.degree(n) == 0]
             G.remove_nodes_from(orphans)
-            
-        # Check if we have nodes to visualize
+            if debug_mode:
+                print(f"Removed {len(orphans)} orphaned nodes")
+        
+        # If graph is empty after filtering, return
         if len(G) == 0:
             print("Graph empty after filtering.")
             return saved_paths
 
-        # Determine node positions using multipartite layout
-        # Group nodes by layer for aligned vertical positioning
-        layer_nodes = defaultdict(list)
-        for node in G.nodes():
-            layer_nodes[node_metadata[node]["layer"]].append(node)
+        # STEP 4: Compute improved node positions with better spacing
+        # This is a critical part that needs improvement
+        pos = {}
         
-        pos = nx.multipartite_layout(G, subset_key=layer_nodes)
+        # Calculate total width and height of the graph area
+        # Use wider spacing to prevent crowding
+        graph_width = len(layers) * horizontal_spacing * 4.0  # Increase horizontal space
+        
+        # Count maximum nodes in any layer for height calculation
+        max_nodes_per_layer = max(len(nodes) for nodes in layer_tokens.values())
+        graph_height = max_nodes_per_layer * vertical_spacing * 2.0  # Increase vertical space
+        
+        # IMPORTANT: Position nodes in a grid layout by layer with better spacing
+        for layer_idx in layers:
+            # Get tokens in this layer that are in the graph
+            layer_nodes_ids = []
+            for token_idx in layer_tokens[layer_idx]:
+                node_id = node_map.get((layer_idx, token_idx))
+                if node_id in G.nodes():
+                    layer_nodes_ids.append(node_id)
+            
+            # Skip empty layers
+            if not layer_nodes_ids:
+                continue
+            
+            # Calculate x-coordinate for this layer
+            layer_idx_norm = layers.index(layer_idx)  # Normalized layer index (0 to len(layers)-1)
+            x_pos = layer_idx_norm * graph_width / max(1, len(layers) - 1)
+            
+            # Sort nodes by token index for consistent ordering
+            layer_nodes_ids.sort(key=lambda n: node_metadata[n]["token_idx"])
+            
+            # Distribute nodes vertically with proper spacing
+            num_nodes = len(layer_nodes_ids)
+            if num_nodes > 0:
+                # Use the full height for better distribution
+                total_height = graph_height
+                
+                # Calculate step size and starting y position
+                y_step = total_height / max(1, num_nodes - 1) if num_nodes > 1 else 0
+                y_start = -total_height / 2 if num_nodes > 1 else 0
+                
+                # Position each node
+                for i, node_id in enumerate(layer_nodes_ids):
+                    y_pos = y_start + i * y_step
+                    pos[node_id] = (x_pos, y_pos)
+                    if debug_mode and i == 0:
+                        print(f"Layer {layer_idx}: positioned at x={x_pos:.1f}, y from {y_start:.1f}")
 
-        # Compute node sizes based on weights
+        # STEP 5: Compute node sizes based on weights
         sizes = self._calculate_flow_graph_node_sizes(
             G, node_metadata, use_variable_node_size,
             min_node_size, max_node_size, use_exponential_scaling
         )
         
-        # Define color map
+        # STEP 6: Prepare node and edge traces for Plotly
+        # Define color map for token types
         color_map = {0: "#2ecc71", 1: "#3498db", 2: "#e74c3c"}  # green, blue, red
         token_type_labels = {0: "Generated", 1: "Text", 2: "Image"}
         
-        # Create node lists for Plotly (separate by token type for legend grouping)
+        # Create node traces (one per token type for legend grouping)
         node_traces = {}
         for token_type in [0, 1, 2]:  # Generated, Text, Image
             node_traces[token_type] = go.Scatter(
@@ -492,7 +551,7 @@ class EnhancedSemanticTracingVisualizer:
             # Store token index in customdata for path highlighting
             node_traces[token_type].customdata = list(node_traces[token_type].customdata) + [[token_idx, layer]]
         
-        # Create edges - FIX: Create separate traces for each edge instead of a single trace with variable width
+        # Create edge traces with proper curvature and width scaling
         edge_traces = []
         edge_data = {}  # Store all edge data for highlighting
         
@@ -507,13 +566,13 @@ class EnhancedSemanticTracingVisualizer:
             else:
                 width = weight * 3
             
-            # Make sure width is at least 1 for visibility
-            width = max(0.5, min(10, width))  # Clamp between 0.5 and 10
+            # Make sure width is at least 0.5 for visibility, but not more than 10
+            width = max(0.5, min(10, width))
             
             # Create curved edge by adding midpoint with offset
             xmid = (x0 + x1) / 2
             ymid = (y0 + y1) / 2
-            # Add slight curvature
+            # Add slight curvature - increase curve factor for more pronounced curves
             curve_factor = 0.2
             xmid += curve_factor * (y1 - y0)
             ymid -= curve_factor * (x1 - x0)
@@ -558,28 +617,40 @@ class EnhancedSemanticTracingVisualizer:
                 "trace_index": len(edge_traces) - 1
             }
 
-        # Combine all traces - edge traces first, then node traces
+        # STEP 7: Combine all traces and create the figure
+        # Edge traces first, then node traces
         data = edge_traces + list(node_traces.values())
         
-        # Create figure
+        # Create figure with proper size
         fig = go.Figure(data=data)
         
-        # Set layout
+        # STEP 8: Configure layout with proper layer labels and spacing
         title = f"Interactive Semantic Trace Flow Graph for Token '{target_text}' (idx: {target_idx})"
         
-        # Add layer labels (vertical lines)
+        # Add layer labels as vertical lines and text annotations
         shapes = []
         annotations = []
         
-        for i, layer_idx in enumerate(sorted(layer_nodes.keys())):
-            # Vertical lines to separate layers
-            if i > 0:  # Don't add line before first layer
+        # Extract unique layers actually present in the graph
+        graph_layers = sorted(set(node_metadata[n]["layer"] for n in G.nodes()))
+        
+        # Map from actual layer index to normalized index for positioning
+        layer_to_norm_idx = {layer: i for i, layer in enumerate(graph_layers)}
+        
+        # For each layer, add a vertical line and label
+        for layer_idx in graph_layers:
+            # Get normalized x-position 
+            norm_idx = layer_to_norm_idx[layer_idx]
+            x_pos = norm_idx * graph_width / max(1, len(graph_layers) - 1)
+            
+            # Add vertical line (not for the first layer)
+            if norm_idx > 0:
                 shapes.append(dict(
                     type="line",
-                    x0=i - 0.5,
-                    y0=-1,
-                    x1=i - 0.5,
-                    y1=1,
+                    x0=x_pos - horizontal_spacing,  # Adjust for better spacing
+                    y0=-graph_height/2 - 1,  # Extend below the bottom-most node
+                    x1=x_pos - horizontal_spacing,
+                    y1=graph_height/2 + 1,   # Extend above the top-most node
                     line=dict(
                         color="rgba(150, 150, 150, 0.4)",
                         width=1,
@@ -587,10 +658,10 @@ class EnhancedSemanticTracingVisualizer:
                     )
                 ))
             
-            # Layer labels
+            # Add layer label
             annotations.append(dict(
-                x=i,
-                y=1.05,
+                x=x_pos,
+                y=graph_height/2 + 1.5,  # Position above the top-most node
                 xref="x",
                 yref="y",
                 text=f"Layer {layer_idx}",
@@ -598,23 +669,31 @@ class EnhancedSemanticTracingVisualizer:
                 font=dict(size=14, color="black"),
             ))
         
+        # Configure the figure layout
         fig.update_layout(
             title=title,
             titlefont_size=16,
             showlegend=True,
             hovermode='closest',
-            margin=dict(b=50, l=50, r=50, t=100),
+            # Explicitly set plot area size to avoid overcrowding
+            width=max(800, len(graph_layers) * 100),  # Scale width by number of layers
+            height=max(600, max_nodes_per_layer * 50), # Scale height by max nodes
+            margin=dict(b=100, l=50, r=50, t=100),
             annotations=annotations,
             shapes=shapes,
             xaxis=dict(
                 showgrid=False,
                 zeroline=False,
-                showticklabels=False
+                showticklabels=False,
+                range=[-1, graph_width + 1]  # Add padding around the graph
             ),
             yaxis=dict(
                 showgrid=False,
                 zeroline=False,
-                showticklabels=False
+                showticklabels=False,
+                scaleanchor="x",  # Keep aspect ratio consistent
+                scaleratio=1,
+                range=[-graph_height/2 - 1, graph_height/2 + 3]  # Add padding
             ),
             legend=dict(
                 title="Token Types",
@@ -646,8 +725,8 @@ class EnhancedSemanticTracingVisualizer:
             ]
         )
 
-        # Add JavaScript for interactivity
-        # This adds event handlers to highlight paths when nodes are clicked
+        # STEP 9: Add JavaScript for interactivity
+        # Add annotation for user guidance
         fig.update_layout(
             clickmode='event',
             annotations=[
@@ -664,14 +743,7 @@ class EnhancedSemanticTracingVisualizer:
             ]
         )
 
-        # Add interactive callback code via plotly's clientside_callback feature
-        fig.update_layout(
-            newshape_line_color='cyan',
-            clickmode='event+select',
-        )
-        
-        # Add JavaScript to handle highlighting on click
-        # Adjusted for individual edge traces
+        # JavaScript for handling node clicking and highlighting
         onclick_js = """
         // This JavaScript handles interactive node highlighting
         const gd = document.getElementById('{plot_id}');
@@ -851,6 +923,7 @@ class EnhancedSemanticTracingVisualizer:
         }
         """
         
+        # STEP 10: Save visualizations
         # Create output directories
         html_dir = os.path.join(save_dir, "interactive")
         os.makedirs(html_dir, exist_ok=True)
@@ -864,19 +937,52 @@ class EnhancedSemanticTracingVisualizer:
         )
         saved_paths.append(html_path)
         
-        # Also save a static image for reference
-        if output_format in ["png", "both"]:
-            png_path = os.path.join(save_dir, f"flow_graph_{target_idx}.png")
-            fig.write_image(png_path, width=1200, height=800, scale=2)
-            saved_paths.append(png_path)
-            
-        if output_format in ["svg", "both"]:
-            svg_path = os.path.join(save_dir, f"flow_graph_{target_idx}.svg")
-            fig.write_image(svg_path, format="svg", width=1200, height=800)
-            saved_paths.append(svg_path)
+        # Try to save static images
+        try:
+            if output_format in ["png", "both"]:
+                png_path = os.path.join(save_dir, f"flow_graph_{target_idx}.png")
+                try:
+                    # Try to use kaleido if available
+                    fig.write_image(png_path, width=1200, height=800, scale=2)
+                    saved_paths.append(png_path)
+                except Exception as e:
+                    # Fallback to alternative method - save a screenshot of div
+                    print(f"PNG export error (kaleido may be missing): {e}")
+                    print(f"Tip: Install kaleido package with 'pip install -U kaleido' for better image export")
+                    
+                    # Try plotly.io export with 'svg' engine as fallback
+                    try:
+                        import plotly.io as pio
+                        pio.write_image(fig, png_path, format='png', engine='svg')
+                        saved_paths.append(png_path)
+                    except:
+                        print("Could not save PNG, using HTML only")
+                    
+            if output_format in ["svg", "both"]:
+                svg_path = os.path.join(save_dir, f"flow_graph_{target_idx}.svg")
+                try:
+                    # Try to use kaleido if available
+                    fig.write_image(svg_path, format="svg", width=1200, height=800)
+                    saved_paths.append(svg_path)
+                except Exception as e:
+                    # Fallback to alternative method
+                    print(f"SVG export error (kaleido may be missing): {e}")
+                    print(f"Tip: Install kaleido package with 'pip install -U kaleido' for better image export")
+                    
+                    # Try plotly.io export with 'svg' engine as fallback
+                    try:
+                        import plotly.io as pio
+                        pio.write_image(fig, svg_path, format='svg', engine='svg')
+                        saved_paths.append(svg_path)
+                    except:
+                        print("Could not save SVG, using HTML only")
+        except Exception as export_error:
+            print(f"Error exporting static images: {export_error}")
+            print("Interactive HTML visualization still available")
         
         print(f"Created interactive flow graph: {html_path}")
-        print(f"Created static image files for reference")
+        if len(saved_paths) > 1:
+            print(f"Created {len(saved_paths) - 1} static image files for reference")
         
         return saved_paths
 
@@ -986,7 +1092,6 @@ class EnhancedSemanticTracingVisualizer:
     #
     # STANDALONE HEATMAP VISUALIZATION
     #
-
     def create_heatmaps_from_csv(
         self,
         trace_data: pd.DataFrame,
@@ -1001,9 +1106,9 @@ class EnhancedSemanticTracingVisualizer:
     ) -> List[str]:
         """
         Create per-layer and grid-composite heatmaps for base and patch features.
-
+        
         Args:
-            trace_data: DataFrame of token‐trace records
+            trace_data: DataFrame of token-trace records
             target_text: Text of the target token
             target_idx: Index of the target token
             image_path: Path to original image
@@ -1017,40 +1122,77 @@ class EnhancedSemanticTracingVisualizer:
         """
         saved_paths = []
 
+        # Create output directories
         base_dir = os.path.join(save_dir, "base_heatmaps")
         patch_dir = os.path.join(save_dir, "patch_heatmaps")
         os.makedirs(base_dir, exist_ok=True)
         os.makedirs(patch_dir, exist_ok=True)
 
-        img = Image.open(image_path)
-        preview = img.copy()
-        if "resized_dimensions" in feature_mapping:
-            w, h = feature_mapping["resized_dimensions"]
-            preview = preview.resize((w, h), Image.LANCZOS)
+        # Load the original image
+        try:
+            img = Image.open(image_path)
+            # Create a preview version for patch visualization
+            preview = img.copy()
+            if "resized_dimensions" in feature_mapping:
+                w, h = feature_mapping["resized_dimensions"]
+                preview = preview.resize((w, h), Image.LANCZOS)
+        except Exception as e:
+            print(f"Error loading image: {e}")
+            return saved_paths
 
+        # Get all unique layers in the trace data 
         layers = sorted(trace_data["layer"].unique())
+        
+        # Dictionaries to store heatmaps for each layer
         layer_base_maps = {}
         layer_patch_maps = {}
 
+        # Process each layer separately
         for L in layers:
+            # Get just the data for this layer
             dfL = trace_data[trace_data["layer"] == L]
+            
+            # Filter for image tokens (token_type = 2)
             img_toks = dfL[dfL["token_type"] == 2]
+            
             if img_toks.empty:
+                print(f"Layer {L}: No image tokens found")
                 layer_base_maps[L] = None
                 layer_patch_maps[L] = None
                 continue
 
-            mx = img_toks["predicted_top_prob"].max()
+            # Extract and normalize weights for this layer only
+            # This ensures each layer has its own unique heatmap
+            # FIXED: Added debug print to verify weights are different per layer
+            tok_weights = img_toks["predicted_top_prob"].values
+            mx = tok_weights.max() if len(tok_weights) > 0 else 0
+            print(f"Layer {L}: Max weight = {mx:.4f}, Tokens = {len(img_toks)}")
+            
+            if mx <= 0:
+                print(f"Layer {L}: All weights are zero")
+                layer_base_maps[L] = None
+                layer_patch_maps[L] = None
+                continue
+                
+            # Create normalized weights dictionary for this layer
             weights = {
                 int(r.token_index): r.predicted_top_prob / mx
-                for _, r in img_toks.iterrows() if mx > 0
+                for _, r in img_toks.iterrows()
             }
+            
+            # Debug: Print some token weights for verification
+            if self.debug_mode and weights:
+                sample_keys = list(weights.keys())[:3]
+                print(f"Layer {L} sample weights: " + 
+                    ", ".join([f"Token {k}: {weights[k]:.3f}" for k in sample_keys]))
 
-            # Base feature map
+            # 1. Process base feature map
             bf = feature_mapping.get("base_feature", {})
             if bf.get("grid") and bf.get("positions"):
                 gh, gw = bf["grid"]
                 heat = np.zeros((gh, gw), float)
+                mapped_count = 0
+                
                 for tid, w in weights.items():
                     # Convert string positions back to integers
                     pos = None
@@ -1063,29 +1205,40 @@ class EnhancedSemanticTracingVisualizer:
                         r0, c0 = pos
                         if 0 <= r0 < gh and 0 <= c0 < gw:
                             heat[r0, c0] = w
-                layer_base_maps[L] = heat if heat.max() > 0 else None
-                if not composite_only and layer_base_maps[L] is not None:
-                    p = self._create_base_feature_overlay(
-                        heatmap=heat,
-                        original_image=img,
-                        grid_size=(gh, gw),
-                        layer_idx=L,
-                        target_idx=target_idx,
-                        title=f"Base Influence L{L}",
-                        save_path=os.path.join(base_dir, f"base_L{L}.png"),
-                        use_grid_visualization=use_grid_visualization,
-                        show_values=show_values
-                    )
-                    if p:
-                        saved_paths.append(p)
+                            mapped_count += 1
+                
+                # Only use heatmap if it has meaningful data
+                if mapped_count > 0 and heat.max() > 0:
+                    layer_base_maps[L] = heat
+                    if not composite_only:
+                        p = self._create_base_feature_overlay(
+                            heatmap=heat,
+                            original_image=img,
+                            grid_size=(gh, gw),
+                            layer_idx=L,
+                            target_idx=target_idx,
+                            title=f"Base Influence L{L}",
+                            save_path=os.path.join(base_dir, f"base_L{L}.png"),
+                            use_grid_visualization=use_grid_visualization,
+                            show_values=show_values
+                        )
+                        if p:
+                            saved_paths.append(p)
+                            print(f"Created base feature overlay for layer {L}")
+                else:
+                    print(f"Layer {L}: No valid base feature data (mapped {mapped_count} tokens)")
+                    layer_base_maps[L] = None
             else:
+                print(f"Layer {L}: Missing base feature mapping information")
                 layer_base_maps[L] = None
 
-            # Patch feature map
+            # 2. Process patch feature map
             pf = feature_mapping.get("patch_feature", {})
             if pf.get("grid_unpadded") and pf.get("positions"):
                 gh, gw = pf["grid_unpadded"]
                 heat = np.zeros((gh, gw), float)
+                mapped_count = 0
+                
                 for tid, w in weights.items():
                     # Convert string positions back to integers
                     pos = None
@@ -1098,31 +1251,40 @@ class EnhancedSemanticTracingVisualizer:
                         r0, c0 = pos
                         if 0 <= r0 < gh and 0 <= c0 < gw:
                             heat[r0, c0] = w
-                layer_patch_maps[L] = heat if heat.max() > 0 else None
-                if not composite_only and layer_patch_maps[L] is not None:
-                    p = self._create_patch_feature_overlay(
-                        heatmap=heat,
-                        spatial_preview_image=preview,
-                        feature_mapping=feature_mapping,
-                        patch_size=feature_mapping.get("patch_size", 14),
-                        layer_idx=L,
-                        target_idx=target_idx,
-                        title=f"Patch Influence L{L}",
-                        save_path=os.path.join(patch_dir, f"patch_L{L}.png"),
-                        show_values=show_values
-                    )
-                    if p:
-                        saved_paths.append(p)
+                            mapped_count += 1
+                
+                # Only use heatmap if it has meaningful data
+                if mapped_count > 0 and heat.max() > 0:
+                    layer_patch_maps[L] = heat
+                    if not composite_only:
+                        p = self._create_patch_feature_overlay(
+                            heatmap=heat,
+                            spatial_preview_image=preview,
+                            feature_mapping=feature_mapping,
+                            patch_size=feature_mapping.get("patch_size", 14),
+                            layer_idx=L,
+                            target_idx=target_idx,
+                            title=f"Patch Influence L{L}",
+                            save_path=os.path.join(patch_dir, f"patch_L{L}.png"),
+                            show_values=show_values
+                        )
+                        if p:
+                            saved_paths.append(p)
+                            print(f"Created patch feature overlay for layer {L}")
+                else:
+                    print(f"Layer {L}: No valid patch feature data (mapped {mapped_count} tokens)")
+                    layer_patch_maps[L] = None
             else:
+                print(f"Layer {L}: Missing patch feature mapping information")
                 layer_patch_maps[L] = None
 
-        # Composite grids (always generate if any valid)
+        # Create composite grid visualizations if we have valid maps
         valid_base = [L for L, hm in layer_base_maps.items() if hm is not None]
         if valid_base:
             out = os.path.join(save_dir, f"composite_base_grid_{target_idx}.png")
             p = self._create_grid_composite(
                 heatmap_maps=layer_base_maps,
-                layers=layers,
+                layers=valid_base,  # FIXED: Only use layers with valid data
                 title=f"Base Influence per Layer for Token {target_idx}",
                 save_path=out,
                 cmap="hot",
@@ -1130,13 +1292,14 @@ class EnhancedSemanticTracingVisualizer:
             )
             if p:
                 saved_paths.append(p)
+                print(f"Created composite base grid with {len(valid_base)} layers")
 
         valid_patch = [L for L, hm in layer_patch_maps.items() if hm is not None]
         if valid_patch:
             out = os.path.join(save_dir, f"composite_patch_grid_{target_idx}.png")
             p = self._create_grid_composite(
                 heatmap_maps=layer_patch_maps,
-                layers=layers,
+                layers=valid_patch,  # FIXED: Only use layers with valid data
                 title=f"Patch Influence per Layer for Token {target_idx}",
                 save_path=out,
                 cmap="hot",
@@ -1144,75 +1307,11 @@ class EnhancedSemanticTracingVisualizer:
             )
             if p:
                 saved_paths.append(p)
+                print(f"Created composite patch grid with {len(valid_patch)} layers")
 
         return saved_paths
 
 
-
-    def _create_grid_composite(
-        self,
-        heatmap_maps: Dict[int, Optional[np.ndarray]],
-        layers: List[int],
-        title: str,
-        save_path: str,
-        cmap: str = "hot",
-        show_values: bool = True
-    ) -> Optional[str]:
-        """
-        Arrange each layer's 2D heatmap array into a square grid of subplots.
-
-        heatmap_maps: dict layer->2D numpy array or None
-        layers: full list of layers to include (None entries yield blank panels)
-        """
-        # count panels
-        n = len(layers)
-        if n == 0:
-            return None
-
-        ncols = math.ceil(math.sqrt(n))
-        nrows = math.ceil(n / ncols)
-
-        fig, axes = plt.subplots(nrows, ncols, figsize=(ncols*3, nrows*3))
-        axes = axes.flatten()
-
-        im = None
-        for idx, L in enumerate(layers):
-            ax = axes[idx]
-            hm = heatmap_maps.get(L)
-            if hm is None:
-                ax.axis("off")
-                continue
-
-            im = ax.imshow(hm, vmin=0, vmax=1, cmap=cmap)
-            ax.set_title(f"Layer {L}", fontsize=10)
-            ax.axis("off")
-
-            if show_values:
-                # overlay each cell value
-                H,W = hm.shape
-                for i in range(H):
-                    for j in range(W):
-                        val = hm[i,j]
-                        if val > 0:
-                            ax.text(j, i, f"{val:.2f}",
-                                    ha='center', va='center', fontsize=6,
-                                    color='white' if val>0.5 else 'black')
-
-        # hide extra axes
-        for ax in axes[n:]:
-            ax.axis("off")
-
-        fig.suptitle(title, fontsize=14)
-        if im is not None:
-            cbar = fig.colorbar(im, ax=axes.tolist(), fraction=0.02, pad=0.01)
-            cbar.set_label("Normalized Influence", fontsize=10)
-
-        plt.tight_layout(rect=[0,0,1,0.96])
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        return save_path
-
-    
     def _create_base_feature_overlay(
         self,
         heatmap: np.ndarray,
@@ -1251,25 +1350,44 @@ class EnhancedSemanticTracingVisualizer:
             Path to saved visualization or None if failed
         """
         try:
-            # Resize original image for overlay
-            resized_background = original_image.resize(target_size, Image.LANCZOS)
+            # FIXED: Ensure the image is resized correctly and converted to RGB for consistent display
+            if original_image.mode != 'RGB':
+                resized_background = original_image.convert('RGB').resize(target_size, Image.LANCZOS)
+            else:
+                resized_background = original_image.resize(target_size, Image.LANCZOS)
+            
             background_np = np.array(resized_background)
             
-            # Get grid dimensions
-            grid_h, grid_w = grid_size
+            # Verify image data is valid
+            if background_np.min() == background_np.max():
+                print(f"Warning: Image has no variation (constant value: {background_np.min()})")
             
             # Calculate cell dimensions
+            grid_h, grid_w = grid_size
             cell_height = target_size[1] / grid_h
             cell_width = target_size[0] / grid_w
             
-            # Create figure and plot
+            # Create figure with explicit size and dpi
+            plt.figure(figsize=(8, 8), dpi=100, facecolor='white')
             fig, ax = plt.subplots(figsize=(8, 8))
             
-            # Plot background image
-            ax.imshow(background_np, extent=(0, target_size[0], target_size[1], 0))
+            # FIXED: Display background image with explicit extent and origin
+            # The issue might be with the extent parameter, so let's be explicit
+            ax.imshow(
+                background_np, 
+                extent=(0, target_size[0], target_size[1], 0),
+                aspect='auto',
+                origin='upper'
+            )
+            
+            # Debug print
+            print(f"Background image shape: {background_np.shape}, Type: {background_np.dtype}")
+            print(f"Heat map shape: {heatmap.shape}, Min: {heatmap.min()}, Max: {heatmap.max()}")
             
             if use_grid_visualization:
-                # Grid-based approach for consistency with patch visualization
+                # FIXED: Use slightly more transparent overlay for better visibility
+                base_alpha = min(0.6, alpha)  # Limit maximum alpha
+                
                 # Create a colored grid overlay
                 for r in range(grid_h):
                     for c in range(grid_w):
@@ -1281,17 +1399,21 @@ class EnhancedSemanticTracingVisualizer:
                             x_start = c * cell_width
                             y_start = r * cell_height
                             
-                            # Create colored rectangle
+                            # Create colored rectangle with better visibility
                             cmap = plt.get_cmap(colormap)
                             cell_color = cmap(cell_value)
+                            
+                            # FIXED: Scale alpha more aggressively for better visibility
+                            # Use a lower alpha value for cells with low values
+                            cell_alpha = min(cell_value * 1.3, base_alpha)
                             
                             # Create rectangle with appropriate alpha
                             rect = plt.Rectangle(
                                 (x_start, y_start),
                                 cell_width, cell_height,
                                 color=cell_color,
-                                alpha=min(cell_value * 1.5, alpha),  # Scale alpha by value, capped at max alpha
-                                linewidth=0
+                                alpha=cell_alpha,
+                                linewidth=0.5 if cell_value > 0.4 else 0
                             )
                             ax.add_patch(rect)
                             
@@ -1308,7 +1430,6 @@ class EnhancedSemanticTracingVisualizer:
                                     bbox=dict(facecolor='none', alpha=0, pad=0)
                                 )
             else:
-                # Original smooth visualization approach
                 # Use scikit-image if available, otherwise fall back to simple method
                 try:
                     from skimage.transform import resize as skimage_resize
@@ -1323,10 +1444,13 @@ class EnhancedSemanticTracingVisualizer:
                     upscaled_heatmap = np.kron(heatmap, np.ones((repeat_y, repeat_x)))
                     upscaled_heatmap = upscaled_heatmap[:target_size[1], :target_size[0]]
                 
-                # Plot heatmap overlay
+                # FIXED: Lower alpha for better background visibility
+                lowered_alpha = min(0.6, alpha)
+                
+                # Plot heatmap overlay with fixed alpha
                 im = ax.imshow(
                     upscaled_heatmap, 
-                    alpha=alpha,
+                    alpha=lowered_alpha,
                     cmap=colormap,
                     vmin=0,
                     vmax=1,
@@ -1334,7 +1458,7 @@ class EnhancedSemanticTracingVisualizer:
                     interpolation="nearest"
                 )
             
-            # Add grid lines regardless of visualization type
+            # Add grid lines if requested
             if add_gridlines:
                 # Horizontal grid lines
                 for i in range(grid_h + 1):
@@ -1357,10 +1481,11 @@ class EnhancedSemanticTracingVisualizer:
             ax.set_title(title, fontsize=12)
             ax.axis("off")
             
-            # Save figure
+            # Save figure with explicit bbox_inches to prevent cropping
             plt.tight_layout()
-            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor='white')
             plt.close(fig)
+            plt.close('all')  # Close any other open figures
             
             return save_path
         
@@ -1369,7 +1494,8 @@ class EnhancedSemanticTracingVisualizer:
             import traceback
             traceback.print_exc()
             return None
-    
+
+
     def _create_patch_feature_overlay(
         self,
         heatmap: np.ndarray,
@@ -1417,9 +1543,19 @@ class EnhancedSemanticTracingVisualizer:
                 print("Error: Invalid grid dimensions.")
                 return None
             
+            # FIXED: Ensure the preview image is in RGB mode for consistent display
+            if spatial_preview_image.mode != 'RGB':
+                preview_image = spatial_preview_image.convert('RGB')
+            else:
+                preview_image = spatial_preview_image
+                
             # Get dimensions for the visualization
-            preview_w, preview_h = spatial_preview_image.size
-            background_np = np.array(spatial_preview_image)
+            preview_w, preview_h = preview_image.size
+            background_np = np.array(preview_image)
+            
+            # Verify image data is valid
+            if background_np.min() == background_np.max():
+                print(f"Warning: Preview image has no variation (constant value: {background_np.min()})")
             
             # Get the actual content dimensions and padding
             resized_dims_wh = feature_mapping.get("resized_dimensions", (0, 0))
@@ -1439,14 +1575,31 @@ class EnhancedSemanticTracingVisualizer:
             cell_height = resized_h_actual / prob_grid_h
             cell_width = resized_w_actual / prob_grid_w
             
-            # Create figure and plot
+            # Create figure with explicit size and dpi
+            plt.figure(figsize=(8, 8 * preview_h / max(1, preview_w)), dpi=100, facecolor='white')
             fig, ax = plt.subplots(figsize=(8, 8 * preview_h / max(1, preview_w)))
             
-            # Plot background image
-            ax.imshow(background_np, extent=(0, preview_w, preview_h, 0))
+            # FIXED: Display background image with explicit extent and origin
+            ax.imshow(
+                background_np, 
+                extent=(0, preview_w, preview_h, 0),
+                aspect='auto',
+                origin='upper'
+            )
+            
+            # Debug print
+            print(f"Preview image shape: {background_np.shape}, Type: {background_np.dtype}")
+            print(f"Patch heatmap shape: {heatmap.shape}, Min: {heatmap.min()}, Max: {heatmap.max()}")
+            print(f"Padding: top={pad_top}, left={pad_left}, Content size: {resized_w_actual}x{resized_h_actual}")
+            
+            # FIXED: Use slightly more transparent overlay for better visibility
+            base_alpha = min(0.6, alpha)  # Limit maximum alpha
             
             # Create colormap
             cmap = plt.get_cmap(colormap)
+            
+            # FIXED: Keep track of whether we're adding any cells
+            cells_added = 0
             
             # Create grid-based overlay
             for r in range(prob_grid_h):
@@ -1454,7 +1607,8 @@ class EnhancedSemanticTracingVisualizer:
                     # Get heatmap value for this cell (between 0 and 1)
                     cell_value = heatmap[r, c] if r < len(heatmap) and c < len(heatmap[0]) else 0
                     
-                    if cell_value > 0:  # Only draw cells with influence
+                    # FIXED: Lower threshold for visibility
+                    if cell_value > 0.01:  # Show even cells with small influence
                         # Calculate cell boundaries in image coordinates
                         x_start = pad_left + c * cell_width
                         y_start = pad_top + r * cell_height
@@ -1462,15 +1616,20 @@ class EnhancedSemanticTracingVisualizer:
                         # Get color from colormap
                         cell_color = cmap(cell_value)
                         
+                        # FIXED: Scale alpha more aggressively for better visibility
+                        # Use a lower alpha value for cells with low values
+                        cell_alpha = min(cell_value * 1.3, base_alpha)
+                        
                         # Create rectangle with appropriate alpha
                         rect = plt.Rectangle(
                             (x_start, y_start),
                             cell_width, cell_height,
                             color=cell_color,
-                            alpha=min(cell_value * 1.5, alpha),  # Scale alpha by value, capped at max alpha
-                            linewidth=0
+                            alpha=cell_alpha,
+                            linewidth=0.5 if cell_value > 0.4 else 0
                         )
                         ax.add_patch(rect)
+                        cells_added += 1
                         
                         # Optionally add text showing value
                         if show_values and cell_value > 0.25:  # Only show text for more significant cells
@@ -1485,6 +1644,8 @@ class EnhancedSemanticTracingVisualizer:
                                 bbox=dict(facecolor='none', alpha=0, pad=0)
                             )
             
+            print(f"Added {cells_added} cells to patch visualization")
+            
             # Add grid lines if requested
             if add_gridlines:
                 # Horizontal grid lines
@@ -1496,6 +1657,17 @@ class EnhancedSemanticTracingVisualizer:
                 for i in range(prob_grid_w + 1):
                     x = pad_left + i * cell_width
                     ax.axvline(x=x, color='gray', linestyle='-', linewidth=0.5, alpha=0.5)
+                
+                # Add border around content area
+                content_rect = plt.Rectangle(
+                    (pad_left, pad_top),
+                    resized_w_actual, resized_h_actual,
+                    fill=False,
+                    edgecolor='blue',
+                    linestyle='--',
+                    linewidth=1
+                )
+                ax.add_patch(content_rect)
             
             # Add colorbar
             norm = plt.Normalize(vmin=0, vmax=1)
@@ -1508,10 +1680,11 @@ class EnhancedSemanticTracingVisualizer:
             ax.set_title(title, fontsize=12)
             ax.axis("off")
             
-            # Save figure
+            # Save figure with explicit bbox_inches to prevent cropping
             plt.tight_layout()
-            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor='white')
             plt.close(fig)
+            plt.close('all')  # Close any other open figures
             
             return save_path
         
@@ -1520,7 +1693,113 @@ class EnhancedSemanticTracingVisualizer:
             import traceback
             traceback.print_exc()
             return None
-    
+
+
+    def _create_grid_composite(
+        self,
+        heatmap_maps: Dict[int, Optional[np.ndarray]],
+        layers: List[int],
+        title: str,
+        save_path: str,
+        cmap: str = "hot",
+        show_values: bool = True
+    ) -> Optional[str]:
+        """
+        Arrange each layer's 2D heatmap array into a square grid of subplots.
+        
+        Args:
+            heatmap_maps: Dictionary mapping layer index to 2D heatmap array
+            layers: List of layer indices to include (each gets its own subplot)
+            title: Title for the figure
+            save_path: Path to save the composite image
+            cmap: Colormap to use
+            show_values: Whether to show cell values
+            
+        Returns:
+            Path to saved image or None if failed
+        """
+        # Only use valid layers (that have heatmaps)
+        valid_layers = [L for L in layers if heatmap_maps.get(L) is not None]
+        n = len(valid_layers)
+        
+        if n == 0:
+            print("No valid layers with heatmaps. Cannot create composite.")
+            return None
+
+        # Determine grid layout
+        ncols = math.ceil(math.sqrt(n))
+        nrows = math.ceil(n / ncols)
+        
+        # Create figure with white background
+        fig, axes = plt.subplots(
+            nrows, ncols, 
+            figsize=(ncols*3, nrows*3),
+            facecolor='white'
+        )
+        axes = np.array(axes).flatten()  # Handle both 1D and 2D axes arrays
+
+        # FIXED: Verify all heatmaps are different using a hash
+        heatmap_hashes = {}
+        for L in valid_layers:
+            hm = heatmap_maps[L]
+            if hm is not None:
+                # Create a simple hash of the heatmap
+                hm_hash = hash(hm.tobytes())
+                if hm_hash in heatmap_hashes:
+                    print(f"WARNING: Layer {L} has identical heatmap to layer {heatmap_hashes[hm_hash]}")
+                else:
+                    heatmap_hashes[hm_hash] = L
+
+        # Track the common colormap instance for consistent colors
+        im = None
+        
+        # Add each layer's heatmap to the grid
+        for idx, L in enumerate(valid_layers):
+            ax = axes[idx]
+            hm = heatmap_maps[L]
+            
+            if hm is None:
+                ax.axis("off")
+                continue
+            
+            # FIXED: Use consistent vmin/vmax across all subplots
+            im = ax.imshow(hm, vmin=0, vmax=1, cmap=cmap)
+            ax.set_title(f"Layer {L}", fontsize=10)
+            
+            # FIXED: Add more detailed layer stats
+            ax_title = f"Layer {L} "
+            if hm.max() > 0:
+                ax_title += f"(max: {hm.max():.2f})"
+            ax.set_title(ax_title, fontsize=10)
+            
+            ax.axis("off")
+
+            # Show values in cells if requested
+            if show_values:
+                H, W = hm.shape
+                for i in range(H):
+                    for j in range(W):
+                        val = hm[i, j]
+                        if val > 0.1:  # Only show significant values
+                            ax.text(j, i, f"{val:.2f}",
+                                    ha='center', va='center', fontsize=6,
+                                    color='white' if val > 0.5 else 'black')
+
+        # Hide any unused subplots
+        for ax in axes[n:]:
+            ax.axis("off")
+
+        # Add title and colorbar
+        fig.suptitle(title, fontsize=14)
+        if im is not None:
+            cbar = fig.colorbar(im, ax=axes.tolist(), fraction=0.02, pad=0.01)
+            cbar.set_label("Normalized Influence", fontsize=10)
+
+        # Adjust layout and save
+        plt.tight_layout(rect=[0, 0, 1, 0.96])  # Leave room for title
+        plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor='white')
+        plt.close(fig)
+        return save_path
     
     #
     # STANDALONE TRACE DATA VISUALIZATION
