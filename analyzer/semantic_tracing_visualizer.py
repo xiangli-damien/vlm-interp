@@ -10,14 +10,15 @@ from PIL import Image, ImageDraw, ImageFont
 import seaborn as sns
 import requests
 import io
+import plotly.graph_objects as go
 from typing import Dict, Any, Optional, List, Tuple, Union, Set
 from collections import defaultdict
 
 
 class EnhancedSemanticTracingVisualizer:
     """
-    Visualizes semantic tracing results from CSV data, creating flow graphs and heatmaps.
-    Provides improved spacing for flow graphs and modular visualization functions.
+    Visualizes semantic tracing results from CSV data, creating interactive flow graphs and heatmaps.
+    Provides improved visualization with interactive exploration features.
     """
     
     def __init__(
@@ -204,8 +205,8 @@ class EnhancedSemanticTracingVisualizer:
         # 1. Create flow graph visualization if requested
         if create_flow_graph:
             try:
-                print("Creating token flow graph visualization...")
-                flow_graph_paths = self.create_flow_graph_from_csv(
+                print("Creating interactive token flow graph visualization...")
+                flow_graph_paths = self.create_interactive_flow_graph_from_csv(
                     df, target_text, target_idx, save_dir, **flow_graph_params
                 )
                 results["flow_graph"] = flow_graph_paths
@@ -298,56 +299,57 @@ class EnhancedSemanticTracingVisualizer:
         }
     
     #
-    # STANDALONE FLOW GRAPH VISUALIZATION
+    # INTERACTIVE FLOW GRAPH VISUALIZATION
     #
-    def create_flow_graph_from_csv(
+    def create_interactive_flow_graph_from_csv(
         self,
         trace_data: pd.DataFrame,
         target_text: str,
         target_idx: int,
         save_dir: str,
-        output_format: str = "both",
-        align_tokens_by_layer: bool = True,
-        show_orphaned_nodes: bool = False,
         min_edge_weight: float = 0.05,
         use_variable_node_size: bool = True,
-        min_node_size: int = 600,
-        max_node_size: int = 1500,
+        min_node_size: int = 10,
+        max_node_size: int = 30,
         debug_mode: bool = False,
-        dpi: int = 100,
-        show_continuation_edges: bool = False,
-        use_exponential_scaling: bool = True
+        use_exponential_scaling: bool = True,
+        output_format: str = "both",
+        show_orphaned_nodes: bool = False,
+        **kwargs
     ) -> List[str]:
         """
-        Create a token-flow graph from trace CSV using a multipartite layout.
-
-        This implementation constructs a mapping from layer index to the list of nodes
-        in that layer, which satisfies NetworkX's requirement that subset_key.values()
-        be sequences. Other improvements include single-pass edge drawing and lowered DPI.
-
+        Creates an interactive flow graph visualization from trace CSV data using Plotly.
+        
+        This function builds a layered visualization with:
+        - One column per model layer
+        - Tokens as nodes colored by type (image=red, text=blue, generated=green)
+        - Connections between source and target tokens across layers
+        - Interactive features:
+            - Click nodes to highlight connected paths
+            - Hover over nodes for token details
+            - Zoom, pan, and export options
+        
         Args:
-            trace_data: DataFrame of token-trace records.
-            target_text: Text of the target token.
-            target_idx: Index of the target token.
-            save_dir: Directory in which to save output files.
-            output_format: 'png', 'svg', or 'both'.
-            align_tokens_by_layer: If True, use multipartite layout for even vertical spacing.
-            show_orphaned_nodes: If False, remove isolated nodes.
-            min_edge_weight: Minimum edge weight to include.
-            use_variable_node_size: Scale node sizes by weight.
-            min_node_size: Minimum node size.
-            max_node_size: Maximum node size.
-            debug_mode: If True, print debug information.
-            dpi: DPI for raster output.
-            show_continuation_edges: Draw dashed edges for token continuations (not used here).
-            use_exponential_scaling: If True, apply square-root scaling to weights.
-
+            trace_data: DataFrame of token trace records
+            target_text: Text of the target token
+            target_idx: Index of the target token
+            save_dir: Directory to save visualization files
+            min_edge_weight: Minimum edge weight to include
+            use_variable_node_size: Whether to vary node size based on weight
+            min_node_size: Minimum node size for visualization
+            max_node_size: Maximum node size for visualization
+            debug_mode: Whether to print debug information
+            use_exponential_scaling: Whether to use exponential scaling for node sizes
+            output_format: Output format (png, svg, or both)
+            show_orphaned_nodes: Whether to show nodes with no connections
+            **kwargs: Additional arguments for future extensions
+            
         Returns:
-            A list of saved file paths.
+            List of paths to saved visualization files
         """
         saved_paths = []
         if trace_data.empty:
-            print("No data for flow graph.")
+            print("No data for interactive flow graph.")
             return saved_paths
 
         # Build directed graph
@@ -359,6 +361,8 @@ class EnhancedSemanticTracingVisualizer:
         # Map from (layer, token_index) to node_id, and store metadata
         node_map = {}
         node_metadata = {}
+        
+        # Process tokens to build graph structure
         for _, row in trace_data.iterrows():
             layer_idx = row["layer"]
             token_idx_i = row["token_index"]
@@ -371,117 +375,481 @@ class EnhancedSemanticTracingVisualizer:
             if pd.notna(pred) and pred:
                 pred = f"→{self._sanitize_text_for_display(pred)}"
 
+            # Store node metadata
             node_metadata[node_id] = {
                 "type": row["token_type"],
                 "text": txt,
                 "top_pred": pred,
                 "weight": row.get("predicted_top_prob", 1.0),
                 "layer": layer_idx,
-                "is_target": row["is_target"]
+                "is_target": row["is_target"],
+                "token_idx": token_idx_i  # Store original token index for path highlighting
             }
             G.add_node(node_id)
 
-        # Build edges based on source-target relationships and weight threshold
+        # Build edges based on source-target relationships
         for _, row in trace_data.iterrows():
             if not row["is_target"] or pd.isna(row.get("sources_indices", None)):
                 continue
 
             target_node = node_map[(row["layer"], row["token_index"])]
-            src_indices = [int(i) for i in str(row["sources_indices"]).split(",") if i]
-            src_weights = [float(w) for w in str(row["sources_weights"]).split(",") if w]
-
+            
+            # Parse source indices and weights from the CSV
+            try:
+                src_indices = [int(i) for i in str(row["sources_indices"]).split(",") if i]
+                src_weights = [float(w) for w in str(row["sources_weights"]).split(",") if w]
+            except (ValueError, AttributeError):
+                continue
+                
             for src_idx, weight in zip(src_indices, src_weights):
                 if weight < min_edge_weight:
                     continue
+                    
                 # Find the latest previous layer that contains this source token
-                for prev_layer in reversed(layers):
+                for prev_layer in reversed([l for l in layers if l < row["layer"]]):
                     key = (prev_layer, src_idx)
                     if key in node_map:
+                        # Add edge with weight attribute
                         G.add_edge(node_map[key], target_node, weight=weight)
                         break
 
-        # Optionally remove isolated nodes
+        # Remove orphaned nodes if requested
         if not show_orphaned_nodes:
             orphans = [n for n in G.nodes() if G.degree(n) == 0]
             G.remove_nodes_from(orphans)
+            
+        # Filter nodes if needed
         if len(G) == 0:
             print("Graph empty after filtering.")
             return saved_paths
 
-        # Determine node positions
-        if align_tokens_by_layer:
-            # Build mapping from layer -> list of node_ids for multipartite layout
-            layer_nodes = defaultdict(list)
-            for node in G.nodes():
-                layer_nodes[node_metadata[node]["layer"]].append(node)
-            pos = nx.multipartite_layout(G, subset_key=layer_nodes)
-        else:
-            pos = nx.spring_layout(G, k=1.0, iterations=50)
+        # Determine node positions using multipartite layout
+        # Group nodes by layer for aligned vertical positioning
+        layer_nodes = defaultdict(list)
+        for node in G.nodes():
+            layer_nodes[node_metadata[node]["layer"]].append(node)
+        
+        pos = nx.multipartite_layout(G, subset_key=layer_nodes)
 
-        # Compute node sizes and colors
+        # Compute node sizes based on weights
         sizes = self._calculate_flow_graph_node_sizes(
             G, node_metadata, use_variable_node_size,
             min_node_size, max_node_size, use_exponential_scaling
         )
-        color_map = {0: "#2ecc71", 1: "#3498db", 2: "#e74c3c"}
-        colors = [color_map[node_metadata[n]["type"]] for n in G.nodes()]
-
-        # Draw nodes
-        plt.figure(figsize=(12, 8), dpi=dpi)
-        nx.draw_networkx_nodes(
-            G, pos,
-            node_size=sizes,
-            node_color=colors,
-            edgecolors='black',
-            linewidths=0.5,
-            alpha=0.8
+        
+        # Define color map
+        color_map = {0: "#2ecc71", 1: "#3498db", 2: "#e74c3c"}  # green, blue, red
+        token_type_labels = {0: "Generated", 1: "Text", 2: "Image"}
+        
+        # Create node lists for Plotly (separate by token type for legend grouping)
+        node_traces = {}
+        for token_type in [0, 1, 2]:  # Generated, Text, Image
+            node_traces[token_type] = go.Scatter(
+                x=[],
+                y=[],
+                mode='markers',
+                name=token_type_labels[token_type],
+                marker=dict(
+                    color=color_map[token_type],
+                    size=[],
+                    line=dict(width=1, color='black')
+                ),
+                hoverinfo='text',
+                hovertext=[],
+                ids=[],  # Store node IDs for callbacks
+                customdata=[]  # Store token indices for path highlighting
+            )
+        
+        # Populate node traces
+        for node in G.nodes():
+            x, y = pos[node]
+            token_type = node_metadata[node]["type"]
+            token_text = node_metadata[node]["text"]
+            top_pred = node_metadata[node]["top_pred"]
+            layer = node_metadata[node]["layer"]
+            token_idx = node_metadata[node]["token_idx"]
+            is_target = node_metadata[node]["is_target"]
+            
+            # Add node to appropriate trace
+            node_traces[token_type].x = list(node_traces[token_type].x) + [x]
+            node_traces[token_type].y = list(node_traces[token_type].y) + [y]
+            
+            # Size
+            idx = list(G.nodes()).index(node)
+            node_traces[token_type].marker.size = list(node_traces[token_type].marker.size) + [sizes[idx]]
+            
+            # Hover text
+            text_label = f"{token_text} {top_pred}" if top_pred else token_text
+            hover_text = f"Layer: {layer}<br>Token: '{text_label}'<br>Index: {token_idx}<br>Type: {token_type_labels[token_type]}"
+            if is_target:
+                hover_text += "<br>Is Target: Yes"
+                
+            node_traces[token_type].hovertext = list(node_traces[token_type].hovertext) + [hover_text]
+            node_traces[token_type].ids = list(node_traces[token_type].ids) + [node]
+            
+            # Store token index in customdata for path highlighting
+            node_traces[token_type].customdata = list(node_traces[token_type].customdata) + [[token_idx, layer]]
+        
+        # Create edge trace
+        edge_trace = go.Scatter(
+            x=[],
+            y=[],
+            line=dict(width=1, color='#888'),
+            hoverinfo='none',
+            mode='lines',
+            opacity=0.6
         )
-
-        # Draw edges in one pass
-        edge_kwargs = dict(arrows=True, arrowsize=8, connectionstyle="arc3,rad=0.1")
+        
+        # Add edges to trace
+        edge_weights = []
+        edge_texts = []
+        edge_data = []  # Store source-target pairs for highlighting
+        
         for u, v, data in G.edges(data=True):
-            w = data["weight"]
-            width = (math.sqrt(w) if use_exponential_scaling else w) * 5.0
-            if width >= min_edge_weight * 5.0:
-                nx.draw_networkx_edges(
-                    G, pos,
-                    edgelist=[(u, v)],
-                    width=width,
-                    alpha=0.6,
-                    **edge_kwargs
-                )
+            x0, y0 = pos[u]
+            x1, y1 = pos[v]
+            weight = data.get('weight', 0.0)
+            
+            # Apply exponential scaling to widths if requested
+            if use_exponential_scaling:
+                width = math.sqrt(weight) * 3  # Adjust multiplier as needed
+            else:
+                width = weight * 3
+                
+            # Create curved edge by adding midpoint with offset
+            xmid = (x0 + x1) / 2
+            ymid = (y0 + y1) / 2
+            # Add slight curvature
+            curve_factor = 0.2
+            xmid += curve_factor * (y1 - y0)
+            ymid -= curve_factor * (x1 - x0)
+            
+            edge_trace.x = list(edge_trace.x) + [x0, xmid, x1, None]
+            edge_trace.y = list(edge_trace.y) + [y0, ymid, y1, None]
+            
+            # Store edge weights for line width customization
+            edge_weights.extend([width, width, width, None])
+            
+            # Hover text for edges
+            u_text = node_metadata[u]["text"]
+            v_text = node_metadata[v]["text"]
+            u_layer = node_metadata[u]["layer"]
+            v_layer = node_metadata[v]["layer"]
+            edge_text = f"Source: '{u_text}' (L{u_layer})<br>Target: '{v_text}' (L{v_layer})<br>Weight: {weight:.3f}"
+            edge_texts.extend([edge_text, edge_text, edge_text, None])
+            
+            # Store source-target token indices for path highlighting
+            source_idx = node_metadata[u]["token_idx"]
+            target_idx = node_metadata[v]["token_idx"]
+            edge_data.extend([[source_idx, target_idx], [source_idx, target_idx], [source_idx, target_idx], None])
+        
+        # Update edge trace with widths
+        edge_trace.line = dict(width=edge_weights, color='#888')
+        edge_trace.hoverinfo = 'text'
+        edge_trace.hovertext = edge_texts
+        edge_trace.customdata = edge_data
 
-        # Draw labels
-        labels = {
-            n: (node_metadata[n]["text"] + " " + node_metadata[n]["top_pred"]).strip()
-            for n in G.nodes()
-        }
-        nx.draw_networkx_labels(
-            G, pos, labels,
-            font_size=8,
-            font_family='DejaVu Sans',
-            bbox=dict(facecolor='white', alpha=0.7, boxstyle='round,pad=0.2')
+        # Combine traces
+        data = [edge_trace] + list(node_traces.values())
+        
+        # Create figure
+        fig = go.Figure(data=data)
+        
+        # Set layout
+        title = f"Interactive Semantic Trace Flow Graph for Token '{target_text}' (idx: {target_idx})"
+        
+        # Add layer labels (vertical lines)
+        shapes = []
+        annotations = []
+        
+        for i, layer_idx in enumerate(sorted(layer_nodes.keys())):
+            # Vertical lines to separate layers
+            if i > 0:  # Don't add line before first layer
+                shapes.append(dict(
+                    type="line",
+                    x0=i - 0.5,
+                    y0=-1,
+                    x1=i - 0.5,
+                    y1=1,
+                    line=dict(
+                        color="rgba(150, 150, 150, 0.4)",
+                        width=1,
+                        dash="dash"
+                    )
+                ))
+            
+            # Layer labels
+            annotations.append(dict(
+                x=i,
+                y=1.05,
+                xref="x",
+                yref="y",
+                text=f"Layer {layer_idx}",
+                showarrow=False,
+                font=dict(size=14, color="black"),
+            ))
+        
+        fig.update_layout(
+            title=title,
+            titlefont_size=16,
+            showlegend=True,
+            hovermode='closest',
+            margin=dict(b=50, l=50, r=50, t=100),
+            annotations=annotations,
+            shapes=shapes,
+            xaxis=dict(
+                showgrid=False,
+                zeroline=False,
+                showticklabels=False
+            ),
+            yaxis=dict(
+                showgrid=False,
+                zeroline=False,
+                showticklabels=False
+            ),
+            legend=dict(
+                title="Token Types",
+                yanchor="top",
+                y=0.99,
+                xanchor="left",
+                x=0.01,
+                font=dict(size=12)
+            ),
+            # Add custom buttons for highlighting and resetting
+            updatemenus=[
+                dict(
+                    type="buttons",
+                    direction="right",
+                    buttons=[
+                        dict(
+                            args=[{"visible": [True] * len(data)}],
+                            label="Reset View",
+                            method="update"
+                        )
+                    ],
+                    pad={"r": 10, "t": 10},
+                    showactive=False,
+                    x=0.1,
+                    xanchor="left",
+                    y=0,
+                    yanchor="top"
+                )
+            ]
         )
 
-        plt.title(f"Flow Graph for '{target_text}' (idx {target_idx})", fontsize=14)
-        plt.axis('off')
-        plt.tight_layout()
+        # Add JavaScript for interactivity
+        # This adds event handlers to highlight paths when nodes are clicked
+        fig.update_layout(
+            clickmode='event',
+            annotations=[
+                dict(
+                    x=0.5,
+                    y=-0.1,
+                    xref="paper",
+                    yref="paper",
+                    text="Click on any node to highlight its path. Double-click to reset.",
+                    showarrow=False,
+                    font=dict(size=12)
+                )
+            ]
+        )
 
-        # Save outputs
-        if output_format in ("png", "both"):
+        # Add interactive callback code via plotly's clientside_callback feature
+        # This JavaScript code will highlight nodes and edges when a node is clicked
+        fig.update_layout(
+            newshape_line_color='cyan',
+            # Include clientside callback for node click events
+            clickmode='event+select',
+        )
+        
+        # Add JavaScript to handle highlighting on click
+        # Note: This is injected into the HTML file after it's created
+        onclick_js = """
+        // This JavaScript handles interactive node highlighting
+        const gd = document.getElementById('{plot_id}');
+        
+        // Store original trace data to enable resetting
+        let originalOpacity = {};
+        let originalWidth = {};
+        let originalSize = {};
+        let originalColor = {};
+        let firstClick = true;
+        
+        gd.on('plotly_click', function(data) {
+            // Get the clicked point
+            const point = data.points[0];
+            
+            // Initialize storage on first click
+            if (firstClick) {
+                // Store original values for edges
+                const edgeTrace = gd.data[0];
+                originalOpacity['edge'] = edgeTrace.opacity;
+                originalWidth['edge'] = [...edgeTrace.line.width];
+                
+                // Store original values for nodes
+                for (let i = 1; i < gd.data.length; i++) {
+                    originalSize[i] = [...gd.data[i].marker.size];
+                    originalColor[i] = gd.data[i].marker.color;
+                }
+                firstClick = false;
+            }
+            
+            // Reset to original state
+            resetHighlighting();
+            
+            // If we clicked a node, highlight its path
+            if (point.customdata && point.curveNumber > 0) {
+                const clickedTokenIdx = point.customdata[0];
+                const clickedLayer = point.customdata[1];
+                
+                // Fade all nodes and edges
+                fadeAllElements();
+                
+                // Find connected paths and highlight them
+                highlightNodePath(clickedTokenIdx, clickedLayer);
+            }
+        });
+        
+        gd.on('plotly_doubleclick', function() {
+            // Reset all highlighting on double-click
+            resetHighlighting();
+        });
+        
+        function fadeAllElements() {
+            // Fade edges
+            const edgeTrace = gd.data[0];
+            const update = {
+                opacity: 0.15,
+                'line.width': edgeTrace.line.width.map(w => w ? Math.min(1, w/3) : null)
+            };
+            Plotly.restyle(gd, update, [0]);
+            
+            // Fade nodes
+            for (let i = 1; i < gd.data.length; i++) {
+                Plotly.restyle(gd, {
+                    'marker.opacity': 0.15,
+                    'marker.line.width': 0.5
+                }, [i]);
+            }
+        }
+        
+        function highlightNodePath(tokenIdx, layerIdx) {
+            // Highlight this specific node
+            for (let i = 1; i < gd.data.length; i++) {
+                const trace = gd.data[i];
+                const highlightIndices = [];
+                
+                // Find all points in this trace matching our token
+                trace.customdata.forEach((data, idx) => {
+                    if (data[0] === tokenIdx && data[1] === layerIdx) {
+                        highlightIndices.push(idx);
+                    }
+                });
+                
+                if (highlightIndices.length > 0) {
+                    // Create arrays of the same length as the trace points
+                    const opacity = Array(trace.x.length).fill(0.15);
+                    const lineWidth = Array(trace.x.length).fill(0.5);
+                    const sizes = [...originalSize[i]];
+                    
+                    // Update for highlighted points
+                    highlightIndices.forEach(idx => {
+                        opacity[idx] = 1;
+                        lineWidth[idx] = 2;
+                        sizes[idx] = sizes[idx] * 1.3;  // Make highlighted node larger
+                    });
+                    
+                    // Apply the updates
+                    Plotly.restyle(gd, {
+                        'marker.opacity': opacity,
+                        'marker.line.width': lineWidth,
+                        'marker.size': sizes
+                    }, [i]);
+                }
+            }
+            
+            // Highlight edges connected to this node
+            // Get edge trace
+            const edgeTrace = gd.data[0];
+            const edgeData = edgeTrace.customdata;
+            
+            // Create arrays for edge opacity and width
+            const edgeOpacity = Array(edgeData.length).fill(0.15);
+            const edgeWidth = [...originalWidth['edge']];
+            
+            // Mark edges to highlight (those connected to our token)
+            for (let i = 0; i < edgeData.length; i++) {
+                if (edgeData[i] === null) continue;
+                
+                // Check if this edge connects to our token
+                // (either as source or target)
+                if (edgeData[i][0] === tokenIdx || edgeData[i][1] === tokenIdx) {
+                    edgeOpacity[i] = 0.9;
+                    if (edgeWidth[i]) {
+                        edgeWidth[i] = edgeWidth[i] * 1.5;  // Make highlighted edges thicker
+                    }
+                }
+            }
+            
+            // Apply the updates to edges
+            Plotly.restyle(gd, {
+                opacity: edgeOpacity,
+                'line.width': edgeWidth
+            }, [0]);
+        }
+        
+        function resetHighlighting() {
+            // Only proceed if we've stored original values
+            if (firstClick) return;
+            
+            // Reset edges
+            Plotly.restyle(gd, {
+                opacity: originalOpacity['edge'],
+                'line.width': originalWidth['edge']
+            }, [0]);
+            
+            // Reset nodes
+            for (let i = 1; i < gd.data.length; i++) {
+                Plotly.restyle(gd, {
+                    'marker.opacity': 1,
+                    'marker.line.width': 1,
+                    'marker.size': originalSize[i],
+                    'marker.color': originalColor[i]
+                }, [i]);
+            }
+        }
+        """
+        
+        # Create output directories
+        html_dir = os.path.join(save_dir, "interactive")
+        os.makedirs(html_dir, exist_ok=True)
+        
+        # Save interactive HTML figure
+        html_path = os.path.join(html_dir, f"interactive_flow_graph_{target_idx}.html")
+        fig.write_html(
+            html_path, 
+            include_plotlyjs='cdn',
+            post_script=onclick_js.replace('{plot_id}', 'graph')
+        )
+        saved_paths.append(html_path)
+        
+        # Also save a static image for reference
+        if output_format in ["png", "both"]:
             png_path = os.path.join(save_dir, f"flow_graph_{target_idx}.png")
-            plt.savefig(png_path, dpi=dpi, bbox_inches='tight')
+            fig.write_image(png_path, width=1200, height=800, scale=2)
             saved_paths.append(png_path)
-        if output_format in ("svg", "both"):
-            mpl.rcParams['svg.fonttype'] = 'none'
+            
+        if output_format in ["svg", "both"]:
             svg_path = os.path.join(save_dir, f"flow_graph_{target_idx}.svg")
-            plt.savefig(svg_path, format='svg', bbox_inches='tight')
+            fig.write_image(svg_path, format="svg", width=1200, height=800)
             saved_paths.append(svg_path)
-        plt.close()
-
+        
+        print(f"Created interactive flow graph: {html_path}")
+        print(f"Created static image files for reference")
+        
         return saved_paths
 
-  
+
     def _calculate_flow_graph_node_sizes(
         self, G, node_metadata, use_variable_node_size, min_node_size, max_node_size, use_exponential_scaling
     ):
@@ -533,13 +901,13 @@ class EnhancedSemanticTracingVisualizer:
     
     def _sanitize_text_for_display(self, text):
         """
-        Sanitize text to avoid font rendering issues with special characters.
+        Sanitize text to avoid rendering issues with special characters.
         
         Args:
             text: Input text that may contain special characters (can be string or any other type)
             
         Returns:
-            Sanitized text that should render properly in matplotlib
+            Sanitized text that should render properly in plotly/html
         """
         # Convert to string if not already a string
         if not isinstance(text, str):
@@ -653,7 +1021,13 @@ class EnhancedSemanticTracingVisualizer:
                 gh, gw = bf["grid"]
                 heat = np.zeros((gh, gw), float)
                 for tid, w in weights.items():
-                    pos = bf["positions"].get(int(tid))
+                    # Convert string positions back to integers
+                    pos = None
+                    if str(tid) in bf["positions"]:
+                        pos = bf["positions"][str(tid)]
+                    elif tid in bf["positions"]:
+                        pos = bf["positions"][tid]
+                        
                     if pos:
                         r0, c0 = pos
                         if 0 <= r0 < gh and 0 <= c0 < gw:
@@ -682,7 +1056,13 @@ class EnhancedSemanticTracingVisualizer:
                 gh, gw = pf["grid_unpadded"]
                 heat = np.zeros((gh, gw), float)
                 for tid, w in weights.items():
-                    pos = pf["positions"].get(int(tid))
+                    # Convert string positions back to integers
+                    pos = None
+                    if str(tid) in pf["positions"]:
+                        pos = pf["positions"][str(tid)]
+                    elif tid in pf["positions"]:
+                        pos = pf["positions"][tid]
+                        
                     if pos:
                         r0, c0 = pos
                         if 0 <= r0 < gh and 0 <= c0 < gw:
@@ -815,7 +1195,8 @@ class EnhancedSemanticTracingVisualizer:
         colormap: str = "hot",
         alpha: float = 0.7,
         add_gridlines: bool = True,
-        use_grid_visualization: bool = True
+        use_grid_visualization: bool = True,
+        show_values: bool = True
     ) -> Optional[str]:
         """
         Create a heatmap overlay visualization for base image features.
@@ -833,6 +1214,7 @@ class EnhancedSemanticTracingVisualizer:
             alpha: Alpha blending value for overlay
             add_gridlines: Whether to add grid lines
             use_grid_visualization: Whether to use grid-based visualization
+            show_values: Whether to show numeric values in cells
             
         Returns:
             Path to saved visualization or None if failed
@@ -883,7 +1265,7 @@ class EnhancedSemanticTracingVisualizer:
                             ax.add_patch(rect)
                             
                             # Optionally add text showing value
-                            if cell_value > 0.25:  # Only show text for more significant cells
+                            if show_values and cell_value > 0.25:  # Only show text for more significant cells
                                 cell_center_x = x_start + cell_width / 2
                                 cell_center_y = y_start + cell_height / 2
                                 ax.text(
@@ -1242,68 +1624,3 @@ class EnhancedSemanticTracingVisualizer:
             import traceback
             traceback.print_exc()
             return saved_paths
-
-
-# Helper function to run the visualizer from a CSV file
-def visualize_semantic_tracing_csv(
-    csv_path: str,
-    metadata_path: Optional[str] = None,
-    image_path: Optional[str] = None,
-    output_dir: Optional[str] = None,
-    create_flow_graph: bool = True,
-    create_heatmaps: bool = True,
-    create_data_vis: bool = True,
-    flow_graph_params: Optional[Dict[str, Any]] = None,
-    heatmap_params: Optional[Dict[str, Any]] = None
-) -> Dict[str, List[str]]:
-    """
-    Convenience function to run the visualizer on a CSV file.
-    
-    Args:
-        csv_path: Path to the CSV file with trace data
-        metadata_path: Optional path to JSON metadata file
-        image_path: Path or URL to original image used in the trace
-        output_dir: Directory to save visualizations
-        create_flow_graph: Whether to create flow graph visualization
-        create_heatmaps: Whether to create heatmap visualizations
-        create_data_vis: Whether to create trace data visualizations
-        flow_graph_params: Parameters for flow graph visualization
-        heatmap_params: Parameters for heatmap visualization
-        
-    Returns:
-        Dictionary mapping visualization types to lists of generated file paths
-    """
-    # Set default output directory if not provided
-    if output_dir is None:
-        csv_dir = os.path.dirname(csv_path)
-        # Check if we're already in a visualizations directory
-        if "visualizations" in csv_dir:
-            output_dir = csv_dir
-        else:
-            output_dir = os.path.join(csv_dir, "visualizations")
-    
-    # Create visualizer and run it
-    visualizer = EnhancedSemanticTracingVisualizer(output_dir)
-    
-    # Set default flow graph parameters if not provided
-    if flow_graph_params is None:
-        flow_graph_params = {
-            "output_format": "both",
-            "align_tokens_by_layer": True,
-            "show_orphaned_nodes": True,  # Show all nodes by default
-            "min_edge_weight": 0.0,  # Show all edges by default
-            "use_variable_node_size": True,
-            "debug_mode": False
-        }
-    
-    # Run visualization
-    return visualizer.visualize_from_csv(
-        csv_path=csv_path,
-        metadata_path=metadata_path,
-        image_path=image_path,
-        create_flow_graph=create_flow_graph,
-        create_heatmaps=create_heatmaps,
-        create_data_vis=create_data_vis,
-        flow_graph_params=flow_graph_params,
-        heatmap_params=heatmap_params
-    )
