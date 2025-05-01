@@ -314,141 +314,173 @@ class EnhancedSemanticTracingVisualizer:
         min_node_size: int = 600,
         max_node_size: int = 1500,
         debug_mode: bool = False,
-        dpi: int = 100,  # lowered DPI for faster output
+        dpi: int = 100,
         show_continuation_edges: bool = False,
         use_exponential_scaling: bool = True
     ) -> List[str]:
         """
-        Create a token‐flow graph from trace CSV.
+        Create a token-flow graph from trace CSV using a multipartite layout.
 
-        Uses a multipartite layout to guarantee even vertical spacing
-        of all nodes in each layer column, removes the two‐pass edge
-        halo drawing for speed, and lowers default dpi from 150→100.
+        This implementation constructs a mapping from layer index to the list of nodes
+        in that layer, which satisfies NetworkX's requirement that subset_key.values()
+        be sequences. Other improvements include single-pass edge drawing and lowered DPI.
 
         Args:
-            trace_data: DataFrame of token‐trace records
-            target_text: Text of the target token
-            target_idx: Index of the target token
-            save_dir: Directory to save output files
-            output_format: "png", "svg", or "both"
-            align_tokens_by_layer: if True, use multipartite layout
-            show_orphaned_nodes: if False, drop isolated nodes
-            min_edge_weight: filter edges below this weight
-            use_variable_node_size: scale node by influence weight
-            min_node_size/max_node_size: node size bounds
-            debug_mode: extra printouts
-            dpi: DPI for raster output (lowered for speed)
-            show_continuation_edges: draw dashed edges for token‐continuations
-            use_exponential_scaling: apply sqrt scaling to weights
+            trace_data: DataFrame of token-trace records.
+            target_text: Text of the target token.
+            target_idx: Index of the target token.
+            save_dir: Directory in which to save output files.
+            output_format: 'png', 'svg', or 'both'.
+            align_tokens_by_layer: If True, use multipartite layout for even vertical spacing.
+            show_orphaned_nodes: If False, remove isolated nodes.
+            min_edge_weight: Minimum edge weight to include.
+            use_variable_node_size: Scale node sizes by weight.
+            min_node_size: Minimum node size.
+            max_node_size: Maximum node size.
+            debug_mode: If True, print debug information.
+            dpi: DPI for raster output.
+            show_continuation_edges: Draw dashed edges for token continuations (not used here).
+            use_exponential_scaling: If True, apply square-root scaling to weights.
+
         Returns:
-            list of saved file paths
+            A list of saved file paths.
         """
         saved_paths = []
         if trace_data.empty:
             print("No data for flow graph.")
             return saved_paths
 
+        # Build directed graph
         G = nx.DiGraph()
         layers = sorted(trace_data["layer"].unique())
         if debug_mode:
-            print(f"Layers: {layers}")
+            print(f"Detected layers: {layers}")
 
-        # build nodes
+        # Map from (layer, token_index) to node_id, and store metadata
         node_map = {}
         node_metadata = {}
         for _, row in trace_data.iterrows():
-            lid, tid = row["layer"], row["token_index"]
-            node_id = f"L{lid}_T{tid}"
-            node_map[(lid, tid)] = node_id
+            layer_idx = row["layer"]
+            token_idx_i = row["token_index"]
+            node_id = f"L{layer_idx}_T{token_idx_i}"
+            node_map[(layer_idx, token_idx_i)] = node_id
+
+            # Sanitize display text and predicted top token
             txt = self._sanitize_text_for_display(row["token_text"])
             pred = row.get("predicted_top_token", "")
-            pred = f"→{self._sanitize_text_for_display(pred)}" if pd.notna(pred) else ""
+            if pd.notna(pred) and pred:
+                pred = f"→{self._sanitize_text_for_display(pred)}"
+
             node_metadata[node_id] = {
                 "type": row["token_type"],
                 "text": txt,
                 "top_pred": pred,
                 "weight": row.get("predicted_top_prob", 1.0),
-                "layer": lid,
+                "layer": layer_idx,
                 "is_target": row["is_target"]
             }
             G.add_node(node_id)
 
-        # build edges
+        # Build edges based on source-target relationships and weight threshold
         for _, row in trace_data.iterrows():
-            if not row["is_target"] or pd.isna(row["sources_indices"]):
+            if not row["is_target"] or pd.isna(row.get("sources_indices", None)):
                 continue
-            tgt = node_map[(row["layer"], row["token_index"])]
-            src_idxs = [int(i) for i in str(row["sources_indices"]).split(",") if i]
-            wts      = [float(w) for w in str(row["sources_weights"]).split(",") if w]
-            for src_idx, w in zip(src_idxs, wts):
-                # find previous‐layer source
-                for pl in reversed(layers):
-                    key = (pl, src_idx)
+
+            target_node = node_map[(row["layer"], row["token_index"])]
+            src_indices = [int(i) for i in str(row["sources_indices"]).split(",") if i]
+            src_weights = [float(w) for w in str(row["sources_weights"]).split(",") if w]
+
+            for src_idx, weight in zip(src_indices, src_weights):
+                if weight < min_edge_weight:
+                    continue
+                # Find the latest previous layer that contains this source token
+                for prev_layer in reversed(layers):
+                    key = (prev_layer, src_idx)
                     if key in node_map:
-                        if w >= min_edge_weight:
-                            G.add_edge(node_map[key], tgt, weight=w)
+                        G.add_edge(node_map[key], target_node, weight=weight)
                         break
 
-        # remove orphans
+        # Optionally remove isolated nodes
         if not show_orphaned_nodes:
-            orphans = [n for n in G if G.degree(n) == 0]
+            orphans = [n for n in G.nodes() if G.degree(n) == 0]
             G.remove_nodes_from(orphans)
-
         if len(G) == 0:
             print("Graph empty after filtering.")
             return saved_paths
 
-        # layout: multipartite by layer
+        # Determine node positions
         if align_tokens_by_layer:
-            # 构建 node -> layer 的字典，替代 lambda
-            subset_key = {n: node_metadata[n]["layer"] for n in G.nodes()}
-            pos = nx.multipartite_layout(G, subset_key=subset_key)
+            # Build mapping from layer -> list of node_ids for multipartite layout
+            layer_nodes = defaultdict(list)
+            for node in G.nodes():
+                layer_nodes[node_metadata[node]["layer"]].append(node)
+            pos = nx.multipartite_layout(G, subset_key=layer_nodes)
         else:
             pos = nx.spring_layout(G, k=1.0, iterations=50)
 
-        # node sizes & colors
+        # Compute node sizes and colors
         sizes = self._calculate_flow_graph_node_sizes(
             G, node_metadata, use_variable_node_size,
             min_node_size, max_node_size, use_exponential_scaling
         )
-        cmap = {0: "#2ecc71", 1: "#3498db", 2: "#e74c3c"}
-        colors = [cmap[node_metadata[n]["type"]] for n in G]
+        color_map = {0: "#2ecc71", 1: "#3498db", 2: "#e74c3c"}
+        colors = [color_map[node_metadata[n]["type"]] for n in G.nodes()]
 
+        # Draw nodes
         plt.figure(figsize=(12, 8), dpi=dpi)
-        nx.draw_networkx_nodes(G, pos, node_size=sizes, node_color=colors,
-                               edgecolors='black', linewidths=0.5, alpha=0.8)
+        nx.draw_networkx_nodes(
+            G, pos,
+            node_size=sizes,
+            node_color=colors,
+            edgecolors='black',
+            linewidths=0.5,
+            alpha=0.8
+        )
 
-        edge_kw = dict(arrows=True, arrowsize=8, connectionstyle="arc3,rad=0.1")
+        # Draw edges in one pass
+        edge_kwargs = dict(arrows=True, arrowsize=8, connectionstyle="arc3,rad=0.1")
         for u, v, data in G.edges(data=True):
             w = data["weight"]
             width = (math.sqrt(w) if use_exponential_scaling else w) * 5.0
             if width >= min_edge_weight * 5.0:
-                nx.draw_networkx_edges(G, pos, edgelist=[(u, v)],
-                                       width=width, alpha=0.6, **edge_kw)
+                nx.draw_networkx_edges(
+                    G, pos,
+                    edgelist=[(u, v)],
+                    width=width,
+                    alpha=0.6,
+                    **edge_kwargs
+                )
 
-        labels = {n: (node_metadata[n]["text"] + " " + node_metadata[n]["top_pred"]).strip()
-                  for n in G}
-        nx.draw_networkx_labels(G, pos, labels,
-                                font_size=8, font_family='DejaVu Sans',
-                                bbox=dict(facecolor='white', alpha=0.7, boxstyle='round,pad=0.2'))
+        # Draw labels
+        labels = {
+            n: (node_metadata[n]["text"] + " " + node_metadata[n]["top_pred"]).strip()
+            for n in G.nodes()
+        }
+        nx.draw_networkx_labels(
+            G, pos, labels,
+            font_size=8,
+            font_family='DejaVu Sans',
+            bbox=dict(facecolor='white', alpha=0.7, boxstyle='round,pad=0.2')
+        )
 
         plt.title(f"Flow Graph for '{target_text}' (idx {target_idx})", fontsize=14)
         plt.axis('off')
         plt.tight_layout()
 
-        # save files
+        # Save outputs
         if output_format in ("png", "both"):
-            p = os.path.join(save_dir, f"flow_graph_{target_idx}.png")
-            plt.savefig(p, dpi=dpi, bbox_inches='tight')
-            saved_paths.append(p)
+            png_path = os.path.join(save_dir, f"flow_graph_{target_idx}.png")
+            plt.savefig(png_path, dpi=dpi, bbox_inches='tight')
+            saved_paths.append(png_path)
         if output_format in ("svg", "both"):
             mpl.rcParams['svg.fonttype'] = 'none'
-            p = os.path.join(save_dir, f"flow_graph_{target_idx}.svg")
-            plt.savefig(p, format='svg', bbox_inches='tight')
-            saved_paths.append(p)
+            svg_path = os.path.join(save_dir, f"flow_graph_{target_idx}.svg")
+            plt.savefig(svg_path, format='svg', bbox_inches='tight')
+            saved_paths.append(svg_path)
         plt.close()
 
         return saved_paths
+
   
     def _calculate_flow_graph_node_sizes(
         self, G, node_metadata, use_variable_node_size, min_node_size, max_node_size, use_exponential_scaling
