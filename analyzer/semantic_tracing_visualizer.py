@@ -354,7 +354,8 @@ class EnhancedSemanticTracingVisualizer:
             print(f"Layers: {layers}")
 
         # build nodes
-        node_map, node_metadata = {}, {}
+        node_map = {}
+        node_metadata = {}
         for _, row in trace_data.iterrows():
             lid, tid = row["layer"], row["token_index"]
             node_id = f"L{lid}_T{tid}"
@@ -362,14 +363,14 @@ class EnhancedSemanticTracingVisualizer:
             txt = self._sanitize_text_for_display(row["token_text"])
             pred = row.get("predicted_top_token", "")
             pred = f"→{self._sanitize_text_for_display(pred)}" if pd.notna(pred) else ""
-            node_metadata[node_id] = dict(
-                type=row["token_type"],
-                text=txt,
-                top_pred=pred,
-                weight=row.get("predicted_top_prob", 1.0),
-                layer=lid,
-                is_target=row["is_target"]
-            )
+            node_metadata[node_id] = {
+                "type": row["token_type"],
+                "text": txt,
+                "top_pred": pred,
+                "weight": row.get("predicted_top_prob", 1.0),
+                "layer": lid,
+                "is_target": row["is_target"]
+            }
             G.add_node(node_id)
 
         # build edges
@@ -385,47 +386,46 @@ class EnhancedSemanticTracingVisualizer:
                     key = (pl, src_idx)
                     if key in node_map:
                         if w >= min_edge_weight:
-                            G.add_edge(node_map[key], tgt, weight=w, is_continuation=False)
+                            G.add_edge(node_map[key], tgt, weight=w)
                         break
 
         # remove orphans
         if not show_orphaned_nodes:
-            orphans = [n for n in G if G.degree(n)==0]
+            orphans = [n for n in G if G.degree(n) == 0]
             G.remove_nodes_from(orphans)
 
-        if len(G)==0:
+        if len(G) == 0:
             print("Graph empty after filtering.")
             return saved_paths
 
-        # layout: use multipartite to evenly space nodes by layer
+        # layout: multipartite by layer
         if align_tokens_by_layer:
-            pos = nx.multipartite_layout(G, subset_key=lambda n: node_metadata[n]["layer"])
+            # 构建 node -> layer 的字典，替代 lambda
+            subset_key = {n: node_metadata[n]["layer"] for n in G.nodes()}
+            pos = nx.multipartite_layout(G, subset_key=subset_key)
         else:
-            # fallback: simple spring layout
             pos = nx.spring_layout(G, k=1.0, iterations=50)
 
-        # node sizes/colors
+        # node sizes & colors
         sizes = self._calculate_flow_graph_node_sizes(
             G, node_metadata, use_variable_node_size,
             min_node_size, max_node_size, use_exponential_scaling
         )
-        cmap = {0:"#2ecc71", 1:"#3498db", 2:"#e74c3c"}
+        cmap = {0: "#2ecc71", 1: "#3498db", 2: "#e74c3c"}
         colors = [cmap[node_metadata[n]["type"]] for n in G]
 
-        # draw
-        plt.figure(figsize=(12,8), dpi=dpi)
-        nx.draw_networkx_nodes(G, pos, node_size=sizes, node_color=colors, alpha=0.8,
-                               edgecolors='black', linewidths=0.5)
-        # draw all edges in one pass (no white halo)
+        plt.figure(figsize=(12, 8), dpi=dpi)
+        nx.draw_networkx_nodes(G, pos, node_size=sizes, node_color=colors,
+                               edgecolors='black', linewidths=0.5, alpha=0.8)
+
         edge_kw = dict(arrows=True, arrowsize=8, connectionstyle="arc3,rad=0.1")
-        for u,v,data in G.edges(data=True):
+        for u, v, data in G.edges(data=True):
             w = data["weight"]
             width = (math.sqrt(w) if use_exponential_scaling else w) * 5.0
-            if width >= min_edge_weight*5.0:
-                nx.draw_networkx_edges(G, pos, edgelist=[(u,v)], width=width,
-                                       alpha=0.6, **edge_kw)
+            if width >= min_edge_weight * 5.0:
+                nx.draw_networkx_edges(G, pos, edgelist=[(u, v)],
+                                       width=width, alpha=0.6, **edge_kw)
 
-        # labels
         labels = {n: (node_metadata[n]["text"] + " " + node_metadata[n]["top_pred"]).strip()
                   for n in G}
         nx.draw_networkx_labels(G, pos, labels,
@@ -436,15 +436,18 @@ class EnhancedSemanticTracingVisualizer:
         plt.axis('off')
         plt.tight_layout()
 
-        # save
-        if output_format in ("png","both"):
+        # save files
+        if output_format in ("png", "both"):
             p = os.path.join(save_dir, f"flow_graph_{target_idx}.png")
-            plt.savefig(p, dpi=dpi, bbox_inches='tight'); saved_paths.append(p)
-        if output_format in ("svg","both"):
+            plt.savefig(p, dpi=dpi, bbox_inches='tight')
+            saved_paths.append(p)
+        if output_format in ("svg", "both"):
             mpl.rcParams['svg.fonttype'] = 'none'
             p = os.path.join(save_dir, f"flow_graph_{target_idx}.svg")
-            plt.savefig(p, format='svg', bbox_inches='tight'); saved_paths.append(p)
+            plt.savefig(p, format='svg', bbox_inches='tight')
+            saved_paths.append(p)
         plt.close()
+
         return saved_paths
   
     def _calculate_flow_graph_node_sizes(
@@ -562,74 +565,73 @@ class EnhancedSemanticTracingVisualizer:
         save_dir: str,
         feature_mapping: Dict[str, Any],
         use_grid_visualization: bool = True,
-        show_values: bool = True
+        show_values: bool = True,
+        composite_only: bool = False
     ) -> List[str]:
         """
-        Create per-layer and grid-composite heatmaps for both base and patch features.
+        Create per-layer and grid-composite heatmaps for base and patch features.
 
-        For each layer:
-          - if there is base-feature data, generate one heatmap and save under base_dir/
-          - if there is patch-feature data, generate one heatmap and save under patch_dir/
-        Then build two grid composites:
-          - one for all base-layer maps
-          - one for all patch-layer maps
-
-        Layers with no data will remain blank panels in the grid.
-        Entire composite is skipped if no layer produced any map.
-
-        Returns list of saved file paths.
+        Args:
+            trace_data: DataFrame of token‐trace records
+            target_text: Text of the target token
+            target_idx: Index of the target token
+            image_path: Path to original image
+            save_dir: Directory to save output files
+            feature_mapping: Metadata mapping for features
+            use_grid_visualization: Whether to use grid overlay
+            show_values: Whether to annotate cell values
+            composite_only: If True, skip individual-layer maps
+        Returns:
+            list of saved file paths
         """
         saved_paths = []
 
-        # prepare output directories
-        base_dir  = os.path.join(save_dir, "base_heatmaps")
+        base_dir = os.path.join(save_dir, "base_heatmaps")
         patch_dir = os.path.join(save_dir, "patch_heatmaps")
-        os.makedirs(base_dir,  exist_ok=True)
+        os.makedirs(base_dir, exist_ok=True)
         os.makedirs(patch_dir, exist_ok=True)
 
-        # load image and preview
         img = Image.open(image_path)
         preview = img.copy()
         if "resized_dimensions" in feature_mapping:
-            w,h = feature_mapping["resized_dimensions"]
-            preview = preview.resize((w,h), Image.LANCZOS)
+            w, h = feature_mapping["resized_dimensions"]
+            preview = preview.resize((w, h), Image.LANCZOS)
 
         layers = sorted(trace_data["layer"].unique())
-
-        # per-layer generation (same as before)
         layer_base_maps = {}
         layer_patch_maps = {}
 
         for L in layers:
-            dfL = trace_data[trace_data["layer"]==L]
-            img_toks = dfL[dfL["token_type"]==2]
+            dfL = trace_data[trace_data["layer"] == L]
+            img_toks = dfL[dfL["token_type"] == 2]
             if img_toks.empty:
-                # record blank
                 layer_base_maps[L] = None
                 layer_patch_maps[L] = None
                 continue
 
             mx = img_toks["predicted_top_prob"].max()
-            weights = {int(r.token_index): r.predicted_top_prob/mx
-                       for _,r in img_toks.iterrows() if mx>0}
+            weights = {
+                int(r.token_index): r.predicted_top_prob / mx
+                for _, r in img_toks.iterrows() if mx > 0
+            }
 
-            # base
-            base_info = feature_mapping.get("base_feature", {})
-            if base_info.get("grid") and base_info.get("positions"):
-                gh,gw = base_info["grid"]
-                heat = np.zeros((gh,gw),float)
-                for tid,w in weights.items():
-                    pos = base_info["positions"].get(int(tid))
+            # Base feature map
+            bf = feature_mapping.get("base_feature", {})
+            if bf.get("grid") and bf.get("positions"):
+                gh, gw = bf["grid"]
+                heat = np.zeros((gh, gw), float)
+                for tid, w in weights.items():
+                    pos = bf["positions"].get(int(tid))
                     if pos:
-                        r,c = pos
-                        if 0<=r<gh and 0<=c<gw:
-                            heat[r,c] = w
-                layer_base_maps[L] = heat if heat.max()>0 else None
-                if layer_base_maps[L] is not None:
+                        r0, c0 = pos
+                        if 0 <= r0 < gh and 0 <= c0 < gw:
+                            heat[r0, c0] = w
+                layer_base_maps[L] = heat if heat.max() > 0 else None
+                if not composite_only and layer_base_maps[L] is not None:
                     p = self._create_base_feature_overlay(
                         heatmap=heat,
                         original_image=img,
-                        grid_size=(gh,gw),
+                        grid_size=(gh, gw),
                         layer_idx=L,
                         target_idx=target_idx,
                         title=f"Base Influence L{L}",
@@ -637,41 +639,42 @@ class EnhancedSemanticTracingVisualizer:
                         use_grid_visualization=use_grid_visualization,
                         show_values=show_values
                     )
-                    if p: saved_paths.append(p)
+                    if p:
+                        saved_paths.append(p)
             else:
                 layer_base_maps[L] = None
 
-            # patch
-            patch_info = feature_mapping.get("patch_feature", {})
-            if patch_info.get("grid_unpadded") and patch_info.get("positions"):
-                gh,gw = patch_info["grid_unpadded"]
-                heat = np.zeros((gh,gw),float)
-                for tid,w in weights.items():
-                    pos = patch_info["positions"].get(int(tid))
+            # Patch feature map
+            pf = feature_mapping.get("patch_feature", {})
+            if pf.get("grid_unpadded") and pf.get("positions"):
+                gh, gw = pf["grid_unpadded"]
+                heat = np.zeros((gh, gw), float)
+                for tid, w in weights.items():
+                    pos = pf["positions"].get(int(tid))
                     if pos:
-                        r,c = pos
-                        if 0<=r<gh and 0<=c<gw:
-                            heat[r,c] = w
-                layer_patch_maps[L] = heat if heat.max()>0 else None
-                if layer_patch_maps[L] is not None:
+                        r0, c0 = pos
+                        if 0 <= r0 < gh and 0 <= c0 < gw:
+                            heat[r0, c0] = w
+                layer_patch_maps[L] = heat if heat.max() > 0 else None
+                if not composite_only and layer_patch_maps[L] is not None:
                     p = self._create_patch_feature_overlay(
                         heatmap=heat,
                         spatial_preview_image=preview,
                         feature_mapping=feature_mapping,
-                        patch_size=feature_mapping.get("patch_size",14),
+                        patch_size=feature_mapping.get("patch_size", 14),
                         layer_idx=L,
                         target_idx=target_idx,
                         title=f"Patch Influence L{L}",
                         save_path=os.path.join(patch_dir, f"patch_L{L}.png"),
                         show_values=show_values
                     )
-                    if p: saved_paths.append(p)
+                    if p:
+                        saved_paths.append(p)
             else:
                 layer_patch_maps[L] = None
 
-        # grid composites
-        # 1) base
-        valid_base = [L for L,hm in layer_base_maps.items() if hm is not None]
+        # Composite grids (always generate if any valid)
+        valid_base = [L for L, hm in layer_base_maps.items() if hm is not None]
         if valid_base:
             out = os.path.join(save_dir, f"composite_base_grid_{target_idx}.png")
             p = self._create_grid_composite(
@@ -682,10 +685,10 @@ class EnhancedSemanticTracingVisualizer:
                 cmap="hot",
                 show_values=show_values
             )
-            if p: saved_paths.append(p)
+            if p:
+                saved_paths.append(p)
 
-        # 2) patch
-        valid_patch = [L for L,hm in layer_patch_maps.items() if hm is not None]
+        valid_patch = [L for L, hm in layer_patch_maps.items() if hm is not None]
         if valid_patch:
             out = os.path.join(save_dir, f"composite_patch_grid_{target_idx}.png")
             p = self._create_grid_composite(
@@ -696,9 +699,11 @@ class EnhancedSemanticTracingVisualizer:
                 cmap="hot",
                 show_values=show_values
             )
-            if p: saved_paths.append(p)
+            if p:
+                saved_paths.append(p)
 
         return saved_paths
+
 
 
     def _create_grid_composite(
