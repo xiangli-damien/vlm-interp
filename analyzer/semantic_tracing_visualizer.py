@@ -347,6 +347,8 @@ class EnhancedSemanticTracingVisualizer:
         Returns:
             List of paths to saved visualization files
         """
+        import plotly.graph_objects as go
+        
         saved_paths = []
         if trace_data.empty:
             print("No data for interactive flow graph.")
@@ -418,7 +420,7 @@ class EnhancedSemanticTracingVisualizer:
             orphans = [n for n in G.nodes() if G.degree(n) == 0]
             G.remove_nodes_from(orphans)
             
-        # Filter nodes if needed
+        # Check if we have nodes to visualize
         if len(G) == 0:
             print("Graph empty after filtering.")
             return saved_paths
@@ -490,32 +492,24 @@ class EnhancedSemanticTracingVisualizer:
             # Store token index in customdata for path highlighting
             node_traces[token_type].customdata = list(node_traces[token_type].customdata) + [[token_idx, layer]]
         
-        # Create edge trace
-        edge_trace = go.Scatter(
-            x=[],
-            y=[],
-            line=dict(width=1, color='#888'),
-            hoverinfo='none',
-            mode='lines',
-            opacity=0.6
-        )
-        
-        # Add edges to trace
-        edge_weights = []
-        edge_texts = []
-        edge_data = []  # Store source-target pairs for highlighting
+        # Create edges - FIX: Create separate traces for each edge instead of a single trace with variable width
+        edge_traces = []
+        edge_data = {}  # Store all edge data for highlighting
         
         for u, v, data in G.edges(data=True):
             x0, y0 = pos[u]
             x1, y1 = pos[v]
             weight = data.get('weight', 0.0)
             
-            # Apply exponential scaling to widths if requested
+            # Apply exponential scaling to width if requested
             if use_exponential_scaling:
                 width = math.sqrt(weight) * 3  # Adjust multiplier as needed
             else:
                 width = weight * 3
-                
+            
+            # Make sure width is at least 1 for visibility
+            width = max(0.5, min(10, width))  # Clamp between 0.5 and 10
+            
             # Create curved edge by adding midpoint with offset
             xmid = (x0 + x1) / 2
             ymid = (y0 + y1) / 2
@@ -524,33 +518,48 @@ class EnhancedSemanticTracingVisualizer:
             xmid += curve_factor * (y1 - y0)
             ymid -= curve_factor * (x1 - x0)
             
-            edge_trace.x = list(edge_trace.x) + [x0, xmid, x1, None]
-            edge_trace.y = list(edge_trace.y) + [y0, ymid, y1, None]
-            
-            # Store edge weights for line width customization
-            edge_weights.extend([width, width, width, None])
-            
-            # Hover text for edges
+            # Hover text for this edge
             u_text = node_metadata[u]["text"]
             v_text = node_metadata[v]["text"]
             u_layer = node_metadata[u]["layer"]
             v_layer = node_metadata[v]["layer"]
             edge_text = f"Source: '{u_text}' (L{u_layer})<br>Target: '{v_text}' (L{v_layer})<br>Weight: {weight:.3f}"
-            edge_texts.extend([edge_text, edge_text, edge_text, None])
             
             # Store source-target token indices for path highlighting
             source_idx = node_metadata[u]["token_idx"]
             target_idx = node_metadata[v]["token_idx"]
-            edge_data.extend([[source_idx, target_idx], [source_idx, target_idx], [source_idx, target_idx], None])
-        
-        # Update edge trace with widths
-        edge_trace.line = dict(width=edge_weights, color='#888')
-        edge_trace.hoverinfo = 'text'
-        edge_trace.hovertext = edge_texts
-        edge_trace.customdata = edge_data
+            
+            # Edge alpha scaled by weight, but never below 0.2 for visibility
+            alpha = min(0.9, max(0.2, weight))
+            
+            # Create edge trace for this specific edge
+            edge_trace = go.Scatter(
+                x=[x0, xmid, x1, None],
+                y=[y0, ymid, y1, None],
+                mode='lines',
+                line=dict(
+                    width=width,  # Single width for this edge
+                    color=f'rgba(136, 136, 136, {alpha})'
+                ),
+                hoverinfo='text',
+                hovertext=[edge_text, edge_text, edge_text, None],
+                showlegend=False,
+                customdata=[[source_idx, target_idx], [source_idx, target_idx], [source_idx, target_idx], None]
+            )
+            
+            edge_traces.append(edge_trace)
+            
+            # Store edge data for highlighting
+            edge_key = f"{u}_{v}"
+            edge_data[edge_key] = {
+                "source_idx": source_idx,
+                "target_idx": target_idx,
+                "weight": weight,
+                "trace_index": len(edge_traces) - 1
+            }
 
-        # Combine traces
-        data = [edge_trace] + list(node_traces.values())
+        # Combine all traces - edge traces first, then node traces
+        data = edge_traces + list(node_traces.values())
         
         # Create figure
         fig = go.Figure(data=data)
@@ -642,6 +651,7 @@ class EnhancedSemanticTracingVisualizer:
         fig.update_layout(
             clickmode='event',
             annotations=[
+                *fig.layout.annotations,
                 dict(
                     x=0.5,
                     y=-0.1,
@@ -655,15 +665,13 @@ class EnhancedSemanticTracingVisualizer:
         )
 
         # Add interactive callback code via plotly's clientside_callback feature
-        # This JavaScript code will highlight nodes and edges when a node is clicked
         fig.update_layout(
             newshape_line_color='cyan',
-            # Include clientside callback for node click events
             clickmode='event+select',
         )
         
         # Add JavaScript to handle highlighting on click
-        # Note: This is injected into the HTML file after it's created
+        # Adjusted for individual edge traces
         onclick_js = """
         // This JavaScript handles interactive node highlighting
         const gd = document.getElementById('{plot_id}');
@@ -671,9 +679,10 @@ class EnhancedSemanticTracingVisualizer:
         // Store original trace data to enable resetting
         let originalOpacity = {};
         let originalWidth = {};
-        let originalSize = {};
         let originalColor = {};
+        let originalSize = {};
         let firstClick = true;
+        let numEdgeTraces = 0;  // Will be set on first click
         
         gd.on('plotly_click', function(data) {
             // Get the clicked point
@@ -681,13 +690,19 @@ class EnhancedSemanticTracingVisualizer:
             
             // Initialize storage on first click
             if (firstClick) {
-                // Store original values for edges
-                const edgeTrace = gd.data[0];
-                originalOpacity['edge'] = edgeTrace.opacity;
-                originalWidth['edge'] = [...edgeTrace.line.width];
+                // Count edge traces (all traces before the node traces, which are the last 3)
+                numEdgeTraces = gd.data.length - 3;
                 
-                // Store original values for nodes
-                for (let i = 1; i < gd.data.length; i++) {
+                // Store original values
+                // For edges (each edge is a separate trace)
+                for (let i = 0; i < numEdgeTraces; i++) {
+                    let edgeTrace = gd.data[i];
+                    originalOpacity[i] = edgeTrace.line.color;
+                    originalWidth[i] = edgeTrace.line.width;
+                }
+                
+                // For nodes
+                for (let i = numEdgeTraces; i < gd.data.length; i++) {
                     originalSize[i] = [...gd.data[i].marker.size];
                     originalColor[i] = gd.data[i].marker.color;
                 }
@@ -697,8 +712,8 @@ class EnhancedSemanticTracingVisualizer:
             // Reset to original state
             resetHighlighting();
             
-            // If we clicked a node, highlight its path
-            if (point.customdata && point.curveNumber > 0) {
+            // If we clicked a node (not an edge), highlight its path
+            if (point.customdata && point.curveNumber >= numEdgeTraces) {
                 const clickedTokenIdx = point.customdata[0];
                 const clickedLayer = point.customdata[1];
                 
@@ -716,16 +731,29 @@ class EnhancedSemanticTracingVisualizer:
         });
         
         function fadeAllElements() {
-            // Fade edges
-            const edgeTrace = gd.data[0];
-            const update = {
-                opacity: 0.15,
-                'line.width': edgeTrace.line.width.map(w => w ? Math.min(1, w/3) : null)
-            };
-            Plotly.restyle(gd, update, [0]);
+            // Fade edges - each edge is a separate trace
+            for (let i = 0; i < numEdgeTraces; i++) {
+                let edgeTrace = gd.data[i];
+                // Get original color and make it transparent
+                let origColor = originalOpacity[i];
+                let fadeColor = origColor;
+                if (origColor.startsWith('rgba')) {
+                    // Parse rgba and change alpha
+                    let colorParts = origColor.replace('rgba(', '').replace(')', '').split(',');
+                    fadeColor = `rgba(${colorParts[0]},${colorParts[1]},${colorParts[2]},0.15)`;
+                } else {
+                    // Default color with low alpha
+                    fadeColor = 'rgba(136,136,136,0.15)';
+                }
+                
+                Plotly.restyle(gd, {
+                    'line.color': fadeColor,
+                    'line.width': Math.min(1, originalWidth[i]/3)
+                }, [i]);
+            }
             
             // Fade nodes
-            for (let i = 1; i < gd.data.length; i++) {
+            for (let i = numEdgeTraces; i < gd.data.length; i++) {
                 Plotly.restyle(gd, {
                     'marker.opacity': 0.15,
                     'marker.line.width': 0.5
@@ -735,13 +763,13 @@ class EnhancedSemanticTracingVisualizer:
         
         function highlightNodePath(tokenIdx, layerIdx) {
             // Highlight this specific node
-            for (let i = 1; i < gd.data.length; i++) {
+            for (let i = numEdgeTraces; i < gd.data.length; i++) {
                 const trace = gd.data[i];
                 const highlightIndices = [];
                 
                 // Find all points in this trace matching our token
                 trace.customdata.forEach((data, idx) => {
-                    if (data[0] === tokenIdx && data[1] === layerIdx) {
+                    if (data && data[0] === tokenIdx && data[1] === layerIdx) {
                         highlightIndices.push(idx);
                     }
                 });
@@ -769,33 +797,34 @@ class EnhancedSemanticTracingVisualizer:
             }
             
             // Highlight edges connected to this node
-            // Get edge trace
-            const edgeTrace = gd.data[0];
-            const edgeData = edgeTrace.customdata;
-            
-            // Create arrays for edge opacity and width
-            const edgeOpacity = Array(edgeData.length).fill(0.15);
-            const edgeWidth = [...originalWidth['edge']];
-            
-            // Mark edges to highlight (those connected to our token)
-            for (let i = 0; i < edgeData.length; i++) {
-                if (edgeData[i] === null) continue;
+            // Each edge is a separate trace
+            for (let i = 0; i < numEdgeTraces; i++) {
+                const edgeTrace = gd.data[i];
+                const edgeData = edgeTrace.customdata[0];  // First point has the data
+                
+                if (!edgeData) continue;
                 
                 // Check if this edge connects to our token
-                // (either as source or target)
-                if (edgeData[i][0] === tokenIdx || edgeData[i][1] === tokenIdx) {
-                    edgeOpacity[i] = 0.9;
-                    if (edgeWidth[i]) {
-                        edgeWidth[i] = edgeWidth[i] * 1.5;  // Make highlighted edges thicker
+                if (edgeData[0] === tokenIdx || edgeData[1] === tokenIdx) {
+                    // Highlight this edge
+                    let origColor = originalOpacity[i];
+                    let highlightColor = origColor;
+                    
+                    if (origColor.startsWith('rgba')) {
+                        // Parse rgba and increase alpha
+                        let colorParts = origColor.replace('rgba(', '').replace(')', '').split(',');
+                        highlightColor = `rgba(${colorParts[0]},${colorParts[1]},${colorParts[2]},0.9)`;
+                    } else {
+                        // Default highlight color
+                        highlightColor = 'rgba(136,136,136,0.9)';
                     }
+                    
+                    Plotly.restyle(gd, {
+                        'line.color': highlightColor,
+                        'line.width': originalWidth[i] * 1.5  // Make highlighted edge thicker
+                    }, [i]);
                 }
             }
-            
-            // Apply the updates to edges
-            Plotly.restyle(gd, {
-                opacity: edgeOpacity,
-                'line.width': edgeWidth
-            }, [0]);
         }
         
         function resetHighlighting() {
@@ -803,13 +832,15 @@ class EnhancedSemanticTracingVisualizer:
             if (firstClick) return;
             
             // Reset edges
-            Plotly.restyle(gd, {
-                opacity: originalOpacity['edge'],
-                'line.width': originalWidth['edge']
-            }, [0]);
+            for (let i = 0; i < numEdgeTraces; i++) {
+                Plotly.restyle(gd, {
+                    'line.color': originalOpacity[i],
+                    'line.width': originalWidth[i]
+                }, [i]);
+            }
             
             // Reset nodes
-            for (let i = 1; i < gd.data.length; i++) {
+            for (let i = numEdgeTraces; i < gd.data.length; i++) {
                 Plotly.restyle(gd, {
                     'marker.opacity': 1,
                     'marker.line.width': 1,
