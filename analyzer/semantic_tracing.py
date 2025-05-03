@@ -1,7 +1,8 @@
 """
 Semantic tracing for VLMs: Combines saliency analysis with logit lens to track 
 information flow through model layers, revealing how concepts evolve in the
-model's reasoning process. Optimized version with memory efficiency improvements.
+model's reasoning process. Optimized version with memory efficiency improvements
+and fixes for numerical stability and edge cases.
 """
 
 import torch
@@ -49,7 +50,7 @@ class EnhancedSemanticTracer:
         max_keep: int = 30,        # Maximum nodes to keep per target
         min_keep_layer: int = 5,   # Minimum nodes to keep per layer
         max_keep_layer: int = 100, # Maximum nodes to keep per layer
-        epsilon: float = 1e-6,     # Small value to inject for numerical stability
+        epsilon: float = 1e-4,     # Small value to inject for numerical stability (increased from 1e-6)
         debug: bool = False,
     ):
         """
@@ -82,7 +83,7 @@ class EnhancedSemanticTracer:
         self.layer_batch_size = layer_batch_size
         self.normalize_weights = normalize_weights
         self.debug = debug
-        self.epsilon = epsilon  # Small constant for numerical stability
+        self.epsilon = epsilon  # Increased from 1e-6 to 1e-4 for better numerical stability
         
         # Handle deprecated top_k parameter
         if top_k is not None:
@@ -136,6 +137,7 @@ class EnhancedSemanticTracer:
         print(f"Initialized EnhancedSemanticTracer with {self.num_layers} attention layers")
         print(f"Coverage-based node selection: β_target={beta_target}, β_layer={beta_layer}")
         print(f"Node limits: min_keep={min_keep}, max_keep={max_keep}, min_keep_layer={min_keep_layer}, max_keep_layer={max_keep_layer}")
+        print(f"Numerical stability epsilon: {epsilon}")
     
     def _get_layer_idx(self, layer_name_or_idx):
         """Helper to get consistent layer index from name or index"""
@@ -217,7 +219,7 @@ class EnhancedSemanticTracer:
     def renormalize_weights(
         self, 
         weights: Dict[int, float], 
-        min_value: float = 1e-6
+        min_value: float = 1e-4  # Increased from 1e-6 for better numerical stability
     ) -> Dict[int, float]:
         """
         Safely renormalize a dictionary of weights, handling zero-sum cases.
@@ -727,6 +729,7 @@ class EnhancedSemanticTracer:
                     print(f"[DBG][layer {layer_idx}] Target {target_idx} vector sum: {target_vector.sum().item():.4e}")
                 
                 # Get indices of important source tokens using coverage-based selection
+                # Note: For attention, we don't need to take abs() as attention weights are always non-negative
                 selected_indices, selected_values = self.select_sources(
                     target_vector,
                     beta_target=self.beta_target,
@@ -816,7 +819,9 @@ class EnhancedSemanticTracer:
                     for token_idx in all_token_indices:
                         # Find if this token is a target
                         is_target = any(t["index"] == token_idx for t in layer_results["target_tokens"])
+                        
                         # Find if this token is a source and for which target(s)
+                        # Modified to track all targets this token is a source for
                         source_targets = []
                         for t in layer_results["target_tokens"]:
                             for s in t["sources"]:
@@ -852,7 +857,7 @@ class EnhancedSemanticTracer:
                             "token_id": all_token_ids[token_idx],
                             "token_type": token_types[token_idx].item(),
                             "is_target": is_target,
-                            "source_for_targets": source_targets,
+                            "source_for_targets": ",".join(map(str, source_targets)),  # Store as comma-separated list
                             "predicted_top_token": sanitized_pred_text,
                             "predicted_top_prob": top_pred_prob,
                             "trace_id": trace_id,
@@ -878,15 +883,33 @@ class EnhancedSemanticTracer:
                             
                         trace_records.append(record)
             
-            # 4. Layer-level source node pruning
-            all_sources = []
+            # 4. Layer-level source node pruning - OPTIMIZED to avoid duplicates
+            # Aggregate sources by index to avoid duplicates
+            aggregated_sources = {}
             for target_idx, sources in target_to_sources.items():
-                all_sources.extend(sources)
+                for source in sources:
+                    idx = source["index"]
+                    weight = source["scaled_weight"]
+                    
+                    if idx in aggregated_sources:
+                        # Sum weights from different targets
+                        aggregated_sources[idx]["scaled_weight"] += weight
+                    else:
+                        # Create a copy to avoid modifying the original
+                        aggregated_sources[idx] = source.copy()
             
-            if all_sources:
-                # Apply layer-level pruning
+            # Convert to list for pruning
+            unique_sources_list = list(aggregated_sources.values())
+            
+            # Debug: Print unique vs total count
+            if self.debug:
+                print(f"[DBG][layer {layer_idx}] Sources before de-duplication: {sum(len(srcs) for srcs in target_to_sources.values())}")
+                print(f"[DBG][layer {layer_idx}] Unique sources after de-duplication: {len(unique_sources_list)}")
+            
+            if unique_sources_list:
+                # Apply layer-level pruning to the unique sources
                 pruned_sources = self.layer_post_prune(
-                    all_sources,
+                    unique_sources_list,
                     beta_layer=self.beta_layer,
                     min_keep_layer=self.min_keep_layer,
                     max_keep_layer=self.max_keep_layer
@@ -894,7 +917,7 @@ class EnhancedSemanticTracer:
                 
                 # Debug: Print pruning results
                 if self.debug:
-                    print(f"[DBG][layer {layer_idx}] Pruned {len(all_sources)} -> {len(pruned_sources)} sources")
+                    print(f"[DBG][layer {layer_idx}] Pruned {len(unique_sources_list)} -> {len(pruned_sources)} unique sources")
                 
                 # Create a set of remaining source indices after pruning
                 remaining_source_indices = set(s["index"] for s in pruned_sources)
@@ -976,40 +999,41 @@ class EnhancedSemanticTracer:
         Returns:
             Tuple of (selected indices, selected values)
         """
+        # For saliency values, take absolute values for importance-based sorting
+        # (attention values are already non-negative, so this won't change them)
+        importance = target_vector.abs()
+        
+        # Always add epsilon for numerical stability
+        importance = importance + self.epsilon
+        
         # 1. Sort values and indices by importance (descending)
-        vals, idxs = torch.sort(target_vector, descending=True)
+        vals, idxs = torch.sort(importance, descending=True)
         
-        # 2. Handle zero-sum case: inject a small epsilon to avoid zero division
-        if vals.sum() == 0 or vals.sum() < self.epsilon:
-            # Inject epsilon into all values and re-normalize
-            vals_with_eps = torch.ones_like(vals[:min_keep]) * self.epsilon
-            
-            # Keep at least min_keep elements
-            keep = torch.zeros_like(vals, dtype=torch.bool)
-            keep[:min_keep] = True
-            
-            if self.debug:
-                print(f"Warning: Zero-sum vector. Injecting epsilon={self.epsilon} and keeping {min_keep} values.")
-            
-            return idxs[keep], vals_with_eps
+        # Get the original values (maintaining signs for saliency case)
+        original_vals = target_vector[idxs]
         
-        # 3. Calculate cumulative coverage
+        # 2. Calculate cumulative coverage based on importance
         cum = torch.cumsum(vals, 0)
         coverage = cum / cum[-1]
         
-        # 4. Create boolean mask for selected indices
+        # 3. Create boolean mask for selected indices
         keep = coverage <= beta_target
         
-        # 5. Apply min/max constraints
+        # 4. Apply min/max constraints
         keep[:min_keep] = True  # Always keep at least min_keep
         if keep.sum() > max_keep:
             keep[max_keep:] = False  # Keep at most max_keep
             
         if self.debug:
             print(f"Selected {keep.sum().item()} sources from {len(vals)} candidates (coverage {beta_target:.2f})")
+            
+            # Debug: show importance distribution
+            if len(vals) > 0:
+                print(f"Top importance values: {vals[:5].tolist()}")
+                print(f"Importance values sum: {vals.sum().item():.4e}")
         
-        # 6. Return selected indices and their values
-        return idxs[keep], vals[keep]
+        # 5. Return selected indices and their ORIGINAL values (not importance-based values)
+        return idxs[keep], original_vals[keep]
     
     def layer_post_prune(
         self,
@@ -1042,30 +1066,34 @@ class EnhancedSemanticTracer:
                 print(f"Layer pruning: Only {len(src_nodes)} available, less than min_keep_layer={min_keep_layer}. Keeping all.")
             return src_nodes
         
-        # 1. Sort nodes by scaled_weight (decreasing)
-        sorted_nodes = sorted(src_nodes, key=lambda x: x.get('scaled_weight', 0), reverse=True)
+        # Get unique source indices count before pruning
+        unique_src_indices = {s["index"] for s in src_nodes}
+        if self.debug:
+            print(f"Layer pruning: Processing {len(unique_src_indices)} unique source nodes")
+        
+        # 1. Sort nodes by absolute scaled_weight (decreasing)
+        # Use abs() for sorting to ensure consistency with saliency tracing
+        sorted_nodes = sorted(src_nodes, key=lambda x: abs(x.get('scaled_weight', 0)), reverse=True)
         
         # Extract weights as tensor for easier calculation
-        weights = torch.tensor([n.get('scaled_weight', 0) for n in sorted_nodes])
+        weights = torch.tensor([abs(n.get('scaled_weight', 0)) for n in sorted_nodes])
         
-        # 2. Handle zero-sum case
-        if weights.sum() == 0 or weights.sum() < self.epsilon:
-            if self.debug:
-                print(f"Warning: Zero-sum in layer pruning. Keeping minimum {min_keep_layer} nodes.")
-            return sorted_nodes[:min_keep_layer]
+        # Add epsilon for stability
+        weights = weights + self.epsilon
         
-        # 3. Calculate cumulative coverage
-        cov = torch.cumsum(weights, 0) / weights.sum()
+        # 2. Calculate cumulative coverage
+        cum_sum = torch.cumsum(weights, 0)
+        coverage = cum_sum / cum_sum[-1]
         
-        # 4. Create boolean mask for keeping nodes
-        keep_mask = cov <= beta_layer
+        # 3. Create boolean mask for keeping nodes
+        keep_mask = coverage <= beta_layer
         
-        # 5. Apply min/max constraints
+        # 4. Apply min/max constraints
         keep_mask[:min_keep_layer] = True  # Always keep at least min_keep_layer
         if keep_mask.sum() > max_keep_layer:
             keep_mask[max_keep_layer:] = False  # Keep at most max_keep_layer
         
-        # 6. Return pruned list
+        # 5. Return pruned list
         pruned = [n for k, n in zip(keep_mask, sorted_nodes) if k]
         
         if self.debug:
@@ -1274,8 +1302,10 @@ class EnhancedSemanticTracer:
                 # Debug: Check target vector sum
                 if self.debug:
                     print(f"[DBG][layer {layer_idx}] Target {target_idx} vector sum: {target_vector.sum().item():.4e}")
+                    print(f"[DBG][layer {layer_idx}] Target {target_idx} vector abs sum: {target_vector.abs().sum().item():.4e}")
                 
                 # Get indices of important source tokens using coverage-based selection
+                # select_sources will handle taking abs() for importance-based selection
                 selected_indices, selected_values = self.select_sources(
                     target_vector,
                     beta_target=self.beta_target,
@@ -1287,15 +1317,18 @@ class EnhancedSemanticTracer:
                 if self.debug:
                     print(f"[DBG][layer {layer_idx}] Selected {len(selected_indices)} sources, "
                           f"sum: {selected_values.sum().item():.4e}")
+                    print(f"[DBG][layer {layer_idx}] Selected values abs sum: {selected_values.abs().sum().item():.4e}")
                 
                 # Get source info and normalize weights for next iteration
                 sources = []
-                total_saliency = selected_values.sum().item()
+                # Use absolute values for importance-based calculation
+                total_saliency_abs = selected_values.abs().sum().item()
                 
                 for i, (idx, val) in enumerate(zip(selected_indices.tolist(), selected_values.tolist())):
                     # Calculate relative importance for this source
-                    if self.normalize_weights and total_saliency > self.epsilon:
-                        relative_weight = val / total_saliency
+                    if self.normalize_weights and total_saliency_abs > self.epsilon:
+                        # Use absolute values for relative importance
+                        relative_weight = abs(val) / total_saliency_abs
                         # Scale by the target's weight to get global importance
                         scaled_weight = relative_weight * target_weight
                     else:
@@ -1365,7 +1398,9 @@ class EnhancedSemanticTracer:
                     for token_idx in all_token_indices:
                         # Find if this token is a target
                         is_target = any(t["index"] == token_idx for t in layer_results["target_tokens"])
+                        
                         # Find if this token is a source and for which target(s)
+                        # Modified to track all targets this token is a source for
                         source_targets = []
                         for t in layer_results["target_tokens"]:
                             for s in t["sources"]:
@@ -1401,7 +1436,7 @@ class EnhancedSemanticTracer:
                             "token_id": all_token_ids[token_idx],
                             "token_type": token_types[token_idx].item(),
                             "is_target": is_target,
-                            "source_for_targets": source_targets,
+                            "source_for_targets": ",".join(map(str, source_targets)),  # Store as comma-separated list
                             "predicted_top_token": sanitized_pred_text,
                             "predicted_top_prob": top_pred_prob,
                             "trace_id": trace_id,
@@ -1427,15 +1462,33 @@ class EnhancedSemanticTracer:
                             
                         trace_records.append(record)
             
-            # 4. Layer-level source node pruning
-            all_sources = []
+            # 4. Layer-level source node pruning - OPTIMIZED to avoid duplicates
+            # Aggregate sources by index to avoid duplicates
+            aggregated_sources = {}
             for target_idx, sources in target_to_sources.items():
-                all_sources.extend(sources)
+                for source in sources:
+                    idx = source["index"]
+                    weight = source["scaled_weight"]
+                    
+                    if idx in aggregated_sources:
+                        # Sum weights from different targets
+                        aggregated_sources[idx]["scaled_weight"] += weight
+                    else:
+                        # Create a copy to avoid modifying the original
+                        aggregated_sources[idx] = source.copy()
             
-            if all_sources:
-                # Apply layer-level pruning
+            # Convert to list for pruning
+            unique_sources_list = list(aggregated_sources.values())
+            
+            # Debug: Print unique vs total count
+            if self.debug:
+                print(f"[DBG][layer {layer_idx}] Sources before de-duplication: {sum(len(srcs) for srcs in target_to_sources.values())}")
+                print(f"[DBG][layer {layer_idx}] Unique sources after de-duplication: {len(unique_sources_list)}")
+            
+            if unique_sources_list:
+                # Apply layer-level pruning to the unique sources
                 pruned_sources = self.layer_post_prune(
-                    all_sources,
+                    unique_sources_list,
                     beta_layer=self.beta_layer,
                     min_keep_layer=self.min_keep_layer,
                     max_keep_layer=self.max_keep_layer
@@ -1443,7 +1496,7 @@ class EnhancedSemanticTracer:
                 
                 # Debug: Print pruning results
                 if self.debug:
-                    print(f"[DBG][layer {layer_idx}] Pruned {len(all_sources)} -> {len(pruned_sources)} sources")
+                    print(f"[DBG][layer {layer_idx}] Pruned {len(unique_sources_list)} -> {len(pruned_sources)} unique sources")
                 
                 # Create a set of remaining source indices after pruning
                 remaining_source_indices = set(s["index"] for s in pruned_sources)
@@ -1588,6 +1641,9 @@ class EnhancedSemanticTracer:
                 combined_loss = 0
                 input_ids = inputs["input_ids"][0]
                 
+                # Calculate total weight sum for normalization
+                total_weight = sum(target_weights)
+                
                 for target_idx, target_weight in zip(target_indices, target_weights):
                     if target_idx >= outputs.logits.shape[1]:
                         print(f"Warning: Target index {target_idx} exceeds logits length {outputs.logits.shape[1]}. Skipping.")
@@ -1603,6 +1659,10 @@ class EnhancedSemanticTracer:
                     
                     # Add to combined loss with weight
                     combined_loss = combined_loss + token_loss * target_weight
+                
+                # Normalize the combined loss by total weight to avoid gradient scaling issues
+                if total_weight > self.epsilon:
+                    combined_loss = combined_loss / total_weight
                 
                 # Single backward pass for all targets
                 if combined_loss.requires_grad:
