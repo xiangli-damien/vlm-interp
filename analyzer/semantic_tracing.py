@@ -28,22 +28,28 @@ from utils.data_utils import get_token_indices
 
 class EnhancedSemanticTracer:
     """
-    Traces information flow through VLM layers by combining saliency scores with
+    Traces information flow through VLM layers by combining saliency scores or attention maps with
     logit lens projections to reveal how concepts evolve and flow from input tokens
-    to generated tokens. Optimized for memory efficiency.
+    to generated tokens. Supports multiple tracing modes and coverage-based node selection.
     """
     
     def __init__(
         self,
         model,
         processor,
-        top_k: int = 3,
+        top_k: Optional[int] = None,  # Deprecated parameter
         device: Optional[str] = None,
         output_dir: str = "semantic_tracing_results",
         cpu_offload: bool = True,
         layer_batch_size: int = 2,
         logit_lens_concepts: Optional[List[str]] = None,
-        normalize_weights: bool = True,  # New parameter for controlling normalization
+        normalize_weights: bool = True,
+        beta_target: float = 0.8,  # Target-level coverage threshold
+        beta_layer: float = 0.7,   # Layer-level coverage threshold 
+        min_keep: int = 1,         # Minimum nodes to keep per target
+        max_keep: int = 30,        # Maximum nodes to keep per target
+        min_keep_layer: int = 1,   # Minimum nodes to keep per layer
+        max_keep_layer: int = 500, # Maximum nodes to keep per layer
         debug: bool = False,
     ):
         """
@@ -52,27 +58,47 @@ class EnhancedSemanticTracer:
         Args:
             model: The VLM model (LLaVA-Next)
             processor: The corresponding processor
-            top_k: Number of top contributing tokens to track at each step
+            top_k: Deprecated parameter - use beta_target and min/max_keep instead
             device: Device to use (defaults to model's device)
             output_dir: Directory to save results
             cpu_offload: Whether to offload tensors to CPU when possible
             layer_batch_size: Number of layers to process at once for gradient computation
             logit_lens_concepts: List of concepts to track with logit lens
             normalize_weights: Whether to normalize token importance weights between layers
+            beta_target: Coverage threshold for selecting source nodes for each target token
+            beta_layer: Coverage threshold for pruning all source nodes at a layer level
+            min_keep: Minimum number of source nodes to keep per target token
+            max_keep: Maximum number of source nodes to keep per target token
+            min_keep_layer: Minimum number of source nodes to keep after layer-level pruning
+            max_keep_layer: Maximum number of source nodes to keep after layer-level pruning
             debug: Whether to print additional debug information
         """
         self.model = model
         self.processor = processor
         self.device = device or model.device
-        self.top_k = top_k
         self.output_dir = output_dir
         self.cpu_offload = cpu_offload
         self.layer_batch_size = layer_batch_size
         self.normalize_weights = normalize_weights
         self.debug = debug
         
-        # Create LogitLens analyzer from existing code
-        from analyzer.logit_lens import LLaVANextLogitLensAnalyzer
+        # Handle deprecated top_k parameter
+        if top_k is not None:
+            print(f"Warning: 'top_k' parameter is deprecated and will be removed in a future version. "
+                  f"Using coverage-based selection with beta_target={beta_target} instead.")
+            self.top_k = top_k  # Keep for backward compatibility
+        else:
+            self.top_k = 3  # Default value for backward compatibility
+        
+        # Coverage-based node selection parameters
+        self.beta_target = beta_target
+        self.beta_layer = beta_layer
+        self.min_keep = min_keep
+        self.max_keep = max_keep
+        self.min_keep_layer = min_keep_layer
+        self.max_keep_layer = max_keep_layer
+        
+        # Create LogitLens analyzer
         self.logit_lens = LLaVANextLogitLensAnalyzer(model, processor)
         
         # Set default concepts if none provided
@@ -97,13 +123,17 @@ class EnhancedSemanticTracer:
         # Track hidden states cache to avoid repeated forward passes
         self.hidden_states_cache = {}
         self.saliency_cache = {}
+        self.attention_cache = {}
         
         # Create a unique trace ID counter for identification
         self.trace_id_counter = 0
         
+        # Special tokens mapping for handling empty token display issues
+        self.SPECIAL_TEXT = {13: "\\n", 28705: "_"}
+        
         print(f"Initialized EnhancedSemanticTracer with {self.num_layers} attention layers")
-        print(f"Using top_k={top_k} for tracing")
-        print(f"Normalize weights between layers: {self.normalize_weights}")
+        print(f"Coverage-based node selection: β_target={beta_target}, β_layer={beta_layer}")
+        print(f"Node limits: min_keep={min_keep}, max_keep={max_keep}, min_keep_layer={min_keep_layer}, max_keep_layer={max_keep_layer}")
     
     def _get_layer_idx(self, layer_name_or_idx):
         """Helper to get consistent layer index from name or index"""
@@ -117,155 +147,45 @@ class EnhancedSemanticTracer:
             return self.attention_layer_names[layer_idx]
         return None
     
-    def prepare_inputs(self, image_source, prompt_text):
+    def _sanitize_text_for_display(self, text: str) -> str:
         """
-        Prepare model inputs for analysis.
+        Sanitize text to be displayed in CSV files or visualizations.
         
         Args:
-            image_source: PIL image, path, or URL
-            prompt_text: Text prompt
+            text: Text to sanitize
             
         Returns:
-            Dictionary with prepared inputs and metadata
+            Sanitized text
         """
-        print("Preparing inputs...")
-        # Use existing logit lens analyzer to prepare inputs
-        input_data = self.logit_lens.prepare_inputs(image_source, prompt_text)
-        
-        # Extract input IDs and identify text vs image tokens
-        input_ids = input_data["inputs"]["input_ids"]
-        text_indices, image_indices = get_token_indices(input_ids, self.image_token_id)
-        
-        # Add indices to input data
-        input_data["text_indices"] = text_indices
-        input_data["image_indices"] = image_indices
-        
-        return input_data
+        if not text:
+            return ""
+        # Basic sanitization to prevent issues with CSV
+        text = text.replace(",", " ").replace("\n", "\\n").replace("\r", "").replace("\t", " ")
+        return text
     
-    def generate_and_analyze_multiple(
-        self,
-        input_data: Dict[str, Any],
-        num_tokens: int = 5,
-        batch_compute: bool = True,
-    ) -> Dict[str, Any]:
+    def _get_token_text(self, token_id: int) -> str:
         """
-        Generate multiple tokens and perform semantic tracing for each token.
+        Get text representation of a token, handling special tokens.
         
         Args:
-            input_data: Prepared input data from prepare_inputs
-            num_tokens: Number of tokens to generate and analyze
-            batch_compute: Whether to compute saliency in layer batches to save memory
+            token_id: ID of the token
             
         Returns:
-            Dictionary with analysis results for all generated tokens
+            Text representation of the token
         """
-        model = self.model
-        device = self.device
+        # Handle special tokens that would otherwise display as empty
+        if token_id in self.SPECIAL_TEXT:
+            return self.SPECIAL_TEXT[token_id]
         
-        # 1. Generate text
-        inputs = input_data["inputs"]
-        current_input_ids = inputs["input_ids"].clone()
-        original_seq_len = current_input_ids.shape[1]
+        # Regular token decoding
+        token_text = self.processor.tokenizer.decode([token_id])
         
-        # Track all results by token position
-        all_results = {
-            "input_data": input_data,
-            "target_tokens": [],
-            "full_sequence": {"ids": [], "text": ""},
-            "trace_results": {},
-            "metadata": {}  # Store metadata for visualization
-        }
-        
-        # Generate tokens one by one
-        print(f"Generating {num_tokens} tokens...")
-        model.eval()
-        
-        for token_idx in range(num_tokens):
-            print(f"\n=== Processing token {token_idx+1}/{num_tokens} ===")
+        # Additional check for empty result (could be other special tokens)
+        if not token_text.strip():
+            # If empty after stripping, use a placeholder with the ID
+            return f"<tok_{token_id}>"
             
-            with torch.no_grad():
-                # Generate next token
-                outputs = model(**{k: v for k, v in inputs.items() if k != "token_type_ids"},
-                               use_cache=True)
-                logits = outputs.logits[:, -1, :]
-                next_token_id = torch.argmax(logits, dim=-1).unsqueeze(0)
-                current_input_ids = torch.cat([current_input_ids, next_token_id], dim=1)
-                
-                # Update inputs for next iteration
-                inputs["input_ids"] = current_input_ids
-                if "attention_mask" in inputs:
-                    inputs["attention_mask"] = torch.ones_like(current_input_ids)
-            
-            # Set target to the newly generated token
-            target_token_idx = original_seq_len + token_idx
-            
-            # Decode generated text so far
-            generated_tokens = current_input_ids[0, original_seq_len:].tolist()
-            generated_text = self.processor.tokenizer.decode(generated_tokens)
-            print(f"Generated text so far: '{generated_text}'")
-            
-            # Get the specific token info
-            token_id = current_input_ids[0, target_token_idx].item()
-            token_text = self.processor.tokenizer.decode([token_id])
-            print(f"Analyzing token at index {target_token_idx}: '{token_text}' (ID: {token_id})")
-            
-            # Store token information
-            all_results["target_tokens"].append({
-                "index": target_token_idx,
-                "id": token_id,
-                "text": token_text,
-            })
-            
-            # Clear any cached hidden states before tracing (important for memory!)
-            self.hidden_states_cache = {}
-            
-            # Run semantic tracing for this token
-            print(f"Starting semantic tracing for token '{token_text}' at position {target_token_idx}...")
-            
-            # Increment trace ID counter for this new trace path
-            self.trace_id_counter += 1
-            current_trace_id = self.trace_id_counter
-            
-            trace_results = self._recursive_trace(
-                inputs=inputs,
-                text_indices=input_data["text_indices"],
-                image_indices=input_data["image_indices"],
-                target_token_idx=target_token_idx,
-                batch_compute=batch_compute,
-                trace_id=current_trace_id,
-            )
-            
-            # Store trace results for this token
-            token_key = f"token_{target_token_idx}"
-            all_results["trace_results"][token_key] = trace_results
-            
-            # Store feature mapping in metadata if available - needed for visualization
-            if "feature_mapping" in input_data:
-                if "feature_mapping" not in all_results["metadata"]:
-                    all_results["metadata"]["feature_mapping"] = input_data["feature_mapping"]
-            
-            # Save images in metadata if available - needed for visualization
-            if "original_image" in input_data and "original_image" not in all_results["metadata"]:
-                # Reference to images, not copies (to avoid duplicating large data)
-                all_results["metadata"]["image_available"] = True
-            
-            # Force garbage collection to free memory
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        
-        # Final sequence information
-        all_results["full_sequence"] = {
-            "ids": current_input_ids[0].tolist(),
-            "text": self.processor.tokenizer.decode(current_input_ids[0].tolist()),
-        }
-        
-        # Save metadata separately for visualization
-        metadata_path = os.path.join(self.output_dir, "csv_data", f"trace_metadata.json")
-        self._save_trace_metadata(all_results, metadata_path)
-        all_results["metadata_path"] = metadata_path
-        
-        return all_results
+        return token_text
     
     def generate_and_analyze(
         self,
@@ -273,6 +193,7 @@ class EnhancedSemanticTracer:
         target_token_idx: Optional[int] = None,
         num_tokens: int = 1,
         batch_compute: bool = True,
+        tracing_mode: str = "saliency",  # Options: "saliency", "attention", "both"
     ) -> Dict[str, Any]:
         """
         Generate text and perform semantic tracing for a specific target token.
@@ -282,13 +203,21 @@ class EnhancedSemanticTracer:
             target_token_idx: Index of the token to analyze (if None, uses the first generated token)
             num_tokens: Number of tokens to generate if target_token_idx is None
             batch_compute: Whether to compute saliency in layer batches to save memory
+            tracing_mode: The tracing mode to use ("saliency", "attention", or "both")
             
         Returns:
             Dictionary with analysis results
         """
+        # Validate tracing mode
+        valid_modes = ["saliency", "attention", "both"]
+        if tracing_mode not in valid_modes:
+            raise ValueError(f"Invalid tracing mode: {tracing_mode}. Must be one of {valid_modes}")
+        
         # If analyzing multiple tokens, use the specialized function
         if target_token_idx is None and num_tokens > 1:
-            return self.generate_and_analyze_multiple(input_data, num_tokens, batch_compute)
+            return self.generate_and_analyze_multiple(
+                input_data, num_tokens, batch_compute, tracing_mode
+            )
         
         model = self.model
         device = self.device
@@ -329,7 +258,7 @@ class EnhancedSemanticTracer:
             
             # Decode the target token for display
             token_id = current_input_ids[0, target_token_idx].item()
-            token_text = self.processor.tokenizer.decode([token_id])
+            token_text = self._get_token_text(token_id)
             print(f"Analyzing token at index {target_token_idx}: '{token_text}' (ID: {token_id})")
             
             # Update inputs if needed
@@ -339,7 +268,7 @@ class EnhancedSemanticTracer:
         
         # Save the analyzed token information
         token_id = current_input_ids[0, target_token_idx].item()
-        token_text = self.processor.tokenizer.decode([token_id])
+        token_text = self._get_token_text(token_id)
         
         # Set up results dictionary
         results = {
@@ -354,27 +283,43 @@ class EnhancedSemanticTracer:
                 "text": self.processor.tokenizer.decode(current_input_ids[0].tolist()),
             },
             "trace_results": {},
-            "metadata": {}  # Store metadata for visualization
+            "metadata": {"tracing_mode": tracing_mode}  # Store tracing mode in metadata
         }
         
-        # Clear the hidden states cache
+        # Clear the caches
         self.hidden_states_cache = {}
+        self.saliency_cache = {}
+        self.attention_cache = {}
         
         # Increment trace ID for this trace path
         self.trace_id_counter += 1
         
-        # 2. Start recursive tracing
-        print(f"\nStarting recursive semantic tracing for token '{token_text}' at position {target_token_idx}...")
-        trace_results = self._recursive_trace(
-            inputs=inputs,
-            text_indices=input_data["text_indices"],
-            image_indices=input_data["image_indices"],
-            target_token_idx=target_token_idx,
-            batch_compute=batch_compute,
-            trace_id=self.trace_id_counter,
-        )
+        # 2. Run appropriate tracing based on the mode
+        print(f"\nStarting semantic tracing with mode '{tracing_mode}' for token '{token_text}' at position {target_token_idx}...")
         
-        results["trace_results"] = trace_results
+        if tracing_mode == "saliency" or tracing_mode == "both":
+            # Run saliency-based tracing
+            saliency_results = self._recursive_trace(
+                inputs=inputs,
+                text_indices=input_data["text_indices"],
+                image_indices=input_data["image_indices"],
+                target_token_idx=target_token_idx,
+                batch_compute=batch_compute,
+                trace_id=self.trace_id_counter,
+                tracing_mode="saliency",
+            )
+            results["trace_results"]["saliency"] = saliency_results
+        
+        if tracing_mode == "attention" or tracing_mode == "both":
+            # Run attention-based tracing
+            attention_results = self.trace_by_attention(
+                inputs=inputs,
+                text_indices=input_data["text_indices"],
+                image_indices=input_data["image_indices"],
+                target_token_idx=target_token_idx,
+                trace_id=self.trace_id_counter,
+            )
+            results["trace_results"]["attention"] = attention_results
         
         # Store feature mapping in metadata if available - needed for visualization
         if "feature_mapping" in input_data:
@@ -382,7 +327,6 @@ class EnhancedSemanticTracer:
         
         # Save images in metadata if available - needed for visualization
         if "original_image" in input_data:
-            # Just mark that image is available, don't duplicate in memory
             results["metadata"]["image_available"] = True
         
         # Save metadata separately for visualization
@@ -392,179 +336,162 @@ class EnhancedSemanticTracer:
         
         return results
     
-    def _save_trace_metadata(self, results, metadata_path):
-        """
-        Save trace metadata to a JSON file for visualization use.
-        
-        Args:
-            results: Results dictionary containing metadata
-            metadata_path: Path to save metadata
-        """
-        # Extract metadata that can be serialized to JSON
-        metadata = {
-            "target_tokens": [],
-            "feature_mapping": {},
-            "image_available": results["metadata"].get("image_available", False),
-        }
-        
-        # Add target token information
-        if "target_tokens" in results:
-            # Multiple tokens case
-            for token in results["target_tokens"]:
-                metadata["target_tokens"].append({
-                    "index": token["index"],
-                    "text": token["text"],
-                    "id": token["id"]
-                })
-        elif "target_token" in results:
-            # Single token case
-            metadata["target_tokens"].append({
-                "index": results["target_token"]["index"],
-                "text": results["target_token"]["text"],
-                "id": results["target_token"]["id"]
-            })
-        
-        # Add feature mapping if available (clean of non-serializable objects)
-        if "feature_mapping" in results["metadata"]:
-            feature_map = results["metadata"]["feature_mapping"]
-            
-            # Create a serializable version of feature mapping
-            serializable_mapping = {}
-            
-            # Handle base feature
-            if "base_feature" in feature_map:
-                base_feature = feature_map["base_feature"]
-                serializable_base = {
-                    "grid": base_feature.get("grid", [0, 0]),
-                    "positions": {str(k): v for k, v in base_feature.get("positions", {}).items()}
-                }
-                serializable_mapping["base_feature"] = serializable_base
-            
-            # Handle patch feature
-            if "patch_feature" in feature_map:
-                patch_feature = feature_map["patch_feature"]
-                serializable_patch = {
-                    "grid_unpadded": patch_feature.get("grid_unpadded", [0, 0]),
-                    "positions": {str(k): v for k, v in patch_feature.get("positions", {}).items()}
-                }
-                serializable_mapping["patch_feature"] = serializable_patch
-            
-            # Add other serializable properties
-            for key in ["patch_size", "resized_dimensions"]:
-                if key in feature_map:
-                    serializable_mapping[key] = feature_map[key]
-            
-            metadata["feature_mapping"] = serializable_mapping
-        
-        # Save to file
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f)
-    
-    def analyze_last_token(
+    def generate_and_analyze_multiple(
         self,
         input_data: Dict[str, Any],
-        single_forward_pass: bool = True,
+        num_tokens: int = 5,
         batch_compute: bool = True,
+        tracing_mode: str = "saliency",  # Options: "saliency", "attention", "both"
     ) -> Dict[str, Any]:
         """
-        Perform a single forward pass and analyze only the last token in the sequence.
+        Generate multiple tokens and perform semantic tracing for each token.
         
         Args:
             input_data: Prepared input data from prepare_inputs
-            single_forward_pass: Whether to use one-time forward pass optimization
-            batch_compute: Whether to compute saliency in batches for memory efficiency
+            num_tokens: Number of tokens to generate and analyze
+            batch_compute: Whether to compute saliency in layer batches to save memory
+            tracing_mode: The tracing mode to use ("saliency", "attention", or "both")
             
         Returns:
-            Dictionary with analysis results for the last token
+            Dictionary with analysis results for all generated tokens
         """
+        # Validate tracing mode
+        valid_modes = ["saliency", "attention", "both"]
+        if tracing_mode not in valid_modes:
+            raise ValueError(f"Invalid tracing mode: {tracing_mode}. Must be one of {valid_modes}")
+        
         model = self.model
         device = self.device
         
-        # Get model inputs
+        # 1. Generate text
         inputs = input_data["inputs"]
         current_input_ids = inputs["input_ids"].clone()
+        original_seq_len = current_input_ids.shape[1]
         
-        # Target is the last token in the sequence
-        target_token_idx = current_input_ids.shape[1] - 1
-        
-        # Decode the target token for display
-        token_id = current_input_ids[0, target_token_idx].item()
-        token_text = self.processor.tokenizer.decode([token_id])
-        print(f"Analyzing last token at index {target_token_idx}: '{token_text}' (ID: {token_id})")
-        
-        # Set up results dictionary
-        results = {
+        # Track all results by token position
+        all_results = {
             "input_data": input_data,
-            "target_token": {
+            "target_tokens": [],
+            "full_sequence": {"ids": [], "text": ""},
+            "trace_results": {},
+            "metadata": {"tracing_mode": tracing_mode}  # Store tracing mode in metadata
+        }
+        
+        # Generate tokens one by one
+        print(f"Generating {num_tokens} tokens...")
+        model.eval()
+        
+        for token_idx in range(num_tokens):
+            print(f"\n=== Processing token {token_idx+1}/{num_tokens} ===")
+            
+            with torch.no_grad():
+                # Generate next token
+                outputs = model(**{k: v for k, v in inputs.items() if k != "token_type_ids"},
+                               use_cache=True)
+                logits = outputs.logits[:, -1, :]
+                next_token_id = torch.argmax(logits, dim=-1).unsqueeze(0)
+                current_input_ids = torch.cat([current_input_ids, next_token_id], dim=1)
+                
+                # Update inputs for next iteration
+                inputs["input_ids"] = current_input_ids
+                if "attention_mask" in inputs:
+                    inputs["attention_mask"] = torch.ones_like(current_input_ids)
+            
+            # Set target to the newly generated token
+            target_token_idx = original_seq_len + token_idx
+            
+            # Decode generated text so far
+            generated_tokens = current_input_ids[0, original_seq_len:].tolist()
+            generated_text = self.processor.tokenizer.decode(generated_tokens)
+            print(f"Generated text so far: '{generated_text}'")
+            
+            # Get the specific token info
+            token_id = current_input_ids[0, target_token_idx].item()
+            token_text = self._get_token_text(token_id)
+            print(f"Analyzing token at index {target_token_idx}: '{token_text}' (ID: {token_id})")
+            
+            # Store token information
+            all_results["target_tokens"].append({
                 "index": target_token_idx,
                 "id": token_id,
                 "text": token_text,
-            },
-            "full_sequence": {
-                "ids": current_input_ids[0].tolist(),
-                "text": self.processor.tokenizer.decode(current_input_ids[0].tolist()),
-            },
-            "trace_results": {},
-            "metadata": {}  # Store metadata for visualization
+            })
+            
+            # Clear any cached states before tracing (important for memory!)
+            self.hidden_states_cache = {}
+            self.saliency_cache = {}
+            self.attention_cache = {}
+            
+            # Increment trace ID counter for this new trace path
+            self.trace_id_counter += 1
+            current_trace_id = self.trace_id_counter
+            
+            # Create a token-specific results container
+            token_key = f"token_{target_token_idx}"
+            all_results["trace_results"][token_key] = {}
+            
+            # Run appropriate tracing based on the mode
+            print(f"Starting semantic tracing with mode '{tracing_mode}' for token '{token_text}' at position {target_token_idx}...")
+            
+            if tracing_mode == "saliency" or tracing_mode == "both":
+                # Run saliency-based tracing
+                saliency_results = self._recursive_trace(
+                    inputs=inputs,
+                    text_indices=input_data["text_indices"],
+                    image_indices=input_data["image_indices"],
+                    target_token_idx=target_token_idx,
+                    batch_compute=batch_compute,
+                    trace_id=current_trace_id,
+                    tracing_mode="saliency",
+                )
+                all_results["trace_results"][token_key]["saliency"] = saliency_results
+            
+            if tracing_mode == "attention" or tracing_mode == "both":
+                # Run attention-based tracing
+                attention_results = self.trace_by_attention(
+                    inputs=inputs,
+                    text_indices=input_data["text_indices"],
+                    image_indices=input_data["image_indices"],
+                    target_token_idx=target_token_idx,
+                    trace_id=current_trace_id,
+                )
+                all_results["trace_results"][token_key]["attention"] = attention_results
+            
+            # Force garbage collection to free memory
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Final sequence information
+        all_results["full_sequence"] = {
+            "ids": current_input_ids[0].tolist(),
+            "text": self.processor.tokenizer.decode(current_input_ids[0].tolist()),
         }
-        
-        # Clear the hidden states cache
-        self.hidden_states_cache = {}
-        
-        # Increment trace ID for this trace path
-        self.trace_id_counter += 1
-        
-        # Start recursive tracing with single forward pass option
-        print(f"\nStarting recursive semantic tracing for token '{token_text}' at position {target_token_idx}...")
-        trace_results = self._recursive_trace(
-            inputs=inputs,
-            text_indices=input_data["text_indices"],
-            image_indices=input_data["image_indices"],
-            target_token_idx=target_token_idx,
-            batch_compute=batch_compute,
-            trace_id=self.trace_id_counter,
-            single_forward_pass=single_forward_pass,
-        )
-        
-        results["trace_results"] = trace_results
-        
-        # Store feature mapping in metadata if available - needed for visualization
-        if "feature_mapping" in input_data:
-            results["metadata"]["feature_mapping"] = input_data["feature_mapping"]
-        
-        # Save images in metadata if available - needed for visualization
-        if "original_image" in input_data:
-            # Just mark that image is available, don't duplicate in memory
-            results["metadata"]["image_available"] = True
         
         # Save metadata separately for visualization
         metadata_path = os.path.join(self.output_dir, "csv_data", f"trace_metadata.json")
-        self._save_trace_metadata(results, metadata_path)
-        results["metadata_path"] = metadata_path
+        self._save_trace_metadata(all_results, metadata_path)
+        all_results["metadata_path"] = metadata_path
         
-        return results
+        return all_results
     
-    def _recursive_trace(
+    def trace_by_attention(
         self,
         inputs: Dict[str, torch.Tensor],
         text_indices: torch.Tensor,
         image_indices: torch.Tensor,
         target_token_idx: int,
-        batch_compute: bool = True,
         trace_id: int = 0,
-        single_forward_pass: bool = False,
     ) -> Dict[str, Any]:
         """
-        Recursively trace token influence backward through layers.
+        Trace information flow using attention weights (without gradient computation).
         
         Args:
             inputs: Model inputs
             text_indices: Indices of text tokens
             image_indices: Indices of image tokens
             target_token_idx: Index of the target token
-            batch_compute: Whether to compute saliency in batches
             trace_id: Unique identifier for this trace path
-            single_forward_pass: Whether to do just one forward pass for all layers
             
         Returns:
             Dictionary with trace results for each layer
@@ -590,7 +517,438 @@ class EnhancedSemanticTracer:
         
         # Process layers from deepest to shallowest
         all_token_ids = inputs["input_ids"][0].tolist()
-        all_token_texts = [self.processor.tokenizer.decode([tid]) for tid in all_token_ids]
+        all_token_texts = [self._get_token_text(tid) for tid in all_token_ids]
+        
+        # Create DataFrame to record all traced tokens
+        trace_records = []
+        
+        # If we don't have cached attention weights, get them now with a standard forward pass
+        if not self.attention_cache:
+            print("\nPerforming one-time forward pass to collect attention weights for all layers...")
+            with torch.no_grad():
+                outputs = model(**{k: v for k, v in inputs.items() if k != "token_type_ids"},
+                                output_hidden_states=True,
+                                output_attentions=True,
+                                use_cache=False,
+                                return_dict=True)
+                
+                # Cache all hidden states in CPU memory - needed for logit lens
+                for layer_idx, hidden in enumerate(outputs.hidden_states):
+                    self.hidden_states_cache[layer_idx] = hidden.detach().cpu() if self.cpu_offload else hidden.detach()
+                
+                # Cache all attention weights in CPU memory
+                if outputs.attentions:
+                    for layer_idx, attn in enumerate(outputs.attentions):
+                        self.attention_cache[layer_idx] = attn.detach().cpu() if self.cpu_offload else attn.detach()
+            
+            print(f"Cached hidden states for {len(self.hidden_states_cache)} layers")
+            print(f"Cached attention weights for {len(self.attention_cache)} layers")
+        
+        # Process layers from deepest to shallowest
+        for layer_idx in range(self.num_layers - 1, -1, -1):
+            layer_name = self._get_layer_name(layer_idx)
+            print(f"\nProcessing layer {layer_idx} ({layer_name})...")
+            
+            # 1. Get attention weights for current targets
+            current_target_indices = list(current_targets.keys())
+            current_target_weights = list(current_targets.values())
+            
+            layer_results = {
+                "layer_idx": layer_idx,
+                "layer_name": layer_name,
+                "target_tokens": [],
+                "source_tokens": [],
+                "logit_lens_projections": {},
+            }
+            
+            # Get attention weights for this layer
+            if layer_idx not in self.attention_cache:
+                print(f"Warning: No attention weights for layer {layer_idx}. Skipping.")
+                continue
+            
+            # Get attention weights (shape: [batch, head, seq, seq])
+            attention_weights = self.attention_cache[layer_idx]
+            
+            # Average across heads to get a single attention map
+            # Shape: [batch, seq, seq]
+            attention_map = attention_weights.mean(dim=1)
+            
+            if attention_map.ndim == 3:
+                # If batch dimension is present, take the first batch
+                attention_map = attention_map[0]
+            
+            # 2. For each target, find the important source tokens using coverage-based selection
+            target_to_sources = {}
+            
+            for target_idx, target_weight in current_targets.items():
+                if target_idx >= attention_map.shape[0]:
+                    print(f"Warning: Target index {target_idx} exceeds attention map dimensions {attention_map.shape}. Skipping.")
+                    continue
+                
+                # Get attention from the target token to all previous tokens (causal)
+                target_vector = attention_map[target_idx, :target_idx]  # Only consider previous tokens
+                
+                if len(target_vector) == 0:
+                    print(f"Warning: Empty target vector for token {target_idx}. Skipping.")
+                    continue
+                
+                # Get indices of important source tokens using coverage-based selection
+                selected_indices, selected_values = self.select_sources(
+                    target_vector,
+                    beta_target=self.beta_target,
+                    min_keep=self.min_keep,
+                    max_keep=self.max_keep
+                )
+                
+                # Get source info and normalize weights for next iteration
+                sources = []
+                total_attention = selected_values.sum().item()
+                
+                for i, (idx, val) in enumerate(zip(selected_indices.tolist(), selected_values.tolist())):
+                    # Calculate relative importance for this source
+                    if self.normalize_weights and total_attention > 0:
+                        relative_weight = val / total_attention
+                        # Scale by the target's weight to get global importance
+                        scaled_weight = relative_weight * target_weight
+                    else:
+                        # If total is zero, use equal weights
+                        relative_weight = 1.0 / len(selected_indices)
+                        scaled_weight = relative_weight * target_weight
+                    
+                    # Get token info
+                    token_id = all_token_ids[idx]
+                    token_text = all_token_texts[idx]
+                    token_type = token_types[idx].item()
+                    
+                    source_info = {
+                        "index": idx,
+                        "id": token_id,
+                        "text": token_text,
+                        "type": token_type,  # 0=generated, 1=text, 2=image
+                        "attention_score": val,
+                        "relative_weight": relative_weight,
+                        "scaled_weight": scaled_weight,
+                        "trace_id": trace_id,
+                    }
+                    sources.append(source_info)
+                
+                # Record target token info
+                target_info = {
+                    "index": target_idx,
+                    "id": all_token_ids[target_idx],
+                    "text": all_token_texts[target_idx],
+                    "type": token_types[target_idx].item(),
+                    "weight": target_weight,
+                    "sources": sources,
+                    "trace_id": trace_id,
+                }
+                layer_results["target_tokens"].append(target_info)
+                
+                # Save source indices for next iteration
+                target_to_sources[target_idx] = sources
+            
+            # 3. Compute logit lens projections for all tokens involved
+            all_token_indices = set()
+            for target_info in layer_results["target_tokens"]:
+                all_token_indices.add(target_info["index"])
+                for source in target_info["sources"]:
+                    all_token_indices.add(source["index"])
+            
+            all_token_indices = sorted(list(all_token_indices))
+            if all_token_indices:
+                print(f"Computing logit lens projections for {len(all_token_indices)} tokens...")
+                
+                # Use cached hidden states
+                logit_lens_results = self._compute_logit_lens_projections(
+                    inputs=inputs,
+                    layer_idx=layer_idx,
+                    token_indices=all_token_indices,
+                )
+                
+                if logit_lens_results:
+                    layer_results["logit_lens_projections"] = logit_lens_results
+                    
+                    # Add records to the trace dataframe
+                    for token_idx in all_token_indices:
+                        # Find if this token is a target
+                        is_target = any(t["index"] == token_idx for t in layer_results["target_tokens"])
+                        # Find if this token is a source and for which target(s)
+                        source_targets = []
+                        for t in layer_results["target_tokens"]:
+                            for s in t["sources"]:
+                                if s["index"] == token_idx:
+                                    source_targets.append(t["index"])
+                        
+                        # Get token projection data
+                        token_projection = logit_lens_results.get(token_idx, {})
+                        top_predictions = token_projection.get("top_predictions", [])
+                        concept_predictions = token_projection.get("concept_predictions", {})
+                        
+                        # Extract top prediction
+                        top_pred_text = ""
+                        top_pred_prob = 0.0
+                        if top_predictions and len(top_predictions) > 0:
+                            top_pred_text = top_predictions[0].get("token_text", "")
+                            top_pred_prob = top_predictions[0].get("probability", 0.0)
+                        
+                        # Extract target concept probabilities
+                        concept_probs = {}
+                        for concept, data in concept_predictions.items():
+                            concept_probs[concept] = data.get("probability", 0.0)
+                        
+                        # Sanitize token text for CSV
+                        sanitized_token_text = self._sanitize_text_for_display(all_token_texts[token_idx])
+                        sanitized_pred_text = self._sanitize_text_for_display(top_pred_text)
+                        
+                        # Create record
+                        record = {
+                            "layer": layer_idx,
+                            "token_index": token_idx,
+                            "token_text": sanitized_token_text,
+                            "token_id": all_token_ids[token_idx],
+                            "token_type": token_types[token_idx].item(),
+                            "is_target": is_target,
+                            "source_for_targets": source_targets,
+                            "predicted_top_token": sanitized_pred_text,
+                            "predicted_top_prob": top_pred_prob,
+                            "trace_id": trace_id,
+                        }
+                        
+                        # Add source-target relationship (needed for flow graph visualization)
+                        if is_target:
+                            sources_indices = []
+                            sources_weights = []
+                            for target in layer_results["target_tokens"]:
+                                if target["index"] == token_idx:
+                                    for src in target["sources"]:
+                                        sources_indices.append(src["index"])
+                                        sources_weights.append(src["scaled_weight"])
+                            
+                            # Store as comma-separated strings for CSV compatibility
+                            record["sources_indices"] = ",".join(map(str, sources_indices))
+                            record["sources_weights"] = ",".join(map(str, sources_weights))
+                        
+                        # Add concept probabilities
+                        for concept, prob in concept_probs.items():
+                            record[f"concept_{concept}_prob"] = prob
+                            
+                        trace_records.append(record)
+            
+            # 4. Layer-level source node pruning
+            all_sources = []
+            for target_idx, sources in target_to_sources.items():
+                all_sources.extend(sources)
+            
+            if all_sources:
+                # Apply layer-level pruning
+                pruned_sources = self.layer_post_prune(
+                    all_sources,
+                    beta_layer=self.beta_layer,
+                    min_keep_layer=self.min_keep_layer,
+                    max_keep_layer=self.max_keep_layer
+                )
+                
+                # Create a set of remaining source indices after pruning
+                remaining_source_indices = set(s["index"] for s in pruned_sources)
+                
+                # Update target_to_sources to only include remaining sources
+                for target_idx in target_to_sources:
+                    target_to_sources[target_idx] = [
+                        s for s in target_to_sources[target_idx] 
+                        if s["index"] in remaining_source_indices
+                    ]
+            
+            # 5. Update current_targets for next layer
+            new_targets = {}
+            for target_idx, sources in target_to_sources.items():
+                for source in sources:
+                    source_idx = source["index"]
+                    source_weight = source["scaled_weight"]
+                    
+                    # Multiple targets might share the same source
+                    if source_idx in new_targets:
+                        new_targets[source_idx] += source_weight
+                    else:
+                        new_targets[source_idx] = source_weight
+            
+            # Normalize weights for new targets if needed
+            if new_targets:
+                if self.normalize_weights:
+                    total_weight = sum(new_targets.values())
+                    current_targets = {idx: weight / total_weight for idx, weight in new_targets.items()} if total_weight > 0 else new_targets
+                else:
+                    current_targets = new_targets
+            else:
+                print("Warning: No valid sources found for this layer. Stopping trace.")
+                break
+            
+            # Save layer results
+            trace_results[layer_idx] = layer_results
+            
+            # Clean up to save memory
+            if self.cpu_offload and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
+        
+        # Save trace records to CSV
+        if trace_records:
+            df = pd.DataFrame(trace_records)
+            csv_path = os.path.join(self.output_dir, "csv_data", f"trace_attn_{trace_id}_data.csv")
+            df.to_csv(csv_path, index=False)
+            print(f"Saved attention-based trace data to {csv_path}")
+            
+            # Add to results
+            trace_results["trace_data_path"] = csv_path
+        
+        print("Attention-based semantic tracing complete.")
+        return trace_results
+    
+    def select_sources(
+        self,
+        target_vector: torch.Tensor,
+        beta_target: float = 0.8,
+        min_keep: int = 1,
+        max_keep: int = 30
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Select source nodes based on cumulative coverage threshold.
+        
+        Args:
+            target_vector: Vector of importance scores from target to sources
+            beta_target: Coverage threshold (cumulative ratio)
+            min_keep: Minimum number of sources to keep
+            max_keep: Maximum number of sources to keep
+            
+        Returns:
+            Tuple of (selected indices, selected values)
+        """
+        # 1. Sort values and indices by importance (descending)
+        vals, idxs = torch.sort(target_vector, descending=True)
+        
+        # 2. Calculate cumulative coverage
+        cum = torch.cumsum(vals, 0)
+        
+        # Avoid division by zero
+        if cum[-1] == 0:
+            # If all values are zero, just keep min_keep items
+            keep = torch.zeros_like(vals, dtype=torch.bool)
+            keep[:min_keep] = True
+            return idxs[keep], vals[keep]
+        
+        # Calculate coverage ratio
+        coverage = cum / cum[-1]
+        
+        # 3. Create boolean mask for selected indices
+        keep = coverage <= beta_target
+        
+        # 4. Apply min/max constraints
+        keep[:min_keep] = True  # Always keep at least min_keep
+        if keep.sum() > max_keep:
+            keep[max_keep:] = False  # Keep at most max_keep
+        
+        # 5. Return selected indices and their values
+        return idxs[keep], vals[keep]
+    
+    def layer_post_prune(
+        self,
+        src_nodes: List[Dict],
+        beta_layer: float = 0.7,
+        min_keep_layer: int = 5,
+        max_keep_layer: int = 100
+    ) -> List[Dict]:
+        """
+        Second-level pruning at layer level to control overall node count.
+        
+        Args:
+            src_nodes: List of source node dictionaries (with "scaled_weight" key)
+            beta_layer: Coverage threshold for layer-level pruning
+            min_keep_layer: Minimum number of nodes to keep after pruning
+            max_keep_layer: Maximum number of nodes to keep after pruning
+            
+        Returns:
+            Pruned list of source nodes
+        """
+        if not src_nodes:
+            return []
+        
+        # Handle case with very few nodes
+        if len(src_nodes) <= min_keep_layer:
+            return src_nodes
+        
+        # 1. Sort nodes by scaled_weight (decreasing)
+        sorted_nodes = sorted(src_nodes, key=lambda x: x.get('scaled_weight', 0), reverse=True)
+        
+        # Extract weights as tensor for easier calculation
+        weights = torch.tensor([n.get('scaled_weight', 0) for n in sorted_nodes])
+        
+        # Handle zero-sum case
+        if weights.sum() == 0:
+            return sorted_nodes[:min_keep_layer]
+        
+        # 2. Calculate cumulative coverage
+        cov = torch.cumsum(weights, 0) / weights.sum()
+        
+        # 3. Create boolean mask for keeping nodes
+        keep_mask = cov <= beta_layer
+        
+        # 4. Apply min/max constraints
+        keep_mask[:min_keep_layer] = True  # Always keep at least min_keep_layer
+        if keep_mask.sum() > max_keep_layer:
+            keep_mask[max_keep_layer:] = False  # Keep at most max_keep_layer
+        
+        # 5. Return pruned list
+        pruned = [n for k, n in zip(keep_mask, sorted_nodes) if k]
+        return pruned
+    
+    def _recursive_trace(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        text_indices: torch.Tensor,
+        image_indices: torch.Tensor,
+        target_token_idx: int,
+        batch_compute: bool = True,
+        trace_id: int = 0,
+        single_forward_pass: bool = False,
+        tracing_mode: str = "saliency",
+    ) -> Dict[str, Any]:
+        """
+        Recursively trace token influence backward through layers using saliency.
+        
+        Args:
+            inputs: Model inputs
+            text_indices: Indices of text tokens
+            image_indices: Indices of image tokens
+            target_token_idx: Index of the target token
+            batch_compute: Whether to compute saliency in batches
+            trace_id: Unique identifier for this trace path
+            single_forward_pass: Whether to do just one forward pass for all layers
+            tracing_mode: Tracing method ("saliency" or "attention")
+            
+        Returns:
+            Dictionary with trace results for each layer
+        """
+        model = self.model
+        device = self.device
+        
+        # Dictionaries to store results
+        trace_results = {}
+        current_targets = {target_token_idx: 1.0}  # Initial target token with weight 1.0
+        
+        # Calculate token type counts for stats
+        num_text_tokens = len(text_indices)
+        num_image_tokens = len(image_indices)
+        num_generated_tokens = inputs["input_ids"].shape[1] - (num_text_tokens + num_image_tokens)
+        
+        # Create token type masks for plotting/visualization
+        seq_len = inputs["input_ids"].shape[1]
+        token_types = torch.zeros(seq_len, dtype=torch.long, device=device)
+        token_types[text_indices] = 1  # Text tokens
+        token_types[image_indices] = 2  # Image tokens
+        # Generated tokens remain 0
+        
+        # Process layers from deepest to shallowest
+        all_token_ids = inputs["input_ids"][0].tolist()
+        all_token_texts = [self._get_token_text(tid) for tid in all_token_ids]
         
         # Create DataFrame to record all traced tokens
         trace_records = []
@@ -617,6 +975,11 @@ class EnhancedSemanticTracer:
                     # Cache all hidden states
                     for layer_idx, hidden in enumerate(outputs.hidden_states):
                         self.hidden_states_cache[layer_idx] = hidden.detach().cpu() if self.cpu_offload else hidden.detach()
+                    
+                    # Cache all attention weights
+                    if outputs.attentions:
+                        for layer_idx, attn in enumerate(outputs.attentions):
+                            self.attention_cache[layer_idx] = attn.detach().cpu() if self.cpu_offload else attn.detach()
                     
                     # Compute loss for the target token
                     logits = outputs.logits[0, target_token_idx]
@@ -659,16 +1022,20 @@ class EnhancedSemanticTracer:
             with torch.no_grad():
                 outputs = model(**{k: v for k, v in inputs.items() if k != "token_type_ids"},
                                 output_hidden_states=True, 
+                                output_attentions=True,
                                 use_cache=False,
                                 return_dict=True)
                 # Cache all hidden states in CPU memory
                 for layer_idx, hidden in enumerate(outputs.hidden_states):
                     self.hidden_states_cache[layer_idx] = hidden.detach().cpu() if self.cpu_offload else hidden.detach()
+                
+                # Cache all attention weights
+                if outputs.attentions:
+                    for layer_idx, attn in enumerate(outputs.attentions):
+                        self.attention_cache[layer_idx] = attn.detach().cpu() if self.cpu_offload else attn.detach()
+            
             print(f"Cached hidden states for {len(self.hidden_states_cache)} layers")
-        
-        # Add saliency cache for the single forward pass case
-        if not hasattr(self, 'saliency_cache'):
-            self.saliency_cache = {}
+            print(f"Cached attention weights for {len(self.attention_cache)} layers")
         
         # Process layers from deepest to shallowest
         for layer_idx in range(self.num_layers - 1, -1, -1):
@@ -711,7 +1078,7 @@ class EnhancedSemanticTracer:
                 print(f"Warning: No valid saliency maps computed for layer {layer_idx}. Stopping trace.")
                 break
             
-            # 2. For each target, find the top-k source tokens
+            # 2. For each target, find the important source tokens using coverage-based selection
             target_to_sources = {}
             
             for target_idx, target_weight in current_targets.items():
@@ -726,31 +1093,28 @@ class EnhancedSemanticTracer:
                     print(f"Warning: Empty target vector for token {target_idx}. Skipping.")
                     continue
                 
-                # Get indices of top-k sources
-                if len(target_vector) <= self.top_k:
-                    # If we have fewer tokens than top_k, use all of them
-                    topk_indices = torch.arange(len(target_vector), device=target_vector.device)
-                    topk_values = target_vector
-                else:
-                    # Otherwise find top-k
-                    topk_values, topk_indices = torch.topk(target_vector, self.top_k)
+                # Get indices of important source tokens using coverage-based selection
+                selected_indices, selected_values = self.select_sources(
+                    target_vector,
+                    beta_target=self.beta_target,
+                    min_keep=self.min_keep,
+                    max_keep=self.max_keep
+                )
                 
                 # Get source info and normalize weights for next iteration
                 sources = []
-                total_saliency = topk_values.sum().item()
+                total_saliency = selected_values.sum().item()
                 
-                for i, (idx, val) in enumerate(zip(topk_indices.tolist(), topk_values.tolist())):
+                for i, (idx, val) in enumerate(zip(selected_indices.tolist(), selected_values.tolist())):
                     # Calculate relative importance for this source
-                    # NOTE: Normalization is done to enable comparing tokens in the next layer,
-                    # not for physical interpretation of values
                     if self.normalize_weights and total_saliency > 0:
                         relative_weight = val / total_saliency
                         # Scale by the target's weight to get global importance
                         scaled_weight = relative_weight * target_weight
                     else:
-                        # If not normalizing, just use raw values while preserving the sum
-                        relative_weight = val
-                        scaled_weight = val * target_weight
+                        # If total is zero, use equal weights
+                        relative_weight = 1.0 / len(selected_indices)
+                        scaled_weight = relative_weight * target_weight
                     
                     # Get token info
                     token_id = all_token_ids[idx]
@@ -833,16 +1197,20 @@ class EnhancedSemanticTracer:
                         for concept, data in concept_predictions.items():
                             concept_probs[concept] = data.get("probability", 0.0)
                         
+                        # Sanitize token text for CSV
+                        sanitized_token_text = self._sanitize_text_for_display(all_token_texts[token_idx])
+                        sanitized_pred_text = self._sanitize_text_for_display(top_pred_text)
+                        
                         # Create record
                         record = {
                             "layer": layer_idx,
                             "token_index": token_idx,
-                            "token_text": all_token_texts[token_idx],
+                            "token_text": sanitized_token_text,
                             "token_id": all_token_ids[token_idx],
                             "token_type": token_types[token_idx].item(),
                             "is_target": is_target,
                             "source_for_targets": source_targets,
-                            "predicted_top_token": top_pred_text,
+                            "predicted_top_token": sanitized_pred_text,
                             "predicted_top_prob": top_pred_prob,
                             "trace_id": trace_id,
                         }
@@ -867,7 +1235,31 @@ class EnhancedSemanticTracer:
                             
                         trace_records.append(record)
             
-            # 4. Update current_targets for next layer
+            # 4. Layer-level source node pruning
+            all_sources = []
+            for target_idx, sources in target_to_sources.items():
+                all_sources.extend(sources)
+            
+            if all_sources:
+                # Apply layer-level pruning
+                pruned_sources = self.layer_post_prune(
+                    all_sources,
+                    beta_layer=self.beta_layer,
+                    min_keep_layer=self.min_keep_layer,
+                    max_keep_layer=self.max_keep_layer
+                )
+                
+                # Create a set of remaining source indices after pruning
+                remaining_source_indices = set(s["index"] for s in pruned_sources)
+                
+                # Update target_to_sources to only include remaining sources
+                for target_idx in target_to_sources:
+                    target_to_sources[target_idx] = [
+                        s for s in target_to_sources[target_idx] 
+                        if s["index"] in remaining_source_indices
+                    ]
+            
+            # 5. Update current_targets for next layer
             new_targets = {}
             for target_idx, sources in target_to_sources.items():
                 for source in sources:
@@ -903,15 +1295,17 @@ class EnhancedSemanticTracer:
         # Save trace records to CSV
         if trace_records:
             df = pd.DataFrame(trace_records)
-            csv_path = os.path.join(self.output_dir, "csv_data", f"trace_{trace_id}_data.csv")
+            # Correctly use tracing_mode in the filename
+            csv_path = os.path.join(self.output_dir, "csv_data", f"trace_{tracing_mode}_{trace_id}_data.csv")
             df.to_csv(csv_path, index=False)
-            print(f"Saved trace data to {csv_path}")
+            print(f"Saved {tracing_mode}-based trace data to {csv_path}")
             
             # Add to results
             trace_results["trace_data_path"] = csv_path
         
-        print("Semantic tracing complete.")
+        print(f"{tracing_mode.capitalize()}-based semantic tracing complete.")
         return trace_results
+    
     
     def _compute_saliency_for_multiple_tokens(
         self,
