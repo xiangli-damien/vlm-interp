@@ -187,6 +187,31 @@ class EnhancedSemanticTracer:
             
         return token_text
     
+    def prepare_inputs(self, image_source, prompt_text):
+        """
+        Prepare model inputs for analysis.
+        
+        Args:
+            image_source: PIL image, path, or URL
+            prompt_text: Text prompt
+            
+        Returns:
+            Dictionary with prepared inputs and metadata
+        """
+        print("Preparing inputs...")
+        # Use existing logit lens analyzer to prepare inputs
+        input_data = self.logit_lens.prepare_inputs(image_source, prompt_text)
+        
+        # Extract input IDs and identify text vs image tokens
+        input_ids = input_data["inputs"]["input_ids"]
+        text_indices, image_indices = get_token_indices(input_ids, self.image_token_id)
+        
+        # Add indices to input data
+        input_data["text_indices"] = text_indices
+        input_data["image_indices"] = image_indices
+        
+        return input_data
+    
     def generate_and_analyze(
         self,
         input_data: Dict[str, Any],
