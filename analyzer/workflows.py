@@ -721,7 +721,8 @@ def run_semantic_tracing_test(
     output_format: str = "both",
     show_orphaned_nodes: bool = False,
     min_edge_weight: float = 0.0,
-    use_variable_node_size: bool = True
+    use_variable_node_size: bool = True,
+    debug_mode: bool = False
 ) -> Dict[str, Any]:
     """
     Run semantic tracing test with improved multi-token handling and coverage-based selection.
@@ -829,7 +830,8 @@ def run_semantic_tracing_test(
             single_forward_pass=single_forward_pass,
             analyze_last_token=analyze_last_token,
             target_token_idx=target_token_idx,
-            tracing_mode=tracing_mode
+            tracing_mode=tracing_mode,
+            debug_mode=debug_mode
         )
         
         # Prepare results to return
