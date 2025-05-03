@@ -361,6 +361,75 @@ class EnhancedSemanticTracer:
         
         return results
     
+    def _save_trace_metadata(self, results, metadata_path):
+        """
+        Save trace metadata to a JSON file for visualization use.
+        
+        Args:
+            results: Results dictionary containing metadata
+            metadata_path: Path to save metadata
+        """
+        # Extract metadata that can be serialized to JSON
+        metadata = {
+            "target_tokens": [],
+            "feature_mapping": {},
+            "image_available": results["metadata"].get("image_available", False),
+            "tracing_mode": results["metadata"].get("tracing_mode", "saliency")
+        }
+        
+        # Add target token information
+        if "target_tokens" in results:
+            # Multiple tokens case
+            for token in results["target_tokens"]:
+                metadata["target_tokens"].append({
+                    "index": token["index"],
+                    "text": token["text"],
+                    "id": token["id"]
+                })
+        elif "target_token" in results:
+            # Single token case
+            metadata["target_tokens"].append({
+                "index": results["target_token"]["index"],
+                "text": results["target_token"]["text"],
+                "id": results["target_token"]["id"]
+            })
+        
+        # Add feature mapping if available (clean of non-serializable objects)
+        if "feature_mapping" in results["metadata"]:
+            feature_map = results["metadata"]["feature_mapping"]
+            
+            # Create a serializable version of feature mapping
+            serializable_mapping = {}
+            
+            # Handle base feature
+            if "base_feature" in feature_map:
+                base_feature = feature_map["base_feature"]
+                serializable_base = {
+                    "grid": base_feature.get("grid", [0, 0]),
+                    "positions": {str(k): v for k, v in base_feature.get("positions", {}).items()}
+                }
+                serializable_mapping["base_feature"] = serializable_base
+            
+            # Handle patch feature
+            if "patch_feature" in feature_map:
+                patch_feature = feature_map["patch_feature"]
+                serializable_patch = {
+                    "grid_unpadded": patch_feature.get("grid_unpadded", [0, 0]),
+                    "positions": {str(k): v for k, v in patch_feature.get("positions", {}).items()}
+                }
+                serializable_mapping["patch_feature"] = serializable_patch
+            
+            # Add other serializable properties
+            for key in ["patch_size", "resized_dimensions"]:
+                if key in feature_map:
+                    serializable_mapping[key] = feature_map[key]
+            
+            metadata["feature_mapping"] = serializable_mapping
+        
+        # Save to file
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f)
+
     def generate_and_analyze_multiple(
         self,
         input_data: Dict[str, Any],
