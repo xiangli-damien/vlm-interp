@@ -50,7 +50,7 @@ class EnhancedSemanticTracer:
         max_keep: int = 30,        # Maximum nodes to keep per target
         min_keep_layer: int = 5,   # Minimum nodes to keep per layer
         max_keep_layer: int = 100, # Maximum nodes to keep per layer
-        epsilon: float = 1e-4,     # Small value to inject for numerical stability (increased from 1e-6)
+        epsilon: float = 1e-7,     
         debug: bool = False,
     ):
         """
@@ -235,9 +235,12 @@ class EnhancedSemanticTracer:
             return {}
             
         total = sum(weights.values())
+
+        max_weight = max(abs(w) for w in weights.values()) if weights else 1.0
+        eps_rel = min_value * max_weight
         
         # If total is zero or very small, use uniform weights
-        if total < min_value:
+        if total < eps_rel:
             if self.debug:
                 print(f"Warning: Near-zero total weight ({total:.4e}). Using uniform weights.")
             return {idx: 1.0 / len(weights) for idx in weights}
@@ -1003,9 +1006,11 @@ class EnhancedSemanticTracer:
         # (attention values are already non-negative, so this won't change them)
         importance = target_vector.abs()
         
-        # Always add epsilon for numerical stability
-        importance = importance + self.epsilon
-        
+        if importance.sum() < self.epsilon:
+            if self.debug:
+                print(f"Warning: Near-zero importance vector detected (sum={importance.sum().item():.4e}). Adding epsilon.")
+            importance = importance + self.epsilon
+            
         # 1. Sort values and indices by importance (descending)
         vals, idxs = torch.sort(importance, descending=True)
         
@@ -1014,7 +1019,7 @@ class EnhancedSemanticTracer:
         
         # 2. Calculate cumulative coverage based on importance
         cum = torch.cumsum(vals, 0)
-        coverage = cum / cum[-1]
+        coverage = cum / cum[-1] + self.epsilon
         
         # 3. Create boolean mask for selected indices
         keep = coverage <= beta_target
@@ -1078,12 +1083,10 @@ class EnhancedSemanticTracer:
         # Extract weights as tensor for easier calculation
         weights = torch.tensor([abs(n.get('scaled_weight', 0)) for n in sorted_nodes])
         
-        # Add epsilon for stability
-        weights = weights + self.epsilon
         
         # 2. Calculate cumulative coverage
         cum_sum = torch.cumsum(weights, 0)
-        coverage = cum_sum / cum_sum[-1]
+        coverage = cum_sum / (cum_sum[-1] + self.epsilon)
         
         # 3. Create boolean mask for keeping nodes
         keep_mask = coverage <= beta_layer
