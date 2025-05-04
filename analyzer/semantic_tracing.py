@@ -662,9 +662,7 @@ class EnhancedSemanticTracer:
                                 use_cache=False,
                                 return_dict=True)
                 
-                # Cache all hidden states in CPU memory - needed for logit lens
-                for layer_idx, hidden in enumerate(outputs.hidden_states):
-                    self.hidden_states_cache[layer_idx] = hidden.detach().cpu() if self.cpu_offload else hidden.detach()
+                self._cache_hidden_states(outputs)
                 
                 # Cache all attention weights
                 if outputs.attentions:
@@ -1177,8 +1175,7 @@ class EnhancedSemanticTracer:
                                     return_dict=True)
                     
                     # Cache all hidden states
-                    for layer_idx, hidden in enumerate(outputs.hidden_states):
-                        self.hidden_states_cache[layer_idx] = hidden.detach().cpu() if self.cpu_offload else hidden.detach()
+                    self._cache_hidden_states(outputs)
                     
                     # Cache all attention weights
                     if outputs.attentions:
@@ -1230,8 +1227,7 @@ class EnhancedSemanticTracer:
                                 use_cache=False,
                                 return_dict=True)
                 # Cache all hidden states in CPU memory
-                for layer_idx, hidden in enumerate(outputs.hidden_states):
-                    self.hidden_states_cache[layer_idx] = hidden.detach().cpu() if self.cpu_offload else hidden.detach()
+                self._cache_hidden_states(outputs)
                 
                 # Cache all attention weights
                 if outputs.attentions:
@@ -2061,3 +2057,10 @@ class EnhancedSemanticTracer:
         all_results["metadata_path"] = metadata_path
         
         return all_results
+    
+    def _cache_hidden_states(self, outputs):
+        for hf_idx, hidden in enumerate(outputs.hidden_states):
+            if hf_idx == 0:
+                continue
+            layer_idx = hf_idx - 1
+            self.hidden_states_cache[layer_idx] = hidden.detach().cpu() if self.cpu_offload else hidden.detach()
