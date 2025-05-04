@@ -130,6 +130,8 @@ class EnhancedSemanticTracer:
         
         # Create a unique trace ID counter for identification
         self.trace_id_counter = 0
+        self.layer_att_means: List[float] = []
+        self.layer_sal_norms: List[float] = []
         
         # Special tokens mapping for handling empty token display issues
         self.SPECIAL_TEXT = {13: "\\n", 28705: "_"}
@@ -710,6 +712,9 @@ class EnhancedSemanticTracer:
                 # If batch dimension is present, take the first batch
                 attention_map = attention_map[0]
             
+            attn_mean = attention_map.mean().item()
+            self.layer_att_means.append(attn_mean)
+
             # 2. For each target, find the important source tokens using coverage-based selection
             target_to_sources = {}
             
@@ -1268,6 +1273,9 @@ class EnhancedSemanticTracer:
                 elif saliency_map.ndim == 3:  # [batch, seq, seq] or [head, seq, seq]
                     saliency_map = saliency_map.mean(dim=0)
                     
+                sal_norm = saliency_map.norm().item()
+                self.layer_sal_norms.append(sal_norm)
+
                 all_saliency_maps = {target_idx: saliency_map for target_idx in current_target_indices}
             else:
                 # OPTIMIZATION: Process all target tokens in one backward pass
@@ -2064,3 +2072,20 @@ class EnhancedSemanticTracer:
                 continue
             layer_idx = hf_idx - 1
             self.hidden_states_cache[layer_idx] = hidden.detach().cpu() if self.cpu_offload else hidden.detach()
+
+    def plot_attention_vs_saliency(self, save_path: Optional[str]=None):
+        
+        import matplotlib.pyplot as plt
+
+        layers = list(range(len(self.layer_att_means)))
+        plt.figure(figsize=(8,4))
+        plt.plot(layers, self.layer_att_means, label='ATT_mean')
+        plt.plot(layers, self.layer_sal_norms, label='SAL_norm')
+        plt.xlabel('Layer Index')
+        plt.ylabel('Strength')
+        plt.title('Attention vs Saliency Across Layers')
+        plt.legend()
+        plt.grid(True)
+        if save_path:
+            plt.savefig(save_path, bbox_inches='tight')
+        plt.show()
