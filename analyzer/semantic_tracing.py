@@ -724,7 +724,7 @@ class EnhancedSemanticTracer:
                     continue
                 
                 # Get attention from the target token to all previous tokens (causal)
-                target_vector = attention_map[target_idx, :target_idx]  # Only consider previous tokens
+                target_vector = attention_map[target_idx, :target_idx+1]  # Only consider previous tokens
                 
                 if len(target_vector) == 0:
                     print(f"Warning: Empty target vector for token {target_idx}. Skipping.")
@@ -1300,7 +1300,7 @@ class EnhancedSemanticTracer:
                     continue
                 
                 saliency_map = all_saliency_maps[target_idx]
-                target_vector = saliency_map[target_idx, :target_idx]  # Only consider previous tokens (causal)
+                target_vector = saliency_map[target_idx, :target_idx+1]  # Only consider previous tokens (causal)
                 
                 if len(target_vector) == 0:
                     print(f"Warning: Empty target vector for token {target_idx}. Skipping.")
