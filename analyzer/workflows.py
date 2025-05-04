@@ -488,22 +488,24 @@ def run_semantic_tracing_analysis(
     image_path: str, 
     prompt: str,
     output_dir: str,
-    beta_target: float = 0.8,    # Coverage parameter (replaces top_k)
-    beta_layer: float = 0.7,     # Layer-level coverage parameter
-    min_keep: int = 1,           # Min nodes per target
-    max_keep: int = 30,          # Max nodes per target
-    min_keep_layer: int = 5,     # Min nodes per layer
-    max_keep_layer: int = 100,   # Max nodes per layer
-    top_k: Optional[int] = None, # Deprecated parameter
+    beta_target: float = 0.8,
+    beta_layer: float = 0.7,
+    min_keep: int = 1,
+    max_keep: int = 30,
+    min_keep_layer: int = 5,
+    max_keep_layer: int = 100,
+    top_k: Optional[int] = None,
     num_tokens: int = 1,
     load_in_4bit: bool = True,
     target_token_idx: Optional[int] = None,
+    analyze_specific_indices: Optional[List[int]] = None,  # New parameter
+    generate_only: bool = False,  # New parameter
     image_size: Tuple[int, int] = (336, 336),
     concepts_to_track: Optional[List[str]] = None,
     normalize_weights: bool = True,
     single_forward_pass: bool = False,
     analyze_last_token: bool = False,
-    tracing_mode: str = "saliency",  # Options: "saliency", "attention", "both"
+    tracing_mode: str = "saliency",
     debug_mode: bool = False
 ) -> Dict[str, Any]:
     """
@@ -524,6 +526,8 @@ def run_semantic_tracing_analysis(
         num_tokens: Number of tokens to generate and analyze
         load_in_4bit: Whether to load the model in 4-bit precision
         target_token_idx: Index of specific token to analyze (if None, uses first generated token)
+        analyze_specific_indices: List of specific token indices to analyze
+        generate_only: If True, only generate tokens without analysis
         image_size: Size to resize the image to
         concepts_to_track: List of concepts to track with logit lens
         normalize_weights: Whether to normalize token importance weights between layers
@@ -537,7 +541,6 @@ def run_semantic_tracing_analysis(
     """
     from utils.data_utils import load_image
     from utils.model_utils import load_model
-    from analyzer.semantic_tracing import EnhancedSemanticTracer
     
     start_time = time.time()
     print(f"=== Starting Semantic Tracing Analysis ===")
@@ -553,8 +556,14 @@ def run_semantic_tracing_analysis(
     os.makedirs(csv_dir, exist_ok=True)
     
     # Print analysis mode information
-    mode_str = "Analyzing last token in prompt" if analyze_last_token else \
-               f"Analyzing {num_tokens} token(s)" + (" with single forward pass" if single_forward_pass else "")
+    if generate_only:
+        mode_str = f"Generating {num_tokens} tokens without analysis"
+    elif analyze_specific_indices:
+        mode_str = f"Generating {num_tokens} tokens and analyzing specific indices: {analyze_specific_indices}"
+    elif analyze_last_token:
+        mode_str = "Analyzing last token in prompt"
+    else:
+        mode_str = f"Analyzing {num_tokens} token(s)" + (" with single forward pass" if single_forward_pass else "")
     print(f"Mode: {mode_str}")
     
     # Print node selection parameters
@@ -597,7 +606,56 @@ def run_semantic_tracing_analysis(
     # 5. Run semantic tracing based on the selected mode
     print("\nRunning semantic tracing...")
     
-    if analyze_last_token:
+    if generate_only:
+        # Generate tokens without analysis (for faster generation)
+        model.eval()
+        inputs = input_data["inputs"]
+        current_input_ids = inputs["input_ids"].clone()
+        original_seq_len = current_input_ids.shape[1]
+        
+        with torch.no_grad():
+            for _ in range(num_tokens):
+                outputs = model(**{k: v for k, v in inputs.items() if k != "token_type_ids"}, use_cache=True)
+                logits = outputs.logits[:, -1, :]
+                next_token_id = torch.argmax(logits, dim=-1).unsqueeze(0)
+                current_input_ids = torch.cat([current_input_ids, next_token_id], dim=1)
+                
+                # Update inputs for next iteration
+                inputs["input_ids"] = current_input_ids
+                if "attention_mask" in inputs:
+                    inputs["attention_mask"] = torch.ones_like(current_input_ids)
+        
+        # Decode the complete sequence
+        generated_ids = current_input_ids[0, original_seq_len:].tolist()
+        generated_text = processor.tokenizer.decode(generated_ids)
+        
+        # Create results without trace data
+        trace_results = {
+            "full_sequence": {
+                "ids": current_input_ids[0].tolist(),
+                "text": processor.tokenizer.decode(current_input_ids[0].tolist()),
+                "generated_text": generated_text,
+                "prompt_length": original_seq_len
+            },
+            "generated_tokens": [
+                {
+                    "index": original_seq_len + i,
+                    "id": token_id,
+                    "text": processor.tokenizer.decode([token_id])
+                }
+                for i, token_id in enumerate(generated_ids)
+            ]
+        }
+    elif analyze_specific_indices:
+        # Generate all tokens first, then analyze specific indices
+        trace_results = tracer.generate_all_then_analyze_specific(
+            input_data=input_data,
+            num_tokens=num_tokens,
+            analyze_indices=analyze_specific_indices,
+            tracing_mode=tracing_mode,
+            batch_compute=not single_forward_pass
+        )
+    elif analyze_last_token:
         # Analyze the last token in the prompt directly
         trace_results = tracer.analyze_last_token(
             input_data=input_data,
@@ -627,27 +685,29 @@ def run_semantic_tracing_analysis(
         "csv_files": [],
         "metadata_path": trace_results.get("metadata_path"),
         "target_tokens": [],
+        "all_generated_tokens": trace_results.get("all_generated_tokens", []),
         "full_sequence": trace_results.get("full_sequence", {}),
         "analysis_time": time.time() - start_time,
-        "image_path": image_path,  # Store the original image path
-        "tracing_mode": tracing_mode  # Store the tracing mode used
+        "image_path": image_path,
+        "tracing_mode": tracing_mode
     }
     
-    # Extract CSV paths from results
-    if "trace_results" in trace_results:
-        # Handle both single token and multiple token results
-        if isinstance(trace_results["trace_results"], dict):
-            # Case 1: Direct trace_results dict with multiple tracing modes or single token
-            for mode_key, mode_value in trace_results["trace_results"].items():
-                # Check if this is a tracing mode results or a token results
-                if isinstance(mode_value, dict) and "trace_data_path" in mode_value:
-                    # This is a tracing mode result
-                    output_info["csv_files"].append(mode_value["trace_data_path"])
-                elif isinstance(mode_value, dict):
-                    # This is a token results with potentially multiple tracing modes
-                    for subkey, subvalue in mode_value.items():
-                        if isinstance(subvalue, dict) and "trace_data_path" in subvalue:
-                            output_info["csv_files"].append(subvalue["trace_data_path"])
+    # Extract CSV paths from results (skip for generate_only mode)
+    if not generate_only:
+        if "trace_results" in trace_results:
+            # Handle both single token and multiple token results
+            if isinstance(trace_results["trace_results"], dict):
+                # Process each token's results
+                for mode_key, mode_value in trace_results["trace_results"].items():
+                    # Check if this is a tracing mode results or a token results
+                    if isinstance(mode_value, dict) and "trace_data_path" in mode_value:
+                        # This is a tracing mode result
+                        output_info["csv_files"].append(mode_value["trace_data_path"])
+                    elif isinstance(mode_value, dict):
+                        # This is a token results with potentially multiple tracing modes
+                        for subkey, subvalue in mode_value.items():
+                            if isinstance(subvalue, dict) and "trace_data_path" in subvalue:
+                                output_info["csv_files"].append(subvalue["trace_data_path"])
     
     # Extract target token information
     if "target_tokens" in trace_results:
@@ -673,11 +733,13 @@ def run_semantic_tracing_analysis(
                 "max_keep": max_keep,
                 "min_keep_layer": min_keep_layer,
                 "max_keep_layer": max_keep_layer,
+                "analyze_specific_indices": analyze_specific_indices,
                 "analyze_last_token": analyze_last_token,
                 "single_forward_pass": single_forward_pass,
                 "csv_files": output_info["csv_files"],
                 "metadata_path": output_info["metadata_path"],
                 "target_tokens": output_info["target_tokens"],
+                "all_generated_tokens": output_info.get("all_generated_tokens", []),
                 "full_sequence": output_info["full_sequence"],
                 "analysis_time": output_info["analysis_time"]
             }
@@ -689,7 +751,11 @@ def run_semantic_tracing_analysis(
     print(f"\n=== Analysis Complete ===")
     print(f"Analysis time: {output_info['analysis_time']:.2f} seconds")
     print(f"CSV data saved to: {csv_dir}")
-    print(f"Generated {len(output_info['csv_files'])} trace data files")
+    
+    if not generate_only:
+        print(f"Generated {len(output_info['csv_files'])} trace data files")
+    else:
+        print(f"Generated {len(output_info.get('all_generated_tokens', []))} tokens without analysis")
     
     # Clean up memory
     del model, processor, tracer, input_data, trace_results
@@ -715,8 +781,9 @@ def run_semantic_tracing_test(
     analyze_last_token: bool = False,
     single_forward_pass: bool = False,
     target_token_idx: Optional[int] = None,
-    tracing_mode: str = "both",  # Options: "saliency", "attention", "both"
-    # Visualization parameters
+    analyze_specific_indices: Optional[List[int]] = None,  # New parameter
+    generate_first: bool = False,  # New parameter for two-step process
+    tracing_mode: str = "both",
     skip_visualization: bool = False,
     output_format: str = "both",
     show_orphaned_nodes: bool = False,
@@ -725,7 +792,7 @@ def run_semantic_tracing_test(
     debug_mode: bool = False
 ) -> Dict[str, Any]:
     """
-    Run semantic tracing test with improved multi-token handling and coverage-based selection.
+    Run semantic tracing test with improved multi-token handling and specific token analysis.
     
     Args:
         model_id: HuggingFace model ID
@@ -744,6 +811,8 @@ def run_semantic_tracing_test(
         analyze_last_token: Analyze last token in prompt
         single_forward_pass: Use single forward pass
         target_token_idx: Index of specific token to analyze (None means generate new tokens)
+        analyze_specific_indices: List of specific token indices to analyze
+        generate_first: Two-step process: first generate all tokens, then analyze specific indices
         tracing_mode: The tracing mode to use ("saliency", "attention", or "both")
         skip_visualization: Skip visualization step
         output_format: Output format (png, svg, or both)
@@ -754,7 +823,7 @@ def run_semantic_tracing_test(
     Returns:
         Dictionary with test results
     """
-    # Import necessary functions here to avoid circular imports
+    # Import necessary functions
     from utils.data_utils import load_image
     from utils.model_utils import load_model
     from analyzer.semantic_tracing import EnhancedSemanticTracer
@@ -779,12 +848,21 @@ def run_semantic_tracing_test(
     print(f"Image: {image_url}")
     print(f"Prompt: {prompt_text}")
     print(f"Output Directory: {output_dir}")
-    print(f"Tokens to analyze: {num_tokens}")
-    print(f"Target token index: {target_token_idx if target_token_idx is not None else 'None (generate new)'}")
+    print(f"Tokens to generate: {num_tokens}")
+    
+    # Print specific token analysis info if applicable
+    if analyze_specific_indices:
+        print(f"Analyzing specific token indices: {analyze_specific_indices}")
+    elif target_token_idx is not None:
+        print(f"Analyzing specific token index: {target_token_idx}")
+    elif analyze_last_token:
+        print("Analyzing last token in prompt")
+    else:
+        print(f"Analyzing all generated tokens")
+    
     print(f"Tracing mode: {tracing_mode}")
     print(f"Coverage Parameters: β_target={beta_target}, β_layer={beta_layer}")
     print(f"Node Limits: min_keep={min_keep}, max_keep={max_keep}, min_keep_layer={min_keep_layer}, max_keep_layer={max_keep_layer}")
-    print(f"Analysis mode: {'Last token' if analyze_last_token else 'Multiple tokens'}")
     print(f"Using single forward pass: {single_forward_pass}")
     
     # Create the visualizer for image handling
@@ -798,7 +876,7 @@ def run_semantic_tracing_test(
         print(f"Error: Could not obtain local image from {image_url}")
         return {"error": f"Image not available: {image_url}"}
     
-    # Clean memory if helper function is available
+    # Clean memory
     try:
         import gc
         gc.collect()
@@ -811,35 +889,97 @@ def run_semantic_tracing_test(
     start_time = time.time()
     
     try:
-        # 1. Run analysis only
-        analysis_results = run_semantic_tracing_analysis(
-            model_id=model_id,
-            image_path=local_image_path,
-            prompt=prompt_text,
-            output_dir=output_dir,
-            beta_target=beta_target,
-            beta_layer=beta_layer,
-            min_keep=min_keep,
-            max_keep=max_keep,
-            min_keep_layer=min_keep_layer,
-            max_keep_layer=max_keep_layer,
-            num_tokens=num_tokens,
-            load_in_4bit=load_in_4bit,
-            concepts_to_track=concepts_to_track,
-            normalize_weights=True,
-            single_forward_pass=single_forward_pass,
-            analyze_last_token=analyze_last_token,
-            target_token_idx=target_token_idx,
-            tracing_mode=tracing_mode,
-            debug_mode=debug_mode
-        )
+        # Two-step process if requested
+        if generate_first:
+            print("\n=== STEP 1: Generating complete sequence ===")
+            # First step: Generate all tokens without analysis
+            generation_results = run_semantic_tracing_analysis(
+                model_id=model_id,
+                image_path=local_image_path,
+                prompt=prompt_text,
+                output_dir=output_dir,
+                num_tokens=num_tokens,
+                load_in_4bit=load_in_4bit,
+                generate_only=True  # Only generate, don't analyze
+            )
+            
+            # Extract token information from generation
+            all_tokens = generation_results.get("all_generated_tokens", [])
+            prompt_length = generation_results.get("full_sequence", {}).get("prompt_length", 0)
+            
+            if all_tokens:
+                print(f"\nGenerated {len(all_tokens)} tokens:")
+                for i, token in enumerate(all_tokens):
+                    if i < 10 or i >= len(all_tokens) - 5:  # Show first 10 and last 5
+                        print(f"  {i}: '{token['text']}' at position {token['index']} (ID: {token['id']})")
+                    elif i == 10:
+                        print(f"  ... ({len(all_tokens) - 15} more tokens) ...")
+                
+                # If no specific indices provided, prompt the user
+                if analyze_specific_indices is None:
+                    print("\nNo specific token indices provided for analysis.")
+                    print("Please provide specific indices in the 'analyze_specific_indices' parameter.")
+                    analyze_specific_indices = [prompt_length]  # Default to analyzing the first generated token
+            
+            print("\n=== STEP 2: Analyzing specific token indices ===")
+            if analyze_specific_indices:
+                print(f"Analyzing indices: {analyze_specific_indices}")
+            else:
+                print("No valid indices to analyze.")
+                return generation_results
+            
+            # Second step: Analyze specific tokens
+            analysis_results = run_semantic_tracing_analysis(
+                model_id=model_id,
+                image_path=local_image_path,
+                prompt=prompt_text,
+                output_dir=output_dir,
+                beta_target=beta_target,
+                beta_layer=beta_layer,
+                min_keep=min_keep,
+                max_keep=max_keep,
+                min_keep_layer=min_keep_layer,
+                max_keep_layer=max_keep_layer,
+                num_tokens=num_tokens,
+                load_in_4bit=load_in_4bit,
+                concepts_to_track=concepts_to_track,
+                normalize_weights=True,
+                single_forward_pass=single_forward_pass,
+                analyze_specific_indices=analyze_specific_indices,
+                tracing_mode=tracing_mode,
+                debug_mode=debug_mode
+            )
+        else:
+            # Single-step process: traditional analysis
+            analysis_results = run_semantic_tracing_analysis(
+                model_id=model_id,
+                image_path=local_image_path,
+                prompt=prompt_text,
+                output_dir=output_dir,
+                beta_target=beta_target,
+                beta_layer=beta_layer,
+                min_keep=min_keep,
+                max_keep=max_keep,
+                min_keep_layer=min_keep_layer,
+                max_keep_layer=max_keep_layer,
+                num_tokens=num_tokens,
+                load_in_4bit=load_in_4bit,
+                concepts_to_track=concepts_to_track,
+                normalize_weights=True,
+                single_forward_pass=single_forward_pass,
+                analyze_last_token=analyze_last_token,
+                target_token_idx=target_token_idx,
+                analyze_specific_indices=analyze_specific_indices,
+                tracing_mode=tracing_mode,
+                debug_mode=debug_mode
+            )
         
         # Prepare results to return
         test_results = {
             "analysis_results": analysis_results,
             "visualization_paths": [],
-            "image_path": local_image_path,  # Store local image path for reference
-            "tracing_mode": tracing_mode     # Store tracing mode used
+            "image_path": local_image_path,
+            "tracing_mode": tracing_mode
         }
         
         # Check if we have valid CSV files
@@ -848,7 +988,7 @@ def run_semantic_tracing_test(
             test_results["error"] = "No CSV files generated"
             return test_results
         
-        # 2. Run visualization if not skipped
+        # Run visualization if not skipped
         if not skip_visualization:
             # Set flow graph parameters
             flow_graph_params = {
@@ -867,10 +1007,9 @@ def run_semantic_tracing_test(
             
             print("\nRunning visualization step...")
             
-            # Use the standalone helper function to visualize all CSVs
+            # Process each CSV independently with unique output directories
             all_vis_results = {}
             
-            # Process each CSV independently with unique output directories
             for idx, csv_path in enumerate(analysis_results.get("csv_files", [])):
                 # Extract tracing mode from the filename
                 if "trace_saliency_" in csv_path:

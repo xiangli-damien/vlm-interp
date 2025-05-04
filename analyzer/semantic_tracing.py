@@ -1909,3 +1909,155 @@ class EnhancedSemanticTracer:
             import traceback
             traceback.print_exc()
             return {}
+        
+    def generate_all_then_analyze_specific(
+        self,
+        input_data: Dict[str, Any],
+        num_tokens: int = 10,
+        analyze_indices: Optional[List[int]] = None,
+        tracing_mode: str = "saliency",  # Options: "saliency", "attention", "both"
+        batch_compute: bool = True
+    ) -> Dict[str, Any]:
+        """
+        First generates a complete sequence of tokens, then analyzes only specific token indices.
+        
+        Args:
+            input_data: Prepared input data from prepare_inputs
+            num_tokens: Number of tokens to generate in the complete sequence
+            analyze_indices: Specific indices to analyze (None means analyze all generated tokens)
+            tracing_mode: The tracing mode to use ("saliency", "attention", or "both")
+            batch_compute: Whether to compute saliency in layer batches to save memory
+            
+        Returns:
+            Dictionary with analysis results and full sequence information
+        """
+        model = self.model
+        device = self.device
+        
+        # 1. Generate the complete sequence first
+        print(f"\n=== Generating complete sequence of {num_tokens} tokens ===")
+        inputs = input_data["inputs"]
+        current_input_ids = inputs["input_ids"].clone()
+        original_seq_len = current_input_ids.shape[1]
+        
+        model.eval()
+        generated_tokens = []
+        
+        with torch.no_grad():
+            for token_idx in range(num_tokens):
+                outputs = model(**{k: v for k, v in inputs.items() if k != "token_type_ids"},
+                            use_cache=True)
+                logits = outputs.logits[:, -1, :]
+                next_token_id = torch.argmax(logits, dim=-1).unsqueeze(0)
+                current_input_ids = torch.cat([current_input_ids, next_token_id], dim=1)
+                
+                # Store token info
+                token_id = next_token_id.item()
+                token_text = self._get_token_text(token_id)
+                generated_tokens.append({
+                    "index": original_seq_len + token_idx,
+                    "id": token_id,
+                    "text": token_text
+                })
+                
+                # Update inputs for next iteration
+                inputs["input_ids"] = current_input_ids
+                if "attention_mask" in inputs:
+                    inputs["attention_mask"] = torch.ones_like(current_input_ids)
+                
+                # Print progress
+                if token_idx < 5 or token_idx % 10 == 0:
+                    print(f"Generated token {token_idx+1}/{num_tokens}: '{token_text}' (ID: {token_id})")
+        
+        # Decode the complete sequence
+        gen_ids = current_input_ids[0, original_seq_len:].tolist()
+        complete_text = self.processor.tokenizer.decode(gen_ids)
+        print(f"\nComplete generated text: '{complete_text}'")
+        
+        # 2. Determine which tokens to analyze
+        if analyze_indices is None:
+            # Analyze all generated tokens (original behavior)
+            analyze_indices = [original_seq_len + i for i in range(len(generated_tokens))]
+        else:
+            # Filter to ensure indices are valid
+            analyze_indices = [idx for idx in analyze_indices if original_seq_len <= idx < current_input_ids.shape[1]]
+        
+        print(f"\n=== Analyzing {len(analyze_indices)} specific tokens ===")
+        for i, idx in enumerate(analyze_indices):
+            relative_pos = idx - original_seq_len
+            if 0 <= relative_pos < len(generated_tokens):
+                token = generated_tokens[relative_pos]
+                print(f"Token {i+1}: '{token['text']}' at position {idx} (ID: {token['id']})")
+        
+        # 3. Set up results dictionary
+        all_results = {
+            "input_data": input_data,
+            "target_tokens": [generated_tokens[idx - original_seq_len] for idx in analyze_indices if original_seq_len <= idx < current_input_ids.shape[1]],
+            "all_generated_tokens": generated_tokens,
+            "full_sequence": {
+                "ids": current_input_ids[0].tolist(),
+                "text": self.processor.tokenizer.decode(current_input_ids[0].tolist()),
+                "generated_text": complete_text
+            },
+            "trace_results": {},
+            "metadata": {"tracing_mode": tracing_mode}
+        }
+        
+        # 4. Analyze each requested token
+        for target_idx in analyze_indices:
+            if target_idx < original_seq_len or target_idx >= current_input_ids.shape[1]:
+                print(f"Warning: Token index {target_idx} is outside the valid range. Skipping.")
+                continue
+            
+            # Get token info
+            token_id = current_input_ids[0, target_idx].item()
+            token_text = self._get_token_text(token_id)
+            print(f"\nAnalyzing token at index {target_idx}: '{token_text}' (ID: {token_id})")
+            
+            # Clear caches for fresh analysis
+            self.hidden_states_cache = {}
+            self.saliency_cache = {}
+            self.attention_cache = {}
+            
+            # Increment trace ID
+            self.trace_id_counter += 1
+            current_trace_id = self.trace_id_counter
+            
+            # Create token-specific results container
+            token_key = f"token_{target_idx}"
+            all_results["trace_results"][token_key] = {}
+            
+            # Run appropriate tracing based on the mode
+            if tracing_mode == "saliency" or tracing_mode == "both":
+                saliency_results = self._recursive_trace(
+                    inputs=inputs,
+                    text_indices=input_data["text_indices"],
+                    image_indices=input_data["image_indices"],
+                    target_token_idx=target_idx,
+                    batch_compute=batch_compute,
+                    trace_id=current_trace_id,
+                    tracing_mode="saliency",
+                )
+                all_results["trace_results"][token_key]["saliency"] = saliency_results
+            
+            if tracing_mode == "attention" or tracing_mode == "both":
+                attention_results = self.trace_by_attention(
+                    inputs=inputs,
+                    text_indices=input_data["text_indices"],
+                    image_indices=input_data["image_indices"],
+                    target_token_idx=target_idx,
+                    trace_id=current_trace_id,
+                )
+                all_results["trace_results"][token_key]["attention"] = attention_results
+            
+            # Force garbage collection
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # 5. Save metadata for visualization
+        metadata_path = os.path.join(self.output_dir, "csv_data", f"trace_metadata.json")
+        self._save_trace_metadata(all_results, metadata_path)
+        all_results["metadata_path"] = metadata_path
+        
+        return all_results
