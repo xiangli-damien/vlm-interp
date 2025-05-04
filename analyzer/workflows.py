@@ -670,6 +670,7 @@ def run_semantic_tracing_analysis(
             batch_compute=not single_forward_pass,
             tracing_mode=tracing_mode
         )
+
     else:
         # Standard single token analysis
         trace_results = tracer.generate_and_analyze(
@@ -679,7 +680,8 @@ def run_semantic_tracing_analysis(
             batch_compute=not single_forward_pass,
             tracing_mode=tracing_mode
         )
-        tracer.plot_attention_vs_saliency(save_path="semantic_tracing_results/att_vs_sal.png")
+    
+    tracer.plot_attention_vs_saliency(save_path="semantic_tracing_results/att_vs_sal.png")
     
     # Prepare output information
     output_info = {
