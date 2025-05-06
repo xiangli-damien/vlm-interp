@@ -2072,20 +2072,3 @@ class EnhancedSemanticTracer:
                 continue
             layer_idx = hf_idx - 1
             self.hidden_states_cache[layer_idx] = hidden.detach().cpu() if self.cpu_offload else hidden.detach()
-
-    def plot_attention_vs_saliency(self, save_path: Optional[str]=None):
-        
-        import matplotlib.pyplot as plt
-
-        layers = list(range(len(self.layer_att_means)))
-        plt.figure(figsize=(8,4))
-        plt.plot(layers, self.layer_att_means, label='ATT_mean')
-        plt.plot(layers, self.layer_sal_norms, label='SAL_norm')
-        plt.xlabel('Layer Index')
-        plt.ylabel('Strength')
-        plt.title('Attention vs Saliency Across Layers')
-        plt.legend()
-        plt.grid(True)
-        if save_path:
-            plt.savefig(save_path, bbox_inches='tight')
-        plt.show()
