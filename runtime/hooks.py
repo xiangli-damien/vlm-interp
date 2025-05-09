@@ -8,7 +8,8 @@ import gc
 from typing import Dict, List, Any, Optional, Tuple, Callable, Union
 from runtime.cache import TracingCache
 import logging
-from runtime.model_utils import get_module_by_name
+# Import required model utility functions
+from runtime.model_utils import get_module_by_name, get_llm_attention_layer_names
 
 # Configure logging
 logger = logging.getLogger("hook_manager")
@@ -26,7 +27,7 @@ class TraceHookManager:
     """
     
     def __init__(self, model: nn.Module, cpu_offload: bool = True, pin_memory: bool = False,
-                 detach_after_forward: bool = True):
+                 detach_after_forward: bool = False):
         """
         Initialize the hook manager.
         
@@ -495,3 +496,40 @@ class TraceHookManager:
                         self.cache.set(layer_idx, "attention", attn_weights, detach=False)
                         
         return hook_fn
+
+    def _register_hooks(self):
+        """Register hooks with proper layer index mapping for language model layers only."""
+        # First get all attention layer names
+        all_attn_layer_names = get_llm_attention_layer_names(self.model)
+        logger.info(f"Found {len(all_attn_layer_names)} attention layer names")
+        
+        # Filter to ensure we only get language model layers, not vision layers
+        lm_attn_layers = []
+        for name in all_attn_layer_names:
+            # Check for language model path components
+            if any(pattern in name for pattern in ["language_model", "lm_model", "text_model"]):
+                lm_attn_layers.append(name)
+        
+        # If we didn't find any with those patterns, use all layers
+        if not lm_attn_layers:
+            lm_attn_layers = all_attn_layer_names
+            logger.warning("Could not identify specific language model layers, using all attention layers")
+        
+        # Build an explicit mapping from index to layer name
+        self._idx_to_name = {}
+        for idx, name in enumerate(lm_attn_layers):
+            if idx in self.layers:
+                self._idx_to_name[idx] = name
+                # Register hooks with explicit layer index
+                self.hooks.add_layer(
+                    name, 
+                    capture=["hidden", "attention", "grad"], 
+                    layer_idx=idx
+                )
+        
+        # Important: Set detach_after_forward=False to enable gradient flow
+        self.hooks._detach_after_forward = False
+        
+        # Install hooks
+        num_installed = self.hooks.install()
+        logger.info(f"Installed {num_installed} hooks on language model layers")

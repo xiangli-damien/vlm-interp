@@ -1,0 +1,26 @@
+[
+    {
+      "image": "https://vagabundler.com/wp-content/uploads/2019/06/P3160166-Copy.jpg",
+      "prompt_two_hop": "Name one of the famous bridges on the river next to the landmark in the picture.",
+      "prompt_one_hop": "Name one of the famous bridges on the Seine River.",
+      "prompt_two_hop_entity_sub": "Name one of the famous bridges on the river next to the Statue of Liberty.",
+      "prompt_two_hop_rel_sub": "Name one of the famous restaurants on the river next to the landmark in the picture.",
+      "bridge_entity": "Seine"
+    },
+    {
+      "image": "https://vagabundler.com/wp-content/uploads/2019/06/P3160166-Copy.jpg",
+      "prompt_two_hop": "What is the name of the river flowing next to the tower in this image?",
+      "prompt_one_hop": "What is the name of the Seine River?",
+      "prompt_two_hop_entity_sub": "What is the name of the river flowing next to the Louvre Museum?",
+      "prompt_two_hop_rel_sub": "What is the height of the river flowing next to the tower in this image?",
+      "bridge_entity": "Seine"
+    },
+    {
+      "image": "https://vagabundler.com/wp-content/uploads/2019/06/P3160166-Copy.jpg",
+      "prompt_two_hop": "In which city is the landmark shown in the image located?",
+      "prompt_one_hop": "In which city is the Eiffel Tower located?",
+      "prompt_two_hop_entity_sub": "In which city is the Burj Khalifa located?",
+      "prompt_two_hop_rel_sub": "In which year was the landmark shown in the image built?",
+      "bridge_entity": "Eiffel Tower"
+    }
+  ]
