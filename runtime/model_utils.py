@@ -12,7 +12,8 @@ Includes functions for:
 import torch
 import torch.nn as nn
 import time
-from typing import Dict, Any, Optional, Tuple
+from typing import List, Dict, Tuple, Any, Optional, Union
+
 
 # Import necessary components from transformers
 from transformers import (
