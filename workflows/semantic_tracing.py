@@ -362,7 +362,25 @@ class SemanticTracingWorkflow(GenerationMixin):
                 # Default to saliency if invalid mode provided
                 logger.warning(f"Invalid tracing mode: {mode}. Using saliency mode instead.")
                 mode = TraceMode.SALIENCY
-                
+
+        # Initialize the backend if it doesn't exist yet
+        if mode not in self.backends:
+            logger.info(f"Initializing {mode.value} backend on first use")
+            if mode == TraceMode.ATTENTION:
+                self.backends[mode] = AttentionBackend(
+                    model=self.model,
+                    layer_names=self.layer_names,
+                    cache=self.cache,
+                    device=self.device
+                )
+            elif mode == TraceMode.SALIENCY:
+                self.backends[mode] = SaliencyBackend(
+                    model=self.model,
+                    layer_names=self.layer_names,
+                    cache=self.cache,
+                    device=self.device
+                )
+        
         # Get the appropriate backend based on the mode
         backend = self.backends[mode]
         layer_traces = []
