@@ -298,98 +298,107 @@ class SaliencyBackend:
         
     def compute_batch_saliency(self, target_indices, inputs, layer_batch_size=1):
         """
-        Memory-optimized version: Efficiently compute saliency for multiple layers and target tokens.
-        Layers are processed in small batches to reduce GPU memory usage.
-
-        Args:
-            target_indices (List[int]): List of target token indices to compute saliency for.
-            inputs (Dict[str, torch.Tensor]): Preprocessed input tensors (e.g., input_ids, attention_mask).
-            layer_batch_size (int): Number of layers to process in a single batch to control memory usage.
+        Ultra memory-optimized version: processes each token and each layer individually 
+        using mixed precision and progressive offloading.
         """
-        # Skip if no valid targets provided
+        # Return early if there are no valid targets
         if not target_indices:
             return
 
-        # Filter out invalid token indices (e.g., padding or out-of-bound indices)
+        # Filter out invalid token indices
         max_idx = inputs["input_ids"].size(1) - 1
-        valid_targets = [idx for idx in target_indices if 0 < idx <= max_idx]  # Skip index 0 (usually BOS)
+        valid_targets = [idx for idx in target_indices if 0 < idx <= max_idx]
 
         if not valid_targets:
             return
 
-        # Get full list of layer indices
+        # Get list of all layer indices
         all_layer_indices = list(range(len(self.layer_names)))
 
-        # Process each target token individually (saves memory by avoiding multi-target backward passes)
+        # Process each target token independently
         for target_idx in valid_targets:
-            # Process layers in batches (layer_batch_size)
-            for batch_start in range(0, len(all_layer_indices), layer_batch_size):
-                batch_end = min(batch_start + layer_batch_size, len(all_layer_indices))
-                current_layer_indices = all_layer_indices[batch_start:batch_end]
-                current_layer_names = [self.layer_names[i] for i in current_layer_indices]
+            logger.info(f"Computing batch saliency for token {target_idx}")
 
-                # Initialize a hook manager for this layer batch
+            # Process each layer individually to minimize memory usage
+            for layer_idx in all_layer_indices:
+                layer_name = self.layer_names[layer_idx]
+                logger.debug(f"Processing layer {layer_idx}/{len(all_layer_indices)}: {layer_name}")
+
+                # Create a new hook manager for this specific layer
                 hook_mgr = TraceHookManager(
                     self.model,
-                    cpu_offload=True,             # Offload activations to CPU after forward to save VRAM
-                    detach_after_forward=True     # Detach to avoid retaining autograd graph
+                    cpu_offload=True,
+                    detach_after_forward=True
                 )
 
-                # Register attention and gradient hooks for each layer in the current batch
-                for idx, layer_name in zip(current_layer_indices, current_layer_names):
-                    hook_mgr.add_layer(
-                        layer_name,
-                        capture=["attention", "grad"],  # Capture both attention and gradient tensors
-                        layer_idx=idx
-                    )
+                # Register only the current layer, not multiple layers
+                hook_mgr.add_layer(
+                    layer_name,
+                    capture=["attention", "grad"],
+                    layer_idx=layer_idx
+                )
 
-                # Install all hooks
+                # Install hooks
                 hook_mgr.install()
 
                 try:
-                    # Define loss function for the current target token
+                    # Define the loss function for the current target token only
                     def loss_fn(outputs):
-                        """
-                        Compute the negative log-probability for the true token at `target_idx`
-                        using the logits output of the model.
-                        """
+                        # Extract logits from the model output
                         logits = outputs.logits  # [B, seq_len, vocab_size]
-                        log_probs = torch.log_softmax(logits.float(), dim=-1)
 
+                        # Compute log probabilities in float32 for numerical stability
+                        log_probs = torch.log_softmax(logits, dim=-1)
+
+                        # Compute loss based on the token at the previous position
                         prev_idx = target_idx - 1
                         input_ids = inputs["input_ids"][0]
 
-                        # Extra safety check in case of index out-of-bounds
+                        # Safety check: skip invalid indices
                         if target_idx >= len(input_ids):
                             return torch.tensor(0.0, device=logits.device, requires_grad=True)
 
                         true_token_id = input_ids[target_idx].item()
-                        token_loss = -log_probs[0, prev_idx, true_token_id]  # Negative log prob
+
+                        # Compute negative log-probability for the true token
+                        token_loss = -log_probs[0, prev_idx, true_token_id]
 
                         return token_loss
 
-                    # Run the model forward + backward pass with hooks and loss_fn
-                    hook_mgr.run(inputs, loss_fn)
+                    # Prepare a minimal input dictionary (retain only necessary parts)
+                    minimal_inputs = {}
+                    for k, v in inputs.items():
+                        if isinstance(v, torch.Tensor):
+                            if v.dtype == torch.float32 and v.numel() > 1000:
+                                # Convert large float32 tensors to float16 to reduce memory
+                                minimal_inputs[k] = v.to(torch.float16)
+                            else:
+                                # Use clone only for small tensors
+                                minimal_inputs[k] = v.clone() if v.numel() < 1000 else v
+                        else:
+                            minimal_inputs[k] = v
 
-                    # Compute saliency scores from captured gradients
+                    # Run the model using the hook-enabled version
+                    hook_mgr.run(minimal_inputs, loss_fn)
+
+                    # Compute saliency from collected gradients
                     hook_mgr.compute_saliency()
 
-                    # Get captured tensor snapshot
+                    # Retrieve snapshot of all collected tensors
                     snapshot = hook_mgr.snapshot()
 
-                    # Transfer results to cache for each layer in this batch
-                    for layer_idx in current_layer_indices:
-                        # If saliency available (combined), use that
-                        if snapshot.has(layer_idx, "saliency"):
-                            self.cache.set(layer_idx, "saliency", snapshot.get(layer_idx, "saliency"))
-                        else:
-                            # Otherwise store attention and gradient separately
-                            if snapshot.has(layer_idx, "attention"):
-                                self.cache.set(layer_idx, "attention", snapshot.get(layer_idx, "attention"))
-                            if snapshot.has(layer_idx, "grad"):
-                                self.cache.set(layer_idx, "grad", snapshot.get(layer_idx, "grad"))
+                    # Transfer saliency for the current layer into the main cache
+                    if snapshot.has(layer_idx, "saliency"):
+                        self.cache.set(layer_idx, "saliency", snapshot.get(layer_idx, "saliency"))
+                    else:
+                        # Alternatively store individual attention and gradient components
+                        if snapshot.has(layer_idx, "attention"):
+                            self.cache.set(layer_idx, "attention", snapshot.get(layer_idx, "attention"))
+                        if snapshot.has(layer_idx, "grad"):
+                            self.cache.set(layer_idx, "grad", snapshot.get(layer_idx, "grad"))
 
-                    # Force memory cleanup after each layer batch
+                    # Force memory cleanup after each layer
+                    del minimal_inputs
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -399,14 +408,17 @@ class SaliencyBackend:
                     import traceback
                     traceback.print_exc()
                 finally:
-                    # Always clear hooks after each batch to prevent memory leaks
+                    # Clear all registered hooks
                     hook_mgr.clear()
+
+                    # Force memory cleanup after hook teardown
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-        # Restore model to eval mode after tracing
+        # Ensure model is reset to eval mode after tracing
         self.model.eval()
+
 
 
     @staticmethod

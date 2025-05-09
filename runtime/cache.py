@@ -34,35 +34,37 @@ class TracingCache:
         
     def set(self, layer_idx: int, cache_type: str, tensor: torch.Tensor, detach: bool = True) -> None:
         """
-        Store a tensor in the cache using an aggressive memory-optimization strategy.
+        Modified set method that aggressively offloads all tensors to CPU and converts them to float16 
+        to minimize memory usage.
 
         Args:
             layer_idx (int): Index of the layer used as the cache key.
             cache_type (str): Type of cache ("hidden", "attention", "saliency", "grad").
             tensor (torch.Tensor): The tensor to store.
-            detach (bool): Whether to detach the tensor from the computation graph (for gradients).
+            detach (bool): Whether to detach the tensor from the computation graph.
         """
         if cache_type not in ["hidden", "attention", "saliency", "grad"]:
             raise ValueError(f"Unknown cache type: {cache_type}")
-        
-        # Preprocess tensor: detach and move to CPU if required
+
+        # Start with the input tensor
         processed = tensor
 
-        # Ensure we are working with a detached version if required
-        if processed.requires_grad and detach:
+        # Detach the tensor if required
+        if detach and processed.requires_grad:
             processed = processed.detach()
 
-        # Convert to float16 if on GPU and of high-precision dtype, to save memory
-        if processed.device.type == "cuda" and processed.dtype in {torch.float32, torch.float64}:
+        # Convert to float16 to reduce memory footprint
+        if processed.dtype in {torch.float32, torch.float64}:
             processed = processed.to(torch.float16)
 
-        # Move to CPU to offload GPU memory
-        if self.cpu_offload and processed.device.type == "cuda":
+        # Force offload to CPU to free GPU memory
+        if processed.device.type == "cuda":
             processed = processed.cpu()
-            if self.pin_memory:
-                processed = processed.pin_memory()
+            # Explicitly delete the original tensor to trigger immediate memory release
+            del tensor
+            torch.cuda.empty_cache()
 
-        # Store tensor in the appropriate cache dictionary
+        # Store the processed tensor in the appropriate cache
         if cache_type == "hidden":
             self.hidden_states[layer_idx] = processed
         elif cache_type == "attention":
@@ -71,15 +73,10 @@ class TracingCache:
             self.saliency[layer_idx] = processed
         elif cache_type == "grad":
             self.grad[layer_idx] = processed
-            # Remove missing flag if present
+            # Remove the 'missing gradient' flag if present
             if layer_idx in self.grad_missing:
                 del self.grad_missing[layer_idx]
 
-        # Force garbage collection for large tensors to prevent memory leaks
-        if tensor.device.type == "cuda" and tensor.numel() > 1_000_000:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     
     def set_custom(self, tag: str, obj: Any) -> None:
