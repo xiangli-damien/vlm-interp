@@ -3,6 +3,11 @@ import os
 import math
 import numpy as np
 import matplotlib.pyplot as plt
+import logging
+
+logger = logging.getLogger("logit_viz")
+logger.setLevel(logging.INFO)
+
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Dict, Any, Optional, Tuple
 

@@ -12,7 +12,9 @@ Includes functions for:
 import torch
 import torch.nn as nn
 import time
-from typing import List, Dict, Tuple, Any, Optional, Union
+from typing import Optional, Tuple
+from packaging import version
+from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor
 
 
 # Import necessary components from transformers
@@ -38,7 +40,6 @@ MODEL_OPTIONS = {
     }
 }
 
-
 def load_model(
     model_id: str,
     use_flash_attn: bool = False,
@@ -47,65 +48,66 @@ def load_model(
     device_map: Optional[str] = "auto"
 ) -> Tuple[LlavaNextForConditionalGeneration, LlavaNextProcessor]:
     """
-    Loads a LLaVA-Next model and processor with configurable options.
+    Loads a LLaVA-Next model and processor with flexible support for Flash Attention and 4-bit quantization.
 
     Args:
-        model_id: HuggingFace model ID
-        use_flash_attn: Enable Flash Attention 2 if available
-        load_in_4bit: Load the model using 4-bit quantization
-        enable_gradients: Set requires_grad=True for model parameters
-        device_map: Device map strategy for from_pretrained
+        model_id (str): HuggingFace model ID to load.
+        use_flash_attn (bool): Whether to enable Flash Attention 2 (requires compatible GPU and library).
+        load_in_4bit (bool): Whether to load the model using 4-bit quantization (requires bitsandbytes).
+        enable_gradients (bool): If True, enables requires_grad on model parameters.
+        device_map (Optional[str]): Device mapping for model loading. Defaults to "auto".
 
     Returns:
-        (model, processor): The loaded model and processor
+        Tuple: (model, processor)
     """
     start_time = time.time()
-    print(f"Loading model and processor for: {model_id}...")
+    print(f"[INFO] Loading model and processor from: {model_id}...")
 
-    # --- Load Processor ---
+    # --- Load processor ---
     try:
         processor = LlavaNextProcessor.from_pretrained(model_id)
-        print("Processor loaded successfully.")
+        print("[✓] Processor loaded.")
     except Exception as e:
-        print(f"Error loading processor for {model_id}: {e}")
-        raise RuntimeError(f"Failed to load processor for {model_id}") from e
+        raise RuntimeError(f"[ERROR] Failed to load processor: {e}") from e
 
-    # --- Configure Model Loading ---
+    # --- Configure attention ---
     attn_implementation = "flash_attention_2" if use_flash_attn else "eager"
     if use_flash_attn:
-         print(f"Attempting to use attn_implementation='{attn_implementation}'")
+        print("[INFO] Flash Attention 2 requested. Will use attn_implementation='flash_attention_2'.")
 
+    # --- Configure precision and device ---
     quantization_config = None
     model_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     effective_device_map = device_map if torch.cuda.is_available() else None
 
-    if load_in_4bit:
-        if not torch.cuda.is_available():
-            print("Warning: load_in_4bit=True requires CUDA. Ignoring quantization.")
-        else:
-            try:
-                quantization_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=torch.float16,
-                )
-                model_dtype = torch.float16
-                print("Configured 4-bit quantization (nf4, float16 compute).")
-                if effective_device_map is None:
-                     print("Warning: 4-bit quantization typically requires device_map='auto'. Setting device_map='auto'.")
-                     effective_device_map = "auto"
+    # --- Configure 4-bit quantization (with fallback) ---
+    if load_in_4bit and torch.cuda.is_available():
+        try:
+            import bitsandbytes as bnb
+            from bitsandbytes import BitsAndBytesConfig
 
-            except ImportError:
-                print("Error: bitsandbytes library not found. Cannot use load_in_4bit=True.")
-                raise
-            except Exception as e:
-                 print(f"Error configuring BitsAndBytesConfig: {e}")
-                 raise
+            if version.parse(bnb.__version__) < version.parse("0.41.1"):
+                raise ImportError(f"bitsandbytes version {bnb.__version__} is too old. Please upgrade to >= 0.41.1.")
 
-    # --- Load Model ---
-    print(f"Loading model with dtype={model_dtype}, device_map='{effective_device_map}', attn='{attn_implementation}'...")
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16
+            )
+            print("[✓] 4-bit quantization enabled with nf4 format.")
+
+        except ImportError as e:
+            print(f"[WARN] bitsandbytes not available or outdated: {e}")
+            print("[INFO] Falling back to float16 model...")
+            load_in_4bit = False
+            quantization_config = None
+    elif load_in_4bit:
+        print("[WARN] 4-bit quantization requires CUDA. Ignoring 'load_in_4bit=True'.")
+
+    # --- Load model ---
     try:
+        print(f"[INFO] Loading model with dtype={model_dtype}, device_map={effective_device_map}, attn='{attn_implementation}'...")
         model = LlavaNextForConditionalGeneration.from_pretrained(
             model_id,
             torch_dtype=model_dtype,
@@ -115,44 +117,38 @@ def load_model(
             attn_implementation=attn_implementation,
             trust_remote_code=True
         )
-        print("Model loaded successfully.")
-        print(f"  Model is on device(s): {model.device if effective_device_map is None else 'Multiple (device_map used)'}")
+        print("[✓] Model loaded.")
+        if effective_device_map is None:
+            print(f"[INFO] Model is on device: {model.device}")
+        else:
+            print(f"[INFO] Model loaded with device_map: {effective_device_map}")
 
     except ImportError as e:
-        print(f"ImportError during model loading: {e}. Ensure 'accelerate' is installed if using device_map or quantization, and 'flash-attn' if using flash_attention_2.")
-        raise
+        raise ImportError(f"[ERROR] ImportError during model loading: {e}\n"
+                          "Check if 'accelerate' is installed, and 'flash-attn' if using flash_attention_2.")
     except Exception as e:
-        print(f"Error loading model {model_id}: {e}")
         if "out of memory" in str(e).lower():
-             print("CUDA Out-of-Memory error detected. Try using 4-bit quantization (load_in_4bit=True) or ensure you have enough GPU RAM.")
-        raise RuntimeError(f"Failed to load model {model_id}") from e
+            print("[OOM] CUDA out-of-memory. Try enabling load_in_4bit or reduce model size.")
+        raise RuntimeError(f"[ERROR] Failed to load model: {e}") from e
 
-    # --- Post-Loading Configuration (Gradients) ---
+    # --- Configure gradients ---
     if enable_gradients:
-        if load_in_4bit:
-            print("Warning: Enabling gradients with 4-bit loaded model. This is experimental and may not work as expected or provide meaningful gradients.")
-            try:
-                 print("Attempting to set requires_grad=True on parameters...")
-                 model.train()
-                 for param in model.parameters():
-                      param.requires_grad = True
-                 print("Note: Full gradient enabling on 4-bit model is complex. Consider using PEFT library for fine-tuning.")
-            except Exception as e:
-                 print(f"Error enabling gradients on 4-bit model: {e}")
-        else:
-            print("Enabling gradients for all model parameters...")
+        print("[INFO] Enabling gradients for model parameters...")
+        try:
             model.train()
             for param in model.parameters():
-                 param.requires_grad = True
-            print("Gradients enabled.")
+                param.requires_grad = True
+            print("[✓] Gradients enabled.")
+        except Exception as e:
+            print(f"[WARN] Could not enable gradients: {e}")
     else:
-         model.eval()
+        model.eval()
 
-    end_time = time.time()
-    print(f"Model '{model_id}' and processor loaded in {end_time - start_time:.2f} seconds.")
-
+    elapsed = time.time() - start_time
+    print(f"[✓] Model and processor loaded in {elapsed:.2f} seconds.")
     return model, processor
 
+    
 
 def get_module_by_name(model: nn.Module, name: str) -> Optional[nn.Module]:
     """

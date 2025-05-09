@@ -68,8 +68,9 @@ class GenerationMixin:
                     )
                     
                     # Get next token
-                    logits = outputs.logits[:, -1, :]
-                    next_token_id = torch.argmax(logits, dim=-1).unsqueeze(0)
+                    logits = outputs.logits[:, -1, :]                  # [B, V]
+                    next_token_id = torch.argmax(logits, dim=-1)       # [B]
+                    next_token_id = next_token_id.unsqueeze(1)         # [B, 1]
                     token_id = next_token_id.item()
                     token_text = processor.tokenizer.decode([token_id])
                     
@@ -82,7 +83,7 @@ class GenerationMixin:
                     })
                     
                     # Update input IDs for next iteration
-                    current_input_ids = torch.cat([current_input_ids, next_token_id.unsqueeze(0)], dim=1)
+                    current_input_ids = torch.cat([current_input_ids, next_token_id], dim=1)
                     
                     # Update inputs for next iteration
                     inputs_copy["input_ids"] = current_input_ids
@@ -94,9 +95,10 @@ class GenerationMixin:
                             # This preserves any 0s in the original mask (e.g., for image token padding)
                             inputs_copy["attention_mask"] = F.pad(
                                 original_attention_mask, 
-                                (0, i+1), 
+                                (0, 1), 
                                 value=1
                             )
+                            original_attention_mask = inputs_copy["attention_mask"]
                         else:
                             inputs_copy["attention_mask"] = torch.ones_like(current_input_ids)
                         
