@@ -95,7 +95,7 @@ def run_semantic_tracing_test(
         
         # Step 2: Load and process image
         logger.info(f"Loading image from: {image_url}")
-        image = load_image(image_url)
+        image = load_image(image_url, resize_to=(336, 336))
         
         # Step 3: Create selection configuration
         selection_config = SelectionConfig(
