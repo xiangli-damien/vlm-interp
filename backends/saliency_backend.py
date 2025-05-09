@@ -212,18 +212,12 @@ class SaliencyBackend:
     ):
         """
         Ensure all necessary tensors are cached for later saliency analysis.
-
-        If single_pass=True AND target_indices is provided, performs exactly one
-        combined forward+backward over the entire model to capture attention+grad
-        for every layer, computes saliency for each, and caches them all.
-
-        Otherwise, if target_indices is given, falls back to compute_batch_saliency();
-        if neither, just saves inputs for on-demand per-layer computation later.
+        Memory-optimized version matching the old implementation's approach.
 
         Args:
-            inputs:         Model inputs (must include 'input_ids', etc.)
+            inputs: Model inputs (must include 'input_ids', etc.)
             target_indices: List of token indices to treat as loss targets
-            single_pass:    Whether to do a single “forward+backward for all layers”
+            single_pass: Whether to do a single "forward+backward for all layers"
         """
         # 1) Clone & stash the original inputs so we can reuse them
         self._last_inputs = {
@@ -231,7 +225,7 @@ class SaliencyBackend:
             for k, v in inputs.items()
         }
 
-        # 2) True “single-pass” mode: compute all layers’ saliency in one shot
+        # 2) True "single-pass" mode: compute all layers' saliency in one shot
         if single_pass and target_indices:
             # a) Set up a hook manager to capture both attention & grads
             hook_mgr = TraceHookManager(
@@ -239,56 +233,94 @@ class SaliencyBackend:
                 cpu_offload=True,
                 detach_after_forward=False
             )
-            for layer_idx, layer_name in enumerate(self.layer_names):
-                hook_mgr.add_layer(
-                    layer_name,
-                    capture=["attention", "grad"],
-                    layer_idx=layer_idx
-                )
-            hook_mgr.install()
+            
+            # Only register a subset of layers if too many (memory saving)
+            max_layers_single_pass = 4  # Adjust based on memory constraints
+            if len(self.layer_names) > max_layers_single_pass:
+                logger.warning(f"Too many layers ({len(self.layer_names)}) for single pass. " 
+                            f"Processing in batches of {max_layers_single_pass}")
+                
+                # Process in batches to save memory
+                for batch_start in range(0, len(self.layer_names), max_layers_single_pass):
+                    batch_end = min(batch_start + max_layers_single_pass, len(self.layer_names))
+                    batch_layer_names = self.layer_names[batch_start:batch_end]
+                    batch_indices = list(range(batch_start, batch_end))
+                    
+                    # Register hooks for this batch
+                    for layer_idx, layer_name in zip(batch_indices, batch_layer_names):
+                        hook_mgr.add_layer(
+                            layer_name,
+                            capture=["attention", "grad"],
+                            layer_idx=layer_idx
+                        )
+                    
+                    # Install and run for this batch
+                    hook_mgr.install()
+                    self._run_hook_manager(hook_mgr, target_indices)
+                    
+                    # Cleanup after each batch
+                    hook_mgr.clear()
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            else:
+                # Register all layers if not too many
+                for layer_idx, layer_name in enumerate(self.layer_names):
+                    hook_mgr.add_layer(
+                        layer_name,
+                        capture=["attention", "grad"],
+                        layer_idx=layer_idx
+                    )
+                
+                # Install and run for all layers
+                hook_mgr.install()
+                self._run_hook_manager(hook_mgr, target_indices)
+                hook_mgr.clear()
 
-            # b) Build a combined loss over all requested target tokens
-            def loss_fn(outputs):
-                # outputs.logits: [B, seq_len, vocab_size]
-                logprobs = torch.log_softmax(outputs.logits.float(), dim=-1)
-                loss = None
-                input_ids = self._last_inputs["input_ids"][0]
-                for t in target_indices:
-                    token_id = input_ids[t].item()
-                    # use logits at position t-1 to predict token at t
-                    this = -logprobs[0, t-1, token_id]
-                    loss = this if loss is None else loss + this
-                return loss * 1.0
-
-            # c) One forward+backward to populate all attention & grad hooks
-            hook_mgr.run(self._last_inputs, loss_fn)
-            hook_mgr.compute_saliency()
-
-            # d) Push everything into our main cache
-            snapshot = hook_mgr.snapshot()
-            for idx in range(len(self.layer_names)):
-                if snapshot.has(idx, "saliency"):
-                    self.cache.set(idx, "saliency", snapshot.get(idx, "saliency"))
-                else:
-                    # fallback: cache raw attention & grad if saliency missing
-                    if snapshot.has(idx, "attention"):
-                        self.cache.set(idx, "attention", snapshot.get(idx, "attention"))
-                    if snapshot.has(idx, "grad"):
-                        self.cache.set(idx, "grad", snapshot.get(idx, "grad"))
-
-            hook_mgr.clear()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        # 3) Otherwise, if they gave us targets but didn’t want single_pass:
+        # 3) Otherwise, if they gave us targets but didn't want single_pass:
         elif target_indices:
             # compute saliency layer-by-layer in batches as before
-            self.compute_batch_saliency(target_indices, self._last_inputs)
+            self.compute_batch_saliency(target_indices, self._last_inputs, layer_batch_size=2)
 
         # 4) Neither single-pass nor targets → just cache inputs for on-demand use
         else:
             # no-op beyond storing self._last_inputs
             pass
+
+    def _run_hook_manager(self, hook_mgr, target_indices):
+        """Helper method to run hook manager with appropriate loss function."""
+        # Build a combined loss over all requested target tokens
+        def loss_fn(outputs):
+            # outputs.logits: [B, seq_len, vocab_size]
+            logprobs = torch.log_softmax(outputs.logits.float(), dim=-1)
+            loss = None
+            input_ids = self._last_inputs["input_ids"][0]
+            for t in target_indices:
+                if t >= len(input_ids) or t <= 0:
+                    continue
+                token_id = input_ids[t].item()
+                # use logits at position t-1 to predict token at t
+                this = -logprobs[0, t-1, token_id]
+                loss = this if loss is None else loss + this
+            return loss * 1.0 if loss is not None else torch.tensor(0.0, requires_grad=True)
+
+        # Run the model with hooks
+        hook_mgr.run(self._last_inputs, loss_fn)
+        
+        # Compute saliency scores
+        hook_mgr.compute_saliency()
+
+        # Push everything into our main cache
+        snapshot = hook_mgr.snapshot()
+        for idx in range(len(self.layer_names)):
+            if snapshot.has(idx, "saliency"):
+                self.cache.set(idx, "saliency", snapshot.get(idx, "saliency"))
+            else:
+                # fallback: cache raw attention & grad if saliency missing
+                if snapshot.has(idx, "attention"):
+                    self.cache.set(idx, "attention", snapshot.get(idx, "attention"))
+                if snapshot.has(idx, "grad"):
+                    self.cache.set(idx, "grad", snapshot.get(idx, "grad"))
         
     def compute_batch_saliency(self, target_indices, inputs, layer_batch_size=1):
         """

@@ -222,6 +222,11 @@ class TraceHookManager:
                     self.model.train()
                 else:
                     self.model.eval()
+                    
+            # Force cleanup after run
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     
     def _assign_missing_indices(self) -> None:
         """

@@ -34,7 +34,7 @@ class TracingCache:
         
     def set(self, layer_idx: int, cache_type: str, tensor: torch.Tensor, detach: bool = True) -> None:
         """
-        Store a tensor in the cache.
+        Store a tensor in the cache with more aggressive memory optimization.
         
         Args:
             layer_idx: Layer index to use as key
@@ -49,8 +49,11 @@ class TracingCache:
         processed = tensor
         if detach:
             processed = processed.detach()
-        if cache_type in {"saliency", "attention", "grad"} and processed.dtype in {torch.float32, torch.float64}:
+        
+        # Convert to float16 to save memory for all float tensors
+        if processed.dtype in {torch.float32, torch.float64}:
             processed = processed.to(torch.float16)
+            
         if self.cpu_offload:
             processed = processed.cpu()
             if self.pin_memory:

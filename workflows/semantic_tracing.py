@@ -120,13 +120,13 @@ class SemanticTracingWorkflow(GenerationMixin):
     Workflow for semantic tracing analysis.
     Coordinates input preparation, tracing, and output processing.
     """
-    
+
     def __init__(self, model: torch.nn.Module, processor: Any, output_dir: str, 
                  selection_config: Optional[SelectionConfig] = None,
                  debug: bool = False):
         """
         Initialize the semantic tracing workflow.
-        
+
         Args:
             model: The model to analyze
             processor: The model's processor
@@ -138,53 +138,88 @@ class SemanticTracingWorkflow(GenerationMixin):
         self.processor = processor
         self.output_dir = output_dir
         self.debug = debug
-        
-        # Set debug level if requested
+
         if debug:
             logger.setLevel(logging.DEBUG)
-        
-        # Create output directory
+
         os.makedirs(output_dir, exist_ok=True)
-        
-        # Initialize selection config
+
         self.config = selection_config or SelectionConfig()
-        
-        # Get model device
+
         self.device = next(model.parameters()).device
-        
-        # Get layer names
+
         try:
             from runtime.model_utils import get_llm_attention_layer_names
             self.layer_names = get_llm_attention_layer_names(model)
         except ImportError:
             logger.warning("Could not import get_llm_attention_layer_names. Using empty layer list.")
             self.layer_names = []
-            
+
         if not self.layer_names:
             logger.warning("No attention layers found. Semantic tracing may not work.")
         else:
             logger.info(f"Found {len(self.layer_names)} attention layers.")
-        
-        # Initialize I/O handler
-        self.io = TraceIO(output_dir)
-        
-        # Initialize cache with CPU offload to save GPU memory
-        self.cache = TracingCache(cpu_offload=True)
-        
-        # Initialize backends using dynamic registry pattern
-        self.backends = self._initialize_backends()
 
-        # Initialize token decoder
+        self.io = TraceIO(output_dir)
+
+        # Enable memory-safe CPU cache
+        self.cache = TracingCache(cpu_offload=True)
+
+        # Lazy backend registry (Attention/Saliency)
+        self.backends = {}
+
+        # Optional Logit Lens backend
+        try:
+            self.logit_backend = LogitBackend(
+                model=self.model,
+                cache=self.cache,
+                device=self.device
+            )
+            logger.info("Logit Lens backend initialized.")
+        except Exception as e:
+            logger.warning(f"Could not initialize Logit Lens backend: {e}")
+            self.logit_backend = None
+
         self.token_decoder = TokenDecoder(self.processor)
-        
-        # Initialize data structures for records
+
         self.records_by_mode = {
             TraceMode.ATTENTION: [],
             TraceMode.SALIENCY: []
         }
-        
-        # Initialize token types cache
+
         self.token_types = {}
+
+    def _get_backend(self, mode: TraceMode):
+        """
+        Lazy initialization of attention or saliency backend.
+
+        Args:
+            mode: The trace mode to get backend for
+
+        Returns:
+            The appropriate backend instance
+        """
+        if mode not in self.backends:
+            if mode == TraceMode.ATTENTION:
+                from backends.attention_backend import AttentionBackend
+                self.backends[mode] = AttentionBackend(
+                    model=self.model,
+                    layer_names=self.layer_names,
+                    cache=self.cache,
+                    device=self.device
+                )
+            elif mode == TraceMode.SALIENCY:
+                from backends.saliency_backend import SaliencyBackend
+                self.backends[mode] = SaliencyBackend(
+                    model=self.model,
+                    layer_names=self.layer_names,
+                    cache=self.cache,
+                    device=self.device
+                )
+            else:
+                raise ValueError(f"Unknown tracing mode: {mode}")
+        return self.backends[mode]
+
 
     def _get_token_text(self, token_id: int) -> str:
         """
@@ -543,6 +578,12 @@ class SemanticTracingWorkflow(GenerationMixin):
             # Update targets for next layer
             current_targets = {s["index"]: s["weight"] for s in sources}
             current_targets = SelectionStrategy.renormalize(current_targets, self.config, apply_layer_prune=True)
+
+            # Clear the cache
+            logger.debug(f"Completed layer {layer_idx}. Forcing GC and CUDA cache clear.")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         # Save results
         results = {}
