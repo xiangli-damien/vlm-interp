@@ -8,8 +8,8 @@ from typing import Dict, Any, Optional, Union, List, Tuple
 
 from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
 
-from utils.data_utils import load_image, build_conversation
-from utils.model_utils import load_model, get_llm_attention_layer_names
+from preprocessing.data_utils import load_image, build_conversation
+from core.model_utils import load_model, get_llm_attention_layer_names
 
 
 class LLaVANextEngine:
