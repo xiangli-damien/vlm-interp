@@ -29,7 +29,7 @@ from preprocess.input_builder import prepare_inputs
 from runtime.hooks import TraceHookManager
 from runtime.cache import TracingCache
 from backends.logit_backend import LogitBackend
-from runtime.model_utils import get_llm_attention_layer_names, load_model
+from runtime.model_utils import get_llm_attention_layer_names, load_model, get_module_by_name
 from runtime.io import TraceIO
 
 # Configure logging
@@ -77,14 +77,14 @@ class MultihopMetrics:
     """Metrics for multi-hop reasoning analysis with corrected implementations."""
 
     @staticmethod
-    def compute_entrec(vector: torch.Tensor, lm_head, token_ids: List[int]) -> torch.Tensor:
+    def compute_entrec(vector: torch.Tensor, lm_head, token_ids: Union[int, List[int]]) -> torch.Tensor:
         """
         Calculate ENTREC for a hidden vector with support for multi-token entities.
         
         Args:
             vector: Hidden vector from intermediate layer
             lm_head: Language model head for projection
-            token_ids: List of token IDs for the bridge entity
+            token_ids: Token ID or list of token IDs for the bridge entity
             
         Returns:
             Log probability (average across multiple tokens if provided)
@@ -95,11 +95,21 @@ class MultihopMetrics:
         # Convert to log probabilities
         logp = F.log_softmax(logits, dim=-1)
         
-        # If multiple tokens, average the log probs
-        if len(token_ids) > 1:
-            return torch.mean(torch.tensor([logp[token_id] for token_id in token_ids]))
+        # Handle both single token ID and list of token IDs
+        if isinstance(token_ids, list):
+            if len(token_ids) > 1:
+                # For multiple tokens, average the log probabilities
+                return torch.mean(torch.tensor([logp[token_id] for token_id in token_ids]))
+            elif len(token_ids) == 1:
+                # For a list with one token, use that token
+                return logp[token_ids[0]]
+            else:
+                # Handle empty list case
+                logger.warning("Empty token_ids list provided, using UNK token")
+                return logp[0]  # Use ID 0 (typically UNK token) as fallback
         else:
-            return logp[token_ids[0]]
+            # Handle case where token_ids is a single integer
+            return logp[token_ids]
 
     @staticmethod
     def consistency_score(p_two_hop: torch.Tensor, p_one_hop: torch.Tensor) -> torch.Tensor:
@@ -257,7 +267,12 @@ class MultihopVLMExperiment:
                 if bridge_tokens:
                     break
         
-        # Update sample
+        # Ensure we always have at least one token ID
+        if not bridge_tokens:
+            logger.warning(f"Could not tokenize '{sample.bridge_entity}', using default token")
+            bridge_tokens = [0]  # Use UNK token as fallback
+        
+        # Update sample - always store as a list
         sample.bridge_entity_tokens = bridge_tokens
         
         # Log tokenization details
@@ -326,7 +341,10 @@ class MultihopVLMExperiment:
         if not sample.bridge_entity_tokens:
             self._tokenize_bridge_entity(sample)
         
-        bridge_token_id = sample.bridge_entity_tokens[0]
+        # Get the first bridge token ID, ensuring it's handled correctly whether 
+        # bridge_entity_tokens is a list or single integer
+        bridge_token_id = sample.bridge_entity_tokens[0] if isinstance(sample.bridge_entity_tokens, list) else sample.bridge_entity_tokens
+        
         results = {layer: {"entity_sub": False, "rel_sub": False} for layer in self.layers}
         
         # Capture ENTREC for original and substituted prompts
@@ -347,7 +365,7 @@ class MultihopVLMExperiment:
                 # Get vector for descriptor token
                 vector = hidden[:, descriptor_idx, :].squeeze(0)
                 
-                # Compute ENTREC
+                # Compute ENTREC - pass bridge_token_id directly for consistent handling
                 entrec = MultihopMetrics.compute_entrec(vector, self.lm_head, bridge_token_id)
                 entrec_values[layer] = entrec.item()
             
@@ -382,7 +400,8 @@ class MultihopVLMExperiment:
         if not sample.bridge_entity_tokens:
             self._tokenize_bridge_entity(sample)
         
-        bridge_token_ids = sample.bridge_entity_tokens
+        # Fix: Properly handle bridge_token_id whether it's a list or integer
+        bridge_token_id = sample.bridge_entity_tokens[0] if isinstance(sample.bridge_entity_tokens, list) else sample.bridge_entity_tokens
         results = {layer: False for layer in self.layers}
         
         # 1. First get the one-hop results as reference
@@ -443,11 +462,11 @@ class MultihopVLMExperiment:
                         logger.warning(f"Layer {layer} hidden states don't have requires_grad=True")
                         vector.requires_grad_(True)
                     
-                    # 4. Compute ENTREC
+                    # 4. Compute ENTREC - Fix: Use bridge_token_id (singular) here
                     entrec = MultihopMetrics.compute_entrec(
                         vector.squeeze(0), 
                         self.lm_head, 
-                        bridge_token_ids
+                        bridge_token_id  # Fixed: was bridge_token_ids (plural)
                     )
                     
                     # 5. Compute gradient
@@ -522,8 +541,8 @@ class MultihopVLMExperiment:
                     
                     # Also log the consistency improvement
                     logger.debug(f"Layer {layer}: Consistency {baseline_consistency.item():.4f} → "
-                                f"{perturbed_consistency.item():.4f}, "
-                                f"Success: {results[layer]}")
+                            f"{perturbed_consistency.item():.4f}, "
+                            f"Success: {results[layer]}")
                     
             except Exception as e:
                 logger.error(f"Error in layer {layer} intervention test: {e}")
