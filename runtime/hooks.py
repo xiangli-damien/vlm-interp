@@ -5,7 +5,7 @@ Unified hook management system for model interpretation and tracing.
 import torch
 import torch.nn as nn
 import gc
-from typing import Dict, List, Any, Optional, Tuple, Callable
+from typing import Dict, List, Any, Optional, Tuple, Callable, Union
 from runtime.cache import TracingCache
 import logging
 from runtime.model_utils import get_module_by_name
