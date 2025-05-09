@@ -49,6 +49,8 @@ class TracingCache:
         processed = tensor
         if detach:
             processed = processed.detach()
+        if cache_type in {"saliency", "attention", "grad"} and processed.dtype in {torch.float32, torch.float64}:
+            processed = processed.to(torch.float16)
         if self.cpu_offload:
             processed = processed.cpu()
             if self.pin_memory:
@@ -117,7 +119,8 @@ class TracingCache:
             return None
             
         tensor = cache_dict[layer_idx]
-        
+        if device is not None and isinstance(tensor, torch.Tensor) and tensor.device != device:
+            tensor = tensor.to(device, non_blocking=True)
         return tensor
     
     def get_custom(self, tag: str, device: Optional[torch.device] = None) -> Optional[Any]:

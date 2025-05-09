@@ -122,10 +122,10 @@ class SaliencyBackend:
         Returns:
             Saliency vector for the target
         """
-        # Extract saliency from target to all prior tokens (causal mask)
-        saliency_matrix = saliency_matrix.to(self.device, non_blocking=True)
-        saliency_vector = saliency_matrix[:, :, target_idx, :target_idx].mean(dim=(0, 1))
-        return saliency_vector
+        vec = saliency_matrix[:, :, target_idx, :target_idx].mean(dim=(0, 1))
+        if self.device.type == "cuda":
+            vec = vec.to(self.device, non_blocking=True)
+        return vec
     
     def _aggregate_sources(self, sources: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
         """
@@ -276,10 +276,9 @@ class SaliencyBackend:
                     if snapshot.has(idx, "grad"):
                         self.cache.set(idx, "grad", snapshot.get(idx, "grad"))
 
-            # e) Clean up hooks & return to eval mode
             hook_mgr.clear()
-            torch.cuda.empty_cache()
-            self.model.eval()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # 3) Otherwise, if they gave us targets but didn’t want single_pass:
         elif target_indices:
@@ -371,13 +370,7 @@ class SaliencyBackend:
                 # Compute saliency scores
                 hook_mgr.compute_saliency()
                 
-                # Get captured tensors from hook manager
                 cache = hook_mgr.snapshot()
-                
-                # Clear hooks
-                hook_mgr.clear()
-                torch.cuda.empty_cache()
-                
                 
                 # Transfer to our cache
                 for layer_idx in current_layer_indices:
@@ -396,9 +389,6 @@ class SaliencyBackend:
                 import traceback
                 traceback.print_exc()
             finally:
-                # Clear hooks
-                hook_mgr.clear()
-                
                 # Clean up memory
                 gc.collect()
                 if torch.cuda.is_available():
