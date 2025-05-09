@@ -118,10 +118,6 @@ class TracingCache:
             
         tensor = cache_dict[layer_idx]
         
-        # Move to specified device if requested
-        if device is not None and tensor.device != device:
-            tensor = tensor.to(device)
-            
         return tensor
     
     def get_custom(self, tag: str, device: Optional[torch.device] = None) -> Optional[Any]:

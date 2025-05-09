@@ -123,6 +123,7 @@ class SaliencyBackend:
             Saliency vector for the target
         """
         # Extract saliency from target to all prior tokens (causal mask)
+        saliency_matrix = saliency_matrix.to(self.device, non_blocking=True)
         saliency_vector = saliency_matrix[:, :, target_idx, :target_idx].mean(dim=(0, 1))
         return saliency_vector
     
@@ -277,6 +278,7 @@ class SaliencyBackend:
 
             # e) Clean up hooks & return to eval mode
             hook_mgr.clear()
+            torch.cuda.empty_cache()
             self.model.eval()
 
         # 3) Otherwise, if they gave us targets but didn’t want single_pass:
@@ -289,7 +291,7 @@ class SaliencyBackend:
             # no-op beyond storing self._last_inputs
             pass
         
-    def compute_batch_saliency(self, target_indices, inputs, layer_batch_size=4):
+    def compute_batch_saliency(self, target_indices, inputs, layer_batch_size=1):
         """
         Compute saliency for multiple layers efficiently.
         Processes layers in batches to minimize hook reinstallation overhead.
@@ -320,7 +322,7 @@ class SaliencyBackend:
             current_layer_names = [self.layer_names[i] for i in current_layer_indices]
             
             # Initialize hook manager for this batch of layers
-            hook_mgr = TraceHookManager(self.model, cpu_offload=True, detach_after_forward=False)
+            hook_mgr = TraceHookManager(self.model, cpu_offload=True, detach_after_forward=True)
             
             # Register all layers in the batch at once
             for idx, layer_name in zip(current_layer_indices, current_layer_names):
@@ -371,6 +373,11 @@ class SaliencyBackend:
                 
                 # Get captured tensors from hook manager
                 cache = hook_mgr.snapshot()
+                
+                # Clear hooks
+                hook_mgr.clear()
+                torch.cuda.empty_cache()
+                
                 
                 # Transfer to our cache
                 for layer_idx in current_layer_indices:
