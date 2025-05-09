@@ -12,7 +12,7 @@ Includes functions for:
 import torch
 import torch.nn as nn
 import time
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union, List
 from packaging import version
 from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor
 
