@@ -9,9 +9,11 @@ Workflows for Vision-Language Model interpretability analysis:
 from workflows.logit_lens import LogitLensWorkflow
 from workflows.saliency_analysis import SaliencyWorkflow
 from workflows.semantic_tracing import SemanticTracingWorkflow
+from workflows.semantic_tracing_pipeline import run_semantic_tracing_test
 
 __all__ = [
     "LogitLensWorkflow",
     "SaliencyWorkflow",
     "SemanticTracingWorkflow",
+    "run_semantic_tracing_test"
 ]
