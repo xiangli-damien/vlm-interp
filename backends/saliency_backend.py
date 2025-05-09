@@ -389,6 +389,9 @@ class SaliencyBackend:
                 import traceback
                 traceback.print_exc()
             finally:
+                # Clear hooks
+                hook_mgr.clear()
+                
                 # Clean up memory
                 gc.collect()
                 if torch.cuda.is_available():
