@@ -195,12 +195,7 @@ class TraceHookManager:
             
         # Set to train mode if we need gradients
         original_mode = self.model.training
-        if loss_fn is not None:
-            self.model.eval()                    
-            for p in self.model.parameters():    
-                p.requires_grad_(False)
-        else:
-            self.model.eval()
+        self.model.eval()
             
         try:
             # Forward pass
@@ -430,16 +425,17 @@ class TraceHookManager:
                         # Define gradient capture function
                         def grad_hook(grad: torch.Tensor) -> None:
                             self.cache.set(layer_idx, "grad", grad)
+                            if self.detach_after_forward:
+                                attn = info.pop("live_attn")
+                                self.cache.set(layer_idx, "attention", attn.detach())
                             
                         # Register the hook
                         handle = attn_weights.register_hook(grad_hook)
                         self._tensor_hooks[tensor_hook_key] = handle
                         
                     # Store the tensor in cache (detached if needed)
-                    if self.detach_after_forward:
-                        self.cache.set(layer_idx, "attention", attn_weights)
-                    else:
-                        # Be careful with this - keeping live tensors can cause memory issues
+                    info["live_attn"] = attn_weights
+                    if not self.detach_after_forward:
                         self.cache.set(layer_idx, "attention", attn_weights, detach=False)
                         
         return hook_fn

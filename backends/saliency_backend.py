@@ -258,7 +258,7 @@ class SaliencyBackend:
                     # use logits at position t-1 to predict token at t
                     this = -logprobs[0, t-1, token_id]
                     loss = this if loss is None else loss + this
-                return loss
+                return loss * 1.0
 
             # c) One forward+backward to populate all attention & grad hooks
             hook_mgr.run(self._last_inputs, loss_fn)
@@ -362,7 +362,7 @@ class SaliencyBackend:
                         else:
                             total_loss = total_loss + token_loss
                     
-                    return total_loss
+                    return total_loss * 1.0
                 
                 # Run model with hooks through hook manager
                 hook_mgr.run(inputs, loss_fn)
