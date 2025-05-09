@@ -196,10 +196,9 @@ class TraceHookManager:
         # Set to train mode if we need gradients
         original_mode = self.model.training
         if loss_fn is not None:
-            self.model.train()
-            # Ensure parameters require gradients
-            for param in self.model.parameters():
-                param.requires_grad = True
+            self.model.eval()                    
+            for p in self.model.parameters():    
+                p.requires_grad_(False)
         else:
             self.model.eval()
             
@@ -267,7 +266,11 @@ class TraceHookManager:
         
         # Clear cache
         self.cache.clear()
-        
+
+        for info in self._layer_info.values():
+            info.pop("live_attn", None)
+            info.pop("live_hidden", None)
+
         self._installed = False
         
         # Force garbage collection
