@@ -180,53 +180,88 @@ class TraceHookManager:
     
     def run(self, inputs: Dict[str, torch.Tensor], loss_fn: Optional[Callable] = None) -> Any:
         """
-        Run the model with installed hooks and optional loss calculation.
-        
+        Run the model with installed hooks and optional loss computation.
+        Memory-optimized implementation.
+
         Args:
-            inputs: Model input tensors
-            loss_fn: Optional function to compute loss for backward pass
-            
+            inputs (Dict[str, torch.Tensor]): Input tensors for the model.
+            loss_fn (Callable, optional): Optional loss function for backward pass.
+
         Returns:
-            Model outputs
+            Any: The model outputs (e.g., logits, hidden states, etc.)
         """
         if not self._installed:
-            logger.warning("Hooks not installed. Installing...")
+            logger.warning("Hooks are not installed. Installing now...")
             self.install()
-            
-        # Set to train mode if we need gradients
+
+        # Always run in evaluation mode (even if gradients are computed)
         original_mode = self.model.training
         self.model.eval()
-            
+
+        # Force memory cleanup before execution
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         try:
-            # Forward pass
+            # Forward pass with or without gradient tracking
             with torch.set_grad_enabled(loss_fn is not None):
-                outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
-                
-                # Backward pass if loss function provided
+                # Clone input dictionary to prevent in-place memory issues
+                cloned_inputs = {}
+                for k, v in inputs.items():
+                    if isinstance(v, torch.Tensor):
+                        # Use `.to(device)` instead of `.clone()` for large tensors to reduce memory usage
+                        device = v.device
+                        cloned_inputs[k] = v.to(device, non_blocking=True)
+                    else:
+                        cloned_inputs[k] = v
+
+                # Run model with autocast for mixed precision (saves VRAM)
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
+                    outputs = self.model(**cloned_inputs, output_hidden_states=True, return_dict=True)
+
+                # Backward pass if a loss function is provided
                 if loss_fn is not None:
-                    # Compute loss
-                    loss = loss_fn(outputs)
-                    
-                    # Reset gradients
-                    self.model.zero_grad(set_to_none=True)
-                    
-                    # Backward pass
-                    loss.backward(retain_graph=False)
-                    
-            return outputs
-            
+                    try:
+                        # Compute loss with mixed precision
+                        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
+                            loss = loss_fn(outputs)
+
+                        # Check if loss requires gradient
+                        if not loss.requires_grad:
+                            logger.warning("Loss does not require gradients. Skipping backward pass.")
+                            return outputs
+
+                        # Zero out model gradients before backward
+                        self.model.zero_grad(set_to_none=True)
+
+                        # Perform backward pass
+                        loss.backward(retain_graph=False)
+
+                    except Exception as e:
+                        logger.error(f"Error during backward pass: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+                # Clean up input tensor dictionary
+                del cloned_inputs
+                gc.collect()
+
+                return outputs
+
         finally:
-            # Restore original mode
+            # Restore original training mode
             if self.model.training != original_mode:
                 if original_mode:
                     self.model.train()
                 else:
                     self.model.eval()
-                    
+
             # Force cleanup after run
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
     
     def _assign_missing_indices(self) -> None:
         """

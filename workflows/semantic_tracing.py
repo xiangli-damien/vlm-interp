@@ -389,14 +389,10 @@ class SemanticTracingWorkflow(GenerationMixin):
         input_ids = input_data["inputs"]["input_ids"][0].tolist()
         all_token_texts = [self._get_token_text(tid) for tid in input_ids]
         
-        # If using single forward pass, ensure all activations are cached once at the beginning
+        # If using single forward pass, switch to batch mode to avoid OOM
         if single_forward_pass:
-            logger.info(f"Using single forward pass for {mode.value} backend")
-            backend.ensure_cache(
-                input_data["inputs"],
-                target_indices=list(target_tokens.keys()),
-                single_pass=True
-            )
+            logger.warning("single forward pass may cause OOM, switch to batch mode")
+            single_forward_pass = False
             
         # Get the backend's layer map to ensure correct indexing
         layer_name_map = getattr(backend, "layer_name_map", {})
