@@ -333,19 +333,23 @@ class SemanticTracingWorkflow(GenerationMixin):
          single_forward_pass: bool = False,
          compute_ll_projections: bool = True) -> Dict[str, Any]:
         """
-        Trace token contributions through model layers.
+        Trace token contributions through model layers with optimized memory management.
         
         Args:
             input_data: Prepared input data
             target_tokens: Dictionary mapping target token indices to weights
             mode: Tracing mode (attention or saliency)
             trace_id: Unique identifier for this trace
-            single_forward_pass: Whether to use a single forward pass
+            single_forward_pass: Whether to use a single forward pass (will be overridden to False)
             compute_ll_projections: Whether to compute Logit Lens projections
             
         Returns:
             Dictionary containing trace results
         """
+        # MEMORY OPTIMIZATION: Always override single_forward_pass to be False
+        # to avoid memory issues with large backpropagation through all layers
+        single_forward_pass = False
+        
         # Create trace ID if not provided
         if trace_id is None:
             trace_id = f"trace_{int(time.time())}"
@@ -389,29 +393,35 @@ class SemanticTracingWorkflow(GenerationMixin):
         input_ids = input_data["inputs"]["input_ids"][0].tolist()
         all_token_texts = [self._get_token_text(tid) for tid in input_ids]
         
-        # If using single forward pass, switch to batch mode to avoid OOM
-        if single_forward_pass:
-            logger.warning("single forward pass may cause OOM, switch to batch mode")
-            single_forward_pass = False
-            
+        # MEMORY OPTIMIZATION: Always use batch mode for better memory management
+        logger.info("Using batch mode processing for optimal memory usage")
+        
         # Get the backend's layer map to ensure correct indexing
         layer_name_map = getattr(backend, "layer_name_map", {})
         
         # Trace through layers from last to first
         current_targets = dict(target_tokens)  # Copy to avoid modifying the original
         
+        # Force memory cleanup before starting layer processing
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         for layer_idx in reversed(range(len(self.layer_names))):
             # Skip if no targets left
             if not current_targets:
                 break
+            
+            logger.info(f"Processing layer {layer_idx} with {len(current_targets)} target tokens")
                 
+            # MEMORY OPTIMIZATION: Process each layer separately with explicit cache management
             # Ensure necessary activations are cached for this specific layer
-            # but only if not already cached by single_forward_pass
-            if not single_forward_pass:
-                backend.ensure_cache(
-                    input_data["inputs"],
-                    target_indices=list(target_tokens.keys())
-                )
+            backend.ensure_cache(
+                input_data["inputs"],
+                target_indices=list(current_targets.keys()),
+                # MEMORY OPTIMIZATION: Force layer_batch_size=1 in the backend
+                layer_batch_size=1  
+            )
                     
             # Get the corresponding layer name if layer map is available
             layer_name = layer_name_map.get(layer_idx, None)
@@ -436,46 +446,60 @@ class SemanticTracingWorkflow(GenerationMixin):
             if compute_ll_projections and self.logit_backend is not None:
                 # Get unique token IDs from current targets and sources
                 token_indices = set(current_targets.keys()) | {s["index"] for s in sources}
+                
+                # MEMORY OPTIMIZATION: Limit batch size for logit lens projections
                 if token_indices:
                     ll_projections = {}
                     
-                    # Optimize: use batch projection if available
-                    if hasattr(self.logit_backend, "project_tokens_batch"):
-                        # Use optimized batch projection
-                        batch_results = self.logit_backend.project_tokens_batch(
-                            layer_idx=layer_idx,
-                            token_indices=list(token_indices),
-                            tokenizer=self.processor.tokenizer,
-                            top_k=3
-                        )
+                    # MEMORY OPTIMIZATION: Use smaller batches with explicit cleanup
+                    max_batch_size = 10  # Process tokens in small groups
+                    token_indices_list = list(token_indices)
+                    
+                    for i in range(0, len(token_indices_list), max_batch_size):
+                        batch_indices = token_indices_list[i:i+max_batch_size]
                         
-                        # Process batch results
-                        for token_idx, projection in batch_results.items():
-                            if projection and projection.get("predictions"):
-                                ll_projections[token_idx] = {
-                                    "top1_token": projection["predictions"][0].get("text", ""),
-                                    "top1_prob": projection["predictions"][0].get("prob", 0.0),
-                                    "top1_logit": projection["predictions"][0].get("logit", 0.0),
-                                    "top2_token": projection["predictions"][1].get("text", "") if len(projection["predictions"]) > 1 else "",
-                                    "top2_prob": projection["predictions"][1].get("prob", 0.0) if len(projection["predictions"]) > 1 else 0.0
-                                }
-                    else:
-                        # Fallback to individual token projection
-                        for token_idx in token_indices:
-                            projection = self.logit_backend.project_token(
+                        # Optimize: use batch projection if available
+                        if hasattr(self.logit_backend, "project_tokens_batch"):
+                            # Use optimized batch projection
+                            batch_results = self.logit_backend.project_tokens_batch(
                                 layer_idx=layer_idx,
-                                token_idx=token_idx,
+                                token_indices=batch_indices,
                                 tokenizer=self.processor.tokenizer,
                                 top_k=3
                             )
-                            if projection and projection.get("predictions"):
-                                ll_projections[token_idx] = {
-                                    "top1_token": projection["predictions"][0].get("text", ""),
-                                    "top1_prob": projection["predictions"][0].get("prob", 0.0),
-                                    "top1_logit": projection["predictions"][0].get("logit", 0.0),
-                                    "top2_token": projection["predictions"][1].get("text", "") if len(projection["predictions"]) > 1 else "",
-                                    "top2_prob": projection["predictions"][1].get("prob", 0.0) if len(projection["predictions"]) > 1 else 0.0
-                                }
+                            
+                            # Process batch results
+                            for token_idx, projection in batch_results.items():
+                                if projection and projection.get("predictions"):
+                                    ll_projections[token_idx] = {
+                                        "top1_token": projection["predictions"][0].get("text", ""),
+                                        "top1_prob": projection["predictions"][0].get("prob", 0.0),
+                                        "top1_logit": projection["predictions"][0].get("logit", 0.0),
+                                        "top2_token": projection["predictions"][1].get("text", "") if len(projection["predictions"]) > 1 else "",
+                                        "top2_prob": projection["predictions"][1].get("prob", 0.0) if len(projection["predictions"]) > 1 else 0.0
+                                    }
+                        else:
+                            # Fallback to individual token projection
+                            for token_idx in batch_indices:
+                                projection = self.logit_backend.project_token(
+                                    layer_idx=layer_idx,
+                                    token_idx=token_idx,
+                                    tokenizer=self.processor.tokenizer,
+                                    top_k=3
+                                )
+                                if projection and projection.get("predictions"):
+                                    ll_projections[token_idx] = {
+                                        "top1_token": projection["predictions"][0].get("text", ""),
+                                        "top1_prob": projection["predictions"][0].get("prob", 0.0),
+                                        "top1_logit": projection["predictions"][0].get("logit", 0.0),
+                                        "top2_token": projection["predictions"][1].get("text", "") if len(projection["predictions"]) > 1 else "",
+                                        "top2_prob": projection["predictions"][1].get("prob", 0.0) if len(projection["predictions"]) > 1 else 0.0
+                                    }
+                        
+                        # Force memory cleanup after each batch
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
             
             # Create layer trace and append to records
             layer_trace = {
@@ -593,7 +617,18 @@ class SemanticTracingWorkflow(GenerationMixin):
             current_targets = {s["index"]: s["weight"] for s in sources}
             current_targets = SelectionStrategy.renormalize(current_targets, self.config, apply_layer_prune=True)
 
-            # Clear the cache
+            # MEMORY OPTIMIZATION: Clean the layer-specific cache to free memory
+            # Clear any temporary data in the backend cache for this layer
+            if hasattr(backend, 'cache'):
+                backend.cache.clear_single(layer_idx, "hidden")
+                backend.cache.clear_single(layer_idx, "attention")
+                backend.cache.clear_single(layer_idx, "grad")
+                # Keep saliency cache as it's the final result we need
+            
+            # Clear temporary variables to help GC
+            del sources, sources_by_target, all_token_indices, ll_projections
+            
+            # Aggressive memory cleanup after each layer
             logger.debug(f"Completed layer {layer_idx}. Forcing GC and CUDA cache clear.")
             gc.collect()
             if torch.cuda.is_available():
@@ -635,6 +670,11 @@ class SemanticTracingWorkflow(GenerationMixin):
             "image_available": "original_image" in input_data,
             "feature_mapping": input_data.get("feature_mapping", {})
         }
+        
+        # Final memory cleanup
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
                 
         return results
     

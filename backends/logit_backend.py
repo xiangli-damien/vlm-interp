@@ -6,6 +6,7 @@ Projects hidden states through the LM head to analyze token predictions.
 import torch
 from typing import Dict, List, Any, Optional
 import logging
+import gc
 
 from runtime.cache import TracingCache
 from enum import Enum
@@ -311,12 +312,12 @@ class LogitBackend:
         return result
     
     def project_tokens_batch(self,
-                           layer_idx: int,
-                           token_indices: List[int],
-                           tokenizer=None,
-                           top_k: int = 5) -> Dict[int, Dict[str, Any]]:
+                       layer_idx: int,
+                       token_indices: List[int],
+                       tokenizer=None,
+                       top_k: int = 5) -> Dict[int, Dict[str, Any]]:
         """
-        Project multiple tokens through the LM head in a single batch for efficiency.
+        Memory-optimized version that projects tokens through the LM head in small batches.
         
         Args:
             layer_idx: Index of the layer to analyze (including -1 for embeddings)
@@ -335,81 +336,137 @@ class LogitBackend:
         if not self.cache.has(layer_idx, "hidden"):
             logger.warning(f"Hidden states for layer {layer_idx} not in cache")
             return {}
-            
-        # Get the hidden states for this layer
-        hidden_states = self.cache.get(layer_idx, "hidden", self.device)
         
-        # Filter out invalid token indices
-        seq_len = hidden_states.shape[1]
-        valid_indices = [idx for idx in token_indices if 0 <= idx < seq_len]
-        
-        if not valid_indices:
-            logger.warning(f"No valid token indices provided for layer {layer_idx}")
-            return {}
-        
-        # Collect hidden states for all tokens
-        batch_size = hidden_states.shape[0]
-        batch_hiddens = []
-        
-        for token_idx in valid_indices:
-            # Get hidden state for this token
-            token_hidden = hidden_states[:, token_idx:token_idx+1, :]  # [batch_size, 1, hidden_dim]
-            batch_hiddens.append(token_hidden)
-        
-        # Stack to form a single batch
-        stacked_hiddens = torch.cat(batch_hiddens, dim=1)  # [batch_size, num_tokens, hidden_dim]
-        
-        # Reshape for projection
-        hidden_size = stacked_hiddens.shape[-1]
-        reshaped_hiddens = stacked_hiddens.view(-1, hidden_size)  # [batch_size*num_tokens, hidden_dim]
-        
-        # Project through LM head in a single pass
-        with torch.no_grad():
-            batch_logits = self.lm_head(reshaped_hiddens)  # [batch_size*num_tokens, vocab_size]
-            batch_probs = torch.softmax(batch_logits, dim=-1)
-            
-            # Get top-k predictions for each token
-            top_probs, top_indices = torch.topk(batch_probs, k=min(top_k, batch_probs.size(-1)))
-        
-        # Convert to CPU for processing
-        top_probs = top_probs.cpu().numpy()
-        top_indices = top_indices.cpu().numpy()
-        batch_logits_cpu = batch_logits.cpu()
-        
-        # Create result dictionary for each token
+        # Initialize results dictionary
         results = {}
         
-        # Process each token's results
-        for i, token_idx in enumerate(valid_indices):
-            idx_offset = i * batch_size
-            token_results = {
-                "token_idx": token_idx,
-                "layer_idx": layer_idx,
-                "predictions": []
-            }
+        # MEMORY OPTIMIZATION: Process tokens in small batches
+        # This prevents loading all token hidden states at once
+        max_batch_size = 10  # Adjust based on your GPU memory
+        
+        # Filter invalid token indices first to avoid unnecessary processing
+        valid_indices = []
+        try:
+            # Get sequence length without loading full tensor to device
+            hidden_states = self.cache.get(layer_idx, "hidden")
+            seq_len = hidden_states.shape[1]
+            valid_indices = [idx for idx in token_indices if 0 <= idx < seq_len]
             
-            # Process each batch item for this token
-            for batch_idx in range(batch_size):
-                flat_idx = idx_offset + batch_idx
+            if not valid_indices:
+                logger.warning(f"No valid token indices provided for layer {layer_idx}")
+                return {}
+        except Exception as e:
+            logger.error(f"Error checking valid indices: {e}")
+            return {}
+        
+        # Process in small batches
+        for i in range(0, len(valid_indices), max_batch_size):
+            batch_indices = valid_indices[i:i+max_batch_size]
+            logger.debug(f"Processing token batch {i//max_batch_size + 1}/{(len(valid_indices)-1)//max_batch_size + 1}")
+            
+            try:
+                # MEMORY OPTIMIZATION: Load hidden states for only this batch of tokens
+                # Get hidden states selectively - only move needed tokens to device
+                hidden_states = self.cache.get(layer_idx, "hidden")
                 
-                # Process top-k predictions
-                for k in range(top_indices.shape[1]):
-                    token_id = int(top_indices[flat_idx, k])
-                    logit_value = float(batch_logits_cpu[flat_idx, token_id])
+                # Extract only the required token positions from CPU tensor
+                batch_hiddens = []
+                for token_idx in batch_indices:
+                    # Select only this token's hidden state
+                    token_hidden = hidden_states[:, token_idx:token_idx+1, :]
+                    batch_hiddens.append(token_hidden)
+                
+                # Stack token hidden states for this small batch
+                if batch_hiddens:
+                    # Move stacked tensor to device only after stacking to minimize transfers
+                    stacked_hiddens = torch.cat(batch_hiddens, dim=1).to(self.device)
                     
-                    pred = {
-                        "token_id": token_id,
-                        "prob": float(top_probs[flat_idx, k]),
-                        "logit": logit_value,
-                        "rank": k + 1
-                    }
+                    # MEMORY OPTIMIZATION: Use half precision if possible
+                    if stacked_hiddens.dtype == torch.float32:
+                        stacked_hiddens = stacked_hiddens.to(torch.float16)
                     
-                    # Add decoded text if tokenizer is provided
-                    if tokenizer is not None:
-                        pred["text"] = tokenizer.decode([pred["token_id"]])
+                    # Reshape for projection
+                    hidden_size = stacked_hiddens.shape[-1]
+                    batch_size = stacked_hiddens.shape[0]
+                    num_tokens = len(batch_indices)
+                    reshaped_hiddens = stacked_hiddens.view(-1, hidden_size)
+                    
+                    # Project through LM head
+                    with torch.no_grad():
+                        # MEMORY OPTIMIZATION: Use autocast for mixed precision if available
+                        if hasattr(torch, 'autocast') and torch.cuda.is_available():
+                            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                                batch_logits = self.lm_head(reshaped_hiddens)
+                        else:
+                            batch_logits = self.lm_head(reshaped_hiddens)
                         
-                    token_results["predictions"].append(pred)
+                        # Calculate probabilities and get top-k in separate steps to reduce peak memory
+                        # MEMORY OPTIMIZATION: Process one token at a time within the batch
+                        for i, token_idx in enumerate(batch_indices):
+                            token_start = i * batch_size
+                            token_end = (i + 1) * batch_size
+                            
+                            # Get logits for this token
+                            token_logits = batch_logits[token_start:token_end]
+                            
+                            # Calculate softmax and get top-k predictions
+                            token_probs = torch.softmax(token_logits, dim=-1)
+                            top_probs, top_indices = torch.topk(token_probs, k=min(top_k, token_probs.size(-1)))
+                            
+                            # Move to CPU for processing
+                            top_probs_cpu = top_probs.cpu()
+                            top_indices_cpu = top_indices.cpu()
+                            token_logits_cpu = token_logits.cpu()
+                            
+                            # Create result for this token
+                            token_results = {
+                                "token_idx": token_idx,
+                                "layer_idx": layer_idx,
+                                "predictions": []
+                            }
+                            
+                            # Process each prediction
+                            for batch_idx in range(batch_size):
+                                for k in range(top_indices_cpu.shape[1]):
+                                    token_id = int(top_indices_cpu[batch_idx, k].item())
+                                    logit_value = float(token_logits_cpu[batch_idx, token_id].item())
+                                    
+                                    pred = {
+                                        "token_id": token_id,
+                                        "prob": float(top_probs_cpu[batch_idx, k].item()),
+                                        "logit": logit_value,
+                                        "rank": k + 1
+                                    }
+                                    
+                                    # Add decoded text if tokenizer is provided
+                                    if tokenizer is not None:
+                                        pred["text"] = tokenizer.decode([pred["token_id"]])
+                                        
+                                    token_results["predictions"].append(pred)
+                            
+                            # Store results for this token
+                            results[token_idx] = token_results
+                            
+                            # MEMORY OPTIMIZATION: Explicitly delete tensors
+                            del token_logits, token_probs, top_probs, top_indices
+                    
+                    # MEMORY OPTIMIZATION: Explicitly delete batch tensors
+                    del batch_logits, stacked_hiddens, reshaped_hiddens
+                    
+                    # MEMORY OPTIMIZATION: Force garbage collection
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                
+            except Exception as e:
+                logger.error(f"Error processing token batch {i//max_batch_size + 1}: {e}")
+                import traceback
+                traceback.print_exc()
             
-            results[token_idx] = token_results
+            # MEMORY OPTIMIZATION: Clear batch-specific variables
+            del batch_hiddens
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         return results

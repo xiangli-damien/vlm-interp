@@ -415,8 +415,7 @@ class TraceHookManager:
         Returns:
             Hook function
         """
-        def hook_fn(module: nn.Module, inputs: Tuple[torch.Tensor, ...], 
-                   outputs: Any) -> None:
+        def hook_fn(module: nn.Module, inputs: Tuple[torch.Tensor, ...], outputs: Any) -> None:
             info = self._layer_info[layer_name]
             layer_idx = info.get("index")
             
@@ -435,17 +434,15 @@ class TraceHookManager:
                     if isinstance(outputs[0], torch.Tensor):
                         hidden_state = outputs[0]
                         
-                # Store hidden state if found
+                # Store hidden state if found - ALWAYS DETACH AND MOVE TO CPU for memory efficiency
                 if hidden_state is not None:
+                    # Immediately detach and move to CPU regardless of self.detach_after_forward setting
                     self.cache.set(
                         layer_idx,
                         "hidden",
                         hidden_state,
-                        detach=self.detach_after_forward
+                        detach=True  # Force detach for memory efficiency
                     )
-                    # Store original tensor if we need gradients
-                    if not self.detach_after_forward:
-                        info["live_hidden"] = hidden_state
             
             # Process attention weights if requested
             if "attention" in capture or "grad" in capture:
@@ -460,9 +457,9 @@ class TraceHookManager:
                         attn_weights = outputs[1]
                     # Pattern 2: (hidden_state, present_key_value, attention_weights, ...)
                     elif (len(outputs) > 2 and 
-                          isinstance(outputs[2], torch.Tensor) and 
-                          len(outputs[2].shape) == 4 and 
-                          outputs[2].shape[-1] == outputs[2].shape[-2]):
+                        isinstance(outputs[2], torch.Tensor) and 
+                        len(outputs[2].shape) == 4 and 
+                        outputs[2].shape[-1] == outputs[2].shape[-2]):
                         attn_weights = outputs[2]
                 
                 # Store attention weights if found
@@ -479,22 +476,37 @@ class TraceHookManager:
                         if tensor_hook_key in self._tensor_hooks:
                             self._tensor_hooks[tensor_hook_key].remove()
                             
-                        # Define gradient capture function
+                        # Define gradient capture function - ENHANCED FOR MEMORY EFFICIENCY
                         def grad_hook(grad: torch.Tensor) -> None:
-                            self.cache.set(layer_idx, "grad", grad)
-                            if self.detach_after_forward:
-                                attn = info.pop("live_attn")
-                                self.cache.set(layer_idx, "attention", attn.detach())
-                            
+                            # MEMORY OPTIMIZATION: Immediately compute saliency here
+                            # rather than storing both attention and gradient separately
+                            if "live_attn" in info:
+                                attn = info["live_attn"]
+                                
+                                # Compute saliency immediately
+                                saliency = torch.abs(attn * grad)
+                                
+                                # Convert to half precision and move to CPU immediately
+                                saliency = saliency.to(torch.float16).cpu()
+                                
+                                # Store the saliency score
+                                self.cache.set(layer_idx, "saliency", saliency, detach=True)
+                                
+                                # Clean up to free memory immediately
+                                del grad
+                                info.pop("live_attn", None)
+                            else:
+                                # Fallback: store gradient separately
+                                self.cache.set(layer_idx, "grad", grad, detach=True)
+                        
                         # Register the hook
                         handle = attn_weights.register_hook(grad_hook)
                         self._tensor_hooks[tensor_hook_key] = handle
                         
-                    # Store the tensor in cache (detached if needed)
-                    info["live_attn"] = attn_weights
-                    if not self.detach_after_forward:
-                        self.cache.set(layer_idx, "attention", attn_weights, detach=False)
-                        
+                    # Always store a detached copy of attention in cache, unless we're keeping for gradient
+                    if "attention" in capture and (not "grad" in capture or self.detach_after_forward):
+                        self.cache.set(layer_idx, "attention", attn_weights, detach=True)
+                            
         return hook_fn
 
     def _register_hooks(self):

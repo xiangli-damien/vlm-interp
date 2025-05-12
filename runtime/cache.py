@@ -61,8 +61,10 @@ class TracingCache:
         if processed.device.type == "cuda":
             processed = processed.cpu()
             # Explicitly delete the original tensor to trigger immediate memory release
-            del tensor
-            torch.cuda.empty_cache()
+            if id(processed) != id(tensor):  # Only if we created a new tensor
+                del tensor
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         # Store the processed tensor in the appropriate cache
         if cache_type == "hidden":

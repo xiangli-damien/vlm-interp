@@ -312,6 +312,11 @@ class SaliencyBackend:
         if not valid_targets:
             return
 
+        # Force memory cleanup before starting
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # Get list of all layer indices
         all_layer_indices = list(range(len(self.layer_names)))
 
@@ -328,7 +333,7 @@ class SaliencyBackend:
                 hook_mgr = TraceHookManager(
                     self.model,
                     cpu_offload=True,
-                    detach_after_forward=True
+                    detach_after_forward=True  # IMPORTANT: always detach after forward
                 )
 
                 # Register only the current layer, not multiple layers
@@ -365,7 +370,7 @@ class SaliencyBackend:
 
                         return token_loss
 
-                    # Prepare a minimal input dictionary (retain only necessary parts)
+                    # Prepare a minimal input dictionary with lower precision to save memory
                     minimal_inputs = {}
                     for k, v in inputs.items():
                         if isinstance(v, torch.Tensor):
@@ -373,16 +378,15 @@ class SaliencyBackend:
                                 # Convert large float32 tensors to float16 to reduce memory
                                 minimal_inputs[k] = v.to(torch.float16)
                             else:
-                                # Use clone only for small tensors
-                                minimal_inputs[k] = v.clone() if v.numel() < 1000 else v
+                                # Use shallow copy for small tensors
+                                minimal_inputs[k] = v.to(v.device, non_blocking=True)
                         else:
                             minimal_inputs[k] = v
 
-                    # Run the model using the hook-enabled version
-                    hook_mgr.run(minimal_inputs, loss_fn)
-
-                    # Compute saliency from collected gradients
-                    hook_mgr.compute_saliency()
+                    # Enable mixed precision for forward pass
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
+                        # Run the model using the hook-enabled version
+                        hook_mgr.run(minimal_inputs, loss_fn)
 
                     # Retrieve snapshot of all collected tensors
                     snapshot = hook_mgr.snapshot()
@@ -390,8 +394,16 @@ class SaliencyBackend:
                     # Transfer saliency for the current layer into the main cache
                     if snapshot.has(layer_idx, "saliency"):
                         self.cache.set(layer_idx, "saliency", snapshot.get(layer_idx, "saliency"))
+                    elif snapshot.has(layer_idx, "attention") and snapshot.has(layer_idx, "grad"):
+                        # Manual compute if needed
+                        attention = snapshot.get(layer_idx, "attention")
+                        grad = snapshot.get(layer_idx, "grad")
+                        saliency = torch.abs(attention * grad).to(torch.float16).cpu()
+                        self.cache.set(layer_idx, "saliency", saliency)
+                        # Clean up immediately
+                        del attention, grad
                     else:
-                        # Alternatively store individual attention and gradient components
+                        # Fallback: store components separately
                         if snapshot.has(layer_idx, "attention"):
                             self.cache.set(layer_idx, "attention", snapshot.get(layer_idx, "attention"))
                         if snapshot.has(layer_idx, "grad"):
@@ -404,7 +416,7 @@ class SaliencyBackend:
                         torch.cuda.empty_cache()
 
                 except Exception as e:
-                    logger.error(f"Error computing batch saliency for token {target_idx}: {e}")
+                    logger.error(f"Error computing batch saliency for token {target_idx}, layer {layer_idx}: {e}")
                     import traceback
                     traceback.print_exc()
                 finally:
