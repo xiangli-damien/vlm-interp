@@ -72,7 +72,7 @@ class TraceHookManager:
         if self._compiling:
             logger.warning("Hooks may be ignored during torch.compile. Consider using eager mode for tracing.")
     
-    def add_layer(self, layer_name: str, capture: Union[List[str], Tuple[str, ...]] = ("hidden", "attention", "grad"), 
+    def add_layer(self, layer_name: str, capture: Union[List[str], Tuple[str, ...]] = ("attention", "grad"), 
                  alias: Optional[str] = None, layer_idx: Optional[int] = None) -> bool:
         """
         Register a layer for hook installation.
@@ -488,7 +488,7 @@ class TraceHookManager:
                     # Save the original tensor for gradient hooks
                     if "grad" in capture and attn_weights.requires_grad:
                         # Store the live tensor in layer info
-                        info["live_attn"] = attn_weights
+                        info["live_attn"] = attn_weights.detach()
                         
                         # Register gradient hook on the original tensor
                         tensor_hook_key = f"{layer_name}_attn_grad"
