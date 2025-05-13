@@ -48,7 +48,7 @@ class SaliencyBackend:
     def trace_layer(self, layer_idx: int, target_tokens: Dict[int, float], 
                 selection_config: SelectionConfig, batch_compute: bool = True) -> List[Dict[str, Any]]:
         """
-        Trace saliency patterns for a specific layer with lazy computation.
+        Trace saliency patterns for a specific layer with lazy computation and fallback mechanism.
         
         Args:
             layer_idx: Index of the layer to trace
@@ -69,10 +69,26 @@ class SaliencyBackend:
                 offload_tensors=True,
                 restrict_layers=[layer_idx]  # Only process this layer
             )
-            
+        
         # Get saliency scores after computation
         saliency_matrix = self.cache.get(layer_idx, "saliency", self.device)
+        
+        # FALLBACK: If saliency is still missing (which can happen if gradient hooks weren't triggered)
+        # try to compute it directly from attention if available
+        if saliency_matrix is None and self.cache.has(layer_idx, "attention"):
+            logger.warning(f"Saliency computation failed for layer {layer_idx}, falling back to attention weights")
+            attention_matrix = self.cache.get(layer_idx, "attention", self.device)
+            
+            # Use attention weights directly as a fallback
+            # This happens if the layer doesn't have requires_grad=True for attention weights
+            saliency_matrix = attention_matrix.abs()
+            
+            # Cache the computed fallback saliency
+            self.cache.set(layer_idx, "saliency", saliency_matrix.detach().to(torch.float16).cpu())
+        
+        # Final check - if still no saliency, return empty list
         if saliency_matrix is None:
+            logger.error(f"Failed to compute saliency for layer {layer_idx} - no attention or gradient available")
             return []
             
         # Process saliency for each target token
@@ -265,6 +281,11 @@ class SaliencyBackend:
 
     def _run_hook_manager(self, hook_mgr, target_indices):
         """Helper method to run hook manager with appropriate loss function."""
+        # Ensure consistent use of detach_after_forward=True
+        if not hook_mgr.detach_after_forward:
+            logger.warning("Inconsistent hook manager configuration: detach_after_forward=False may cause OOM issues")
+            hook_mgr.detach_after_forward = True
+        
         # Build a combined loss over all requested target tokens
         def loss_fn(outputs):
             # outputs.logits: [B, seq_len, vocab_size]
@@ -283,10 +304,7 @@ class SaliencyBackend:
         # Run the model with hooks
         hook_mgr.run(self._last_inputs, loss_fn)
         
-        # Compute saliency scores
-        hook_mgr.compute_saliency()
-
-        # Push everything into our main cache
+        # Copy results from hook_mgr.cache to our main cache
         snapshot = hook_mgr.snapshot()
         for idx in range(len(self.layer_names)):
             if snapshot.has(idx, "saliency"):
@@ -404,9 +422,23 @@ class SaliencyBackend:
                 hook_mgr.clear(keep_cache=True)  # Don't clear the cache
                 continue
 
-            # Saliency tensors already computed in gradient hooks, no need to call compute_saliency again
+            # CRITICAL FIX: Copy data from hook_mgr.cache to self.cache
+            # Get a snapshot of the hook manager's cache
+            snapshot = hook_mgr.snapshot()
+            
+            # Copy relevant data to our main cache for each layer in this batch
+            for l in batch_layers:
+                # Copy saliency if available
+                if snapshot.has(l, "saliency"):
+                    self.cache.set(l, "saliency", snapshot.get(l, "saliency"))
+                else:
+                    # Fallback: copy attention and gradient separately if available
+                    if snapshot.has(l, "attention"):
+                        self.cache.set(l, "attention", snapshot.get(l, "attention"))
+                    if snapshot.has(l, "grad"):
+                        self.cache.set(l, "grad", snapshot.get(l, "grad"))
 
-            # Clear hooks but keep the cache
+            # Clear hooks but keep the cache until we've copied everything
             hook_mgr.clear(keep_cache=True)
 
             # Force aggressive memory cleanup
