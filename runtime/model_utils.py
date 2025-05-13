@@ -45,7 +45,12 @@ def load_model(
     use_flash_attn: bool = False,
     load_in_4bit: bool = False,
     enable_gradients: bool = False,
-    device_map: Optional[str] = "auto"
+    device_map: Optional[str] = "auto",
+    # Add new optional parameters for quantization configuration
+    bnb_4bit_quant_type: str = "nf4",
+    bnb_4bit_compute_dtype: torch.dtype = torch.float16,
+    bnb_4bit_use_double_quant: bool = True,
+    **kwargs  # Catch any additional parameters
 ) -> Tuple[LlavaNextForConditionalGeneration, LlavaNextProcessor]:
     """
     Loads a LLaVA-Next model and processor with flexible support for Flash Attention and 4-bit quantization.
@@ -56,6 +61,10 @@ def load_model(
         load_in_4bit (bool): Whether to load the model using 4-bit quantization (requires bitsandbytes).
         enable_gradients (bool): If True, enables requires_grad on model parameters.
         device_map (Optional[str]): Device mapping for model loading. Defaults to "auto".
+        bnb_4bit_quant_type (str): Quantization type for 4-bit loading ("nf4" or "fp4").
+        bnb_4bit_compute_dtype (torch.dtype): Compute dtype for 4-bit quantization.
+        bnb_4bit_use_double_quant (bool): Whether to use double quantization for 4-bit loading.
+        **kwargs: Additional arguments to pass to the model's from_pretrained method.
 
     Returns:
         Tuple: (model, processor)
@@ -91,11 +100,11 @@ def load_model(
 
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16
+                bnb_4bit_use_double_quant=bnb_4bit_use_double_quant,
+                bnb_4bit_quant_type=bnb_4bit_quant_type,
+                bnb_4bit_compute_dtype=bnb_4bit_compute_dtype
             )
-            print("[✓] 4-bit quantization enabled with nf4 format.")
+            print(f"[✓] 4-bit quantization enabled with {bnb_4bit_quant_type} format and {bnb_4bit_compute_dtype} compute dtype.")
 
         except ImportError as e:
             print(f"[WARN] bitsandbytes not available or outdated: {e}")
@@ -115,7 +124,8 @@ def load_model(
             low_cpu_mem_usage=True,
             device_map=effective_device_map,
             attn_implementation=attn_implementation,
-            trust_remote_code=True
+            trust_remote_code=True,
+            **kwargs  # Pass any additional arguments
         )
         print("[✓] Model loaded.")
         if effective_device_map is None:
@@ -147,7 +157,6 @@ def load_model(
     elapsed = time.time() - start_time
     print(f"[✓] Model and processor loaded in {elapsed:.2f} seconds.")
     return model, processor
-
     
 
 def get_module_by_name(model: nn.Module, name: str) -> Optional[nn.Module]:
