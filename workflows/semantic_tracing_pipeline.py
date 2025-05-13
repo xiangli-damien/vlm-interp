@@ -36,50 +36,25 @@ def run_semantic_tracing_test(
     min_edge_weight: float = 0.0,
     use_variable_node_size: bool = True,
     debug_mode: bool = False,
-    # New parameters for memory optimization
     low_memory_mode: bool = True,
     fallback_to_attention: bool = True,
     max_batch_size: int = 1,
     offload_to_cpu: bool = True,
-    top_k: Optional[int] = None  # For compatibility with old code
+    top_k: Optional[int] = None
 ) -> Dict[str, Any]:
     """
     Run semantic tracing with improved memory management and OOM prevention strategies.
-    
-    Args:
-        model_id: HuggingFace model ID
-        image_url: URL or path to the image
-        prompt_text: Text prompt to use
-        output_dir: Directory to save results
-        num_tokens: Number of tokens to generate and analyze
-        beta_target: Coverage threshold for selecting source nodes per target
-        beta_layer: Coverage threshold for pruning at layer level
-        min_keep: Minimum nodes to keep per target
-        max_keep: Maximum nodes to keep per target
-        min_keep_layer: Minimum nodes to keep per layer
-        max_keep_layer: Maximum nodes to keep per layer
-        concepts_to_track: List of concepts to track
-        load_in_4bit: Whether to use 4-bit quantization
-        analyze_last_token: Analyze last token in prompt
-        single_forward_pass: Whether to compute saliency in one pass (will be overridden)
-        target_token_idx: Index of specific token to analyze
-        analyze_specific_indices: List of specific token indices to analyze
-        tracing_mode: The tracing mode to use ("saliency" or "attention")
-        skip_visualization: Skip visualization step
-        output_format: Output format (png, svg, or both)
-        show_orphaned_nodes: Show nodes with no connections
-        min_edge_weight: Minimum edge weight threshold
-        use_variable_node_size: Vary node size based on importance
-        debug_mode: Enable debug mode
-        low_memory_mode: Enable ultra-low memory optimizations
-        fallback_to_attention: Fall back to attention when saliency fails
-        max_batch_size: Maximum batch size for processing
-        offload_to_cpu: Offload tensors to CPU when possible
-        top_k: Optional top k parameter (for compatibility with old code)
-        
-    Returns:
-        Dictionary with test results
     """
+    # Import torch inside the function to prevent UnboundLocalError
+    import torch
+    from enum import Enum
+    import gc
+    
+    # Define TraceMode enum inside the function since it's used within the function
+    class TraceMode(Enum):
+        """Tracing modes for semantic analysis."""
+        ATTENTION = "attention"
+        SALIENCY = "saliency"
     
     # Set up logging
     logger = logging.getLogger("semantic_tracing_test")
