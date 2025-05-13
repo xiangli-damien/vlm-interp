@@ -367,43 +367,56 @@ class TraceHookManager:
     
     def compute_saliency(self) -> Dict[Union[int, str], torch.Tensor]:
         """
-        Convert every (attention, gradient) pair still left in the cache into a
-        saliency tensor ``|A * dA/dL|`` and immediately drop the auxiliaries.
+        Convert every *(attention, gradient)* pair still present in the cache
+        into a *saliency tensor* and *immediately* discard the source tensors.
+
+        This method is idempotent and can be called multiple times; layers that
+        already have a saliency tensor are skipped.
 
         Returns
         -------
-        Dict[Union[int, str], torch.Tensor]
-            Mapping from *layer index* to the newly generated saliency tensor.
+        Dict[int | str, torch.Tensor]
+            Mapping from *layer index* **or** custom alias to the newly
+            generated saliency tensor.  (Layers that were already processed are
+            omitted from the dictionary.)
         """
-        out: Dict[Union[int, str], torch.Tensor] = {}
+        new_saliency: Dict[Union[int, str], torch.Tensor] = {}
 
         for layer_name, info in self._layer_info.items():
             idx = info.get("index")
             if idx is None:
+                # Should never happen, but we guard anyway.
                 continue
 
+            # Skip if saliency already exists or prerequisites are missing.
+            if self.cache.has(idx, "saliency"):
+                continue
             if not (self.cache.has(idx, "attention") and self.cache.has(idx, "grad")):
-                # Mark missing grad – the SaliencyBackend might want to fall back.
                 if not self.cache.has(idx, "grad"):
+                    # Mark missing gradient – helpful for fall‑back logic upstream.
                     self.cache.grad_missing[idx] = True
                 continue
 
+            # Retrieve tensors (they are on CPU if `cpu_offload=True`).
             attn = self.cache.get(idx, "attention")
             grad = self.cache.get(idx, "grad")
 
             if attn.shape != grad.shape:
-                logger.warning(f"compute_saliency: shape mismatch in layer {idx}")
+                logger.warning(
+                    "TraceHookManager.compute_saliency – shape mismatch "
+                    f"in layer {idx}: attn {attn.shape} vs grad {grad.shape}"
+                )
                 continue
 
             sal = torch.abs(attn * grad)
             self.cache.set(idx, "saliency", sal)
-            out[idx] = sal
+            new_saliency[idx] = sal
 
-            # Memory hygiene – drop now‑useless tensors.
+            # Free up memory – attention & grads are no longer needed.
             self.cache.clear_single(idx, "attention")
             self.cache.clear_single(idx, "grad")
 
-        return out
+        return new_saliency
 
     
     def _capture_custom_tensors(self) -> None:
