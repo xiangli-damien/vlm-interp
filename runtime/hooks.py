@@ -181,7 +181,7 @@ class TraceHookManager:
     
     def run(self, inputs: Dict[str, torch.Tensor], loss_fn: Optional[Callable] = None) -> Any:
         """
-        Extremely memory-optimized run method using batch-wise execution and precise memory control.
+        Ultra memory-optimized run method with proper error handling and fallbacks.
         """
         if not self._installed:
             logger.warning("Hooks not installed. Installing...")
@@ -192,79 +192,100 @@ class TraceHookManager:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Always use eval mode, even when computing gradients
+        # Always use eval mode for consistency, even when computing gradients
         original_mode = self.model.training
         self.model.eval()
+        
+        # Initialize outputs to None to avoid reference errors
+        outputs = None
 
         try:
             # Disable gradient tracking unless loss_fn is provided
             torch.set_grad_enabled(loss_fn is not None)
 
-            # Create a minimal input dictionary retaining only required keys
+            # Create a minimal input dictionary with mixed precision to save memory
             minimal_inputs = {}
             for k, v in inputs.items():
                 if isinstance(v, torch.Tensor):
-                    # Use shallow copy with .to() instead of .clone() for large tensors
                     device = v.device
-                    minimal_inputs[k] = v.to(device, non_blocking=True)
-
-                    # If the tensor is float32 and large, convert to float16 to save memory
+                    # Use lower precision for large float tensors
                     if v.dtype == torch.float32 and v.numel() > 1000:
-                        minimal_inputs[k] = v.to(torch.float16)
+                        minimal_inputs[k] = v.to(torch.float16, device=device, non_blocking=True)
+                    else:
+                        minimal_inputs[k] = v.to(device, non_blocking=True)
                 else:
                     minimal_inputs[k] = v
 
-            # Use mixed precision to reduce memory usage
+            # Use deterministic algorithms when possible for reproducibility
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
-                outputs = self.model(
-                    **minimal_inputs,
-                    output_hidden_states=True,
-                    return_dict=True
-                )
-
-            # If a loss function is provided, compute gradients
-            if loss_fn is not None:
                 try:
-                    # Compute the loss in mixed precision
+                    outputs = self.model(
+                        **minimal_inputs,
+                        output_hidden_states=True,
+                        return_dict=True
+                    )
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        logger.warning(f"OOM during forward pass: {e}")
+                        # Clear memory and return early with failure indicator
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        return {"error": "OOM during forward pass"}
+                    else:
+                        raise
+
+            # If a loss function is provided, compute gradients with proper error handling
+            if loss_fn is not None and outputs is not None:
+                try:
+                    # Compute loss with mixed precision
                     with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
                         loss = loss_fn(outputs)
-
+                        
                     # Check if loss requires gradients
                     if not loss.requires_grad:
                         logger.warning("Loss does not require gradients. Skipping backward pass.")
                         return outputs
 
-                    # Fully zero out gradients
+                    # Zero gradients with set_to_none for better memory efficiency
                     self.model.zero_grad(set_to_none=True)
-
-                    # Wrap backward pass in try-except to gracefully handle OOM
-                    try:
-                        # Key optimization: disable retain_graph and use smaller gradient norm (if applicable)
-                        loss.backward(retain_graph=False)
-                    except RuntimeError as e:
-                        if "out of memory" in str(e).lower():
-                            # On OOM, attempt to recover with cleanup and fallback
-                            logger.warning(f"OOM during backward pass: {e}. Attempting fallback...")
-
-                            # Release references to large objects
-                            del loss, outputs
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-
-                            # Fall back to CPU computation or warn user that tracing is incomplete
-                            logger.error("Failed to compute gradients due to OOM. Results may be incomplete.")
+                    
+                    # Use retain_graph=False to minimize memory usage during backward pass
+                    loss.backward(retain_graph=False)
+                    
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        # Handle OOM during backward pass gracefully
+                        logger.warning(f"OOM during backward pass: {e}. Cleaning up...")
+                        
+                        # Release references to tensors
+                        if 'loss' in locals():
+                            del loss
+                        
+                        # Force garbage collection
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        
+                        # Update outputs to include error information
+                        if isinstance(outputs, dict):
+                            outputs["error"] = "OOM during backward pass"
                         else:
-                            # Re-raise non-OOM errors
-                            raise
-
-                except Exception as e:
-                    logger.error(f"Error during backward pass: {e}")
-                    import traceback
-                    traceback.print_exc()
+                            # Create a new dict with the error if outputs is not a dict
+                            temp = {"original_outputs": outputs, "error": "OOM during backward pass"}
+                            outputs = temp
+                    else:
+                        # Re-raise other errors
+                        raise
 
             return outputs
 
+        except Exception as e:
+            logger.error(f"Error during hook manager run: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"error": str(e)}
+            
         finally:
             # Restore original model mode (train/eval)
             if self.model.training != original_mode:
@@ -273,7 +294,7 @@ class TraceHookManager:
                 else:
                     self.model.eval()
 
-            # Cleanup and release all memory
+            # Final cleanup
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

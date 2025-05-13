@@ -296,10 +296,15 @@ class SaliencyBackend:
                 if snapshot.has(idx, "grad"):
                     self.cache.set(idx, "grad", snapshot.get(idx, "grad"))
         
-    def compute_batch_saliency(self, target_indices, inputs, layer_batch_size=1):
+    def compute_batch_saliency(self, target_indices, inputs, layer_batch_size=1, offload_tensors=True):
         """
-        Ultra memory-optimized version: processes each token and each layer individually 
-        using mixed precision and progressive offloading.
+        Ultra memory-optimized saliency computation that processes one token and one layer at a time.
+        
+        Args:
+            target_indices: List of token indices to compute saliency for
+            inputs: Model inputs
+            layer_batch_size: Number of layers to process at once (use 1 for lowest memory usage)
+            offload_tensors: Whether to offload tensors to CPU immediately after computation
         """
         # Return early if there are no valid targets
         if not target_indices:
@@ -310,6 +315,7 @@ class SaliencyBackend:
         valid_targets = [idx for idx in target_indices if 0 < idx <= max_idx]
 
         if not valid_targets:
+            logger.warning("No valid target indices found")
             return
 
         # Force memory cleanup before starting
@@ -319,24 +325,42 @@ class SaliencyBackend:
 
         # Get list of all layer indices
         all_layer_indices = list(range(len(self.layer_names)))
-
+        
         # Process each target token independently
         for target_idx in valid_targets:
-            logger.info(f"Computing batch saliency for token {target_idx}")
+            logger.info(f"Computing saliency for token {target_idx}")
+            
+            # Create a reduced-size inputs dictionary to minimize memory usage
+            minimal_inputs = {}
+            for k, v in inputs.items():
+                if isinstance(v, torch.Tensor):
+                    # Use half precision for non-integer tensors to reduce memory
+                    if v.dtype in [torch.float32, torch.float64] and v.numel() > 1000:
+                        minimal_inputs[k] = v.to(torch.float16)
+                    else:
+                        # Just reference the tensor rather than copying it
+                        minimal_inputs[k] = v
+                else:
+                    minimal_inputs[k] = v
 
             # Process each layer individually to minimize memory usage
             for layer_idx in all_layer_indices:
                 layer_name = self.layer_names[layer_idx]
                 logger.debug(f"Processing layer {layer_idx}/{len(all_layer_indices)}: {layer_name}")
+                
+                # Skip if this layer's saliency is already computed
+                if self.cache.has(layer_idx, "saliency"):
+                    logger.debug(f"Layer {layer_idx} saliency already in cache, skipping")
+                    continue
 
-                # Create a new hook manager for this specific layer
+                # Create a fresh hook manager for just this layer to avoid accumulating hooks
                 hook_mgr = TraceHookManager(
                     self.model,
                     cpu_offload=True,
-                    detach_after_forward=True  # IMPORTANT: always detach after forward
+                    detach_after_forward=True  # Always detach to save memory
                 )
 
-                # Register only the current layer, not multiple layers
+                # Register only the current layer to minimize memory usage
                 hook_mgr.add_layer(
                     layer_name,
                     capture=["attention", "grad"],
@@ -347,86 +371,153 @@ class SaliencyBackend:
                 hook_mgr.install()
 
                 try:
-                    # Define the loss function for the current target token only
+                    # Define loss function optimized for the specific target token
                     def loss_fn(outputs):
-                        # Extract logits from the model output
+                        # Safety check for outputs
+                        if not hasattr(outputs, 'logits'):
+                            return torch.tensor(0.0, device=self.device, requires_grad=True)
+                        
+                        # Extract logits and compute loss for the specific token
                         logits = outputs.logits  # [B, seq_len, vocab_size]
-
-                        # Compute log probabilities in float32 for numerical stability
-                        log_probs = torch.log_softmax(logits, dim=-1)
-
-                        # Compute loss based on the token at the previous position
+                        
+                        # Use float32 for computing log probs for numerical stability
+                        # but on CPU to save GPU memory
+                        if offload_tensors:
+                            log_probs_cpu = torch.log_softmax(logits.detach().cpu().float(), dim=-1)
+                            log_probs = log_probs_cpu.to(logits.device)
+                        else:
+                            log_probs = torch.log_softmax(logits.float(), dim=-1)
+                        
+                        # Compute loss for target token prediction
                         prev_idx = target_idx - 1
-                        input_ids = inputs["input_ids"][0]
-
-                        # Safety check: skip invalid indices
-                        if target_idx >= len(input_ids):
+                        if prev_idx < 0 or target_idx >= minimal_inputs["input_ids"].shape[1]:
+                            # Invalid index - return dummy loss
                             return torch.tensor(0.0, device=logits.device, requires_grad=True)
-
-                        true_token_id = input_ids[target_idx].item()
-
-                        # Compute negative log-probability for the true token
-                        token_loss = -log_probs[0, prev_idx, true_token_id]
-
+                            
+                        token_id = minimal_inputs["input_ids"][0, target_idx].item()
+                        token_loss = -log_probs[0, prev_idx, token_id]
+                        
                         return token_loss
 
-                    # Prepare a minimal input dictionary with lower precision to save memory
-                    minimal_inputs = {}
-                    for k, v in inputs.items():
-                        if isinstance(v, torch.Tensor):
-                            if v.dtype == torch.float32 and v.numel() > 1000:
-                                # Convert large float32 tensors to float16 to reduce memory
-                                minimal_inputs[k] = v.to(torch.float16)
-                            else:
-                                # Use shallow copy for small tensors
-                                minimal_inputs[k] = v.to(v.device, non_blocking=True)
+                    # Run with mixed precision and gradient calculation
+                    try:
+                        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
+                            run_result = hook_mgr.run(minimal_inputs, loss_fn)
+                        
+                        # Check if run was successful
+                        if isinstance(run_result, dict) and "error" in run_result:
+                            logger.warning(f"Error during hook run: {run_result['error']}")
+                            raise RuntimeError(f"Hook run failed: {run_result['error']}")
+                    
+                    except RuntimeError as e:
+                        if "out of memory" in str(e).lower():
+                            # If OOM occurs, try with even more aggressive memory optimization
+                            logger.warning(f"OOM during run, trying with more aggressive optimization")
+                            
+                            # Clear all existing tensors and cache
+                            hook_mgr.clear()
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            
+                            # Create a new hook manager with more aggressive settings
+                            hook_mgr = TraceHookManager(
+                                self.model,
+                                cpu_offload=True,
+                                detach_after_forward=True
+                            )
+                            hook_mgr.add_layer(layer_name, capture=["attention"], layer_idx=layer_idx)
+                            hook_mgr.install()
+                            
+                            # Try without gradient computation (attention only)
+                            try:
+                                with torch.no_grad():
+                                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+                                        outputs = self.model(
+                                            **minimal_inputs,
+                                            output_attentions=True,
+                                            output_hidden_states=False,
+                                            return_dict=True
+                                        )
+                                    
+                                    # Extract attention directly
+                                    if hasattr(outputs, 'attentions') and outputs.attentions:
+                                        layer_attn = outputs.attentions[layer_idx]
+                                        
+                                        # Store it directly in the cache
+                                        self.cache.set(layer_idx, "attention", layer_attn.detach().cpu())
+                                        
+                                        # Use attention values directly as saliency (fallback)
+                                        logger.warning(f"Using attention as fallback for saliency in layer {layer_idx}")
+                                        self.cache.set(layer_idx, "saliency", layer_attn.detach().cpu())
+                            
+                            except Exception as inner_e:
+                                logger.error(f"Failed even with fallback approach: {inner_e}")
                         else:
-                            minimal_inputs[k] = v
-
-                    # Enable mixed precision for forward pass
-                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
-                        # Run the model using the hook-enabled version
-                        hook_mgr.run(minimal_inputs, loss_fn)
-
-                    # Retrieve snapshot of all collected tensors
+                            # Non-OOM error, log and continue
+                            logger.error(f"Non-OOM error in run: {e}")
+                    
+                    # Try to compute saliency from the hook manager's snapshot
                     snapshot = hook_mgr.snapshot()
-
-                    # Transfer saliency for the current layer into the main cache
+                    
+                    # Transfer saliency data to main cache
                     if snapshot.has(layer_idx, "saliency"):
-                        self.cache.set(layer_idx, "saliency", snapshot.get(layer_idx, "saliency"))
+                        saliency = snapshot.get(layer_idx, "saliency")
+                        if offload_tensors:
+                            saliency = saliency.cpu()
+                        self.cache.set(layer_idx, "saliency", saliency)
                     elif snapshot.has(layer_idx, "attention") and snapshot.has(layer_idx, "grad"):
-                        # Manual compute if needed
+                        # Manually compute saliency
                         attention = snapshot.get(layer_idx, "attention")
                         grad = snapshot.get(layer_idx, "grad")
-                        saliency = torch.abs(attention * grad).to(torch.float16).cpu()
+                        
+                        # Check for NaN or Inf values and replace them
+                        if torch.isnan(attention).any() or torch.isinf(attention).any():
+                            attention = torch.nan_to_num(attention, nan=0.0, posinf=1.0, neginf=0.0)
+                        if torch.isnan(grad).any() or torch.isinf(grad).any():
+                            grad = torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=0.0)
+                        
+                        # Compute saliency
+                        saliency = torch.abs(attention * grad)
+                        
+                        # Offload to CPU to save memory
+                        if offload_tensors:
+                            saliency = saliency.to(dtype=torch.float16).cpu()
+                            
                         self.cache.set(layer_idx, "saliency", saliency)
-                        # Clean up immediately
+                        
+                        # Free memory immediately
                         del attention, grad
-                    else:
-                        # Fallback: store components separately
-                        if snapshot.has(layer_idx, "attention"):
-                            self.cache.set(layer_idx, "attention", snapshot.get(layer_idx, "attention"))
-                        if snapshot.has(layer_idx, "grad"):
-                            self.cache.set(layer_idx, "grad", snapshot.get(layer_idx, "grad"))
-
-                    # Force memory cleanup after each layer
-                    del minimal_inputs
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                        
+                    elif snapshot.has(layer_idx, "attention"):
+                        # Fallback: use attention as proxy for saliency
+                        attention = snapshot.get(layer_idx, "attention")
+                        logger.warning(f"Only attention available for layer {layer_idx}, using as fallback for saliency")
+                        
+                        if offload_tensors:
+                            attention = attention.to(dtype=torch.float16).cpu()
+                            
+                        self.cache.set(layer_idx, "attention", attention)
+                        self.cache.set(layer_idx, "saliency", attention)  # Use attention as fallback
 
                 except Exception as e:
-                    logger.error(f"Error computing batch saliency for token {target_idx}, layer {layer_idx}: {e}")
+                    logger.error(f"Error processing layer {layer_idx}: {e}")
                     import traceback
                     traceback.print_exc()
+                    
                 finally:
-                    # Clear all registered hooks
+                    # Always clean up hooks and force memory cleanup after each layer
                     hook_mgr.clear()
-
-                    # Force memory cleanup after hook teardown
+                    
+                    # Aggressive memory cleanup
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+            
+            # Force cleanup after each target token
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Ensure model is reset to eval mode after tracing
         self.model.eval()

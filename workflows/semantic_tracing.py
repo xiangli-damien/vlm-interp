@@ -333,14 +333,14 @@ class SemanticTracingWorkflow(GenerationMixin):
          single_forward_pass: bool = False,
          compute_ll_projections: bool = True) -> Dict[str, Any]:
         """
-        Trace token contributions through model layers with optimized memory management.
+        Memory-optimized tracing that minimizes GPU memory usage.
         
         Args:
             input_data: Prepared input data
             target_tokens: Dictionary mapping target token indices to weights
             mode: Tracing mode (attention or saliency)
             trace_id: Unique identifier for this trace
-            single_forward_pass: Whether to use a single forward pass (will be overridden to False)
+            single_forward_pass: Whether to use a single forward pass (always overridden to False for memory efficiency)
             compute_ll_projections: Whether to compute Logit Lens projections
             
         Returns:
@@ -363,298 +363,303 @@ class SemanticTracingWorkflow(GenerationMixin):
             try:
                 mode = TraceMode(mode.lower())
             except ValueError:
-                # Default to saliency if invalid mode provided
                 logger.warning(f"Invalid tracing mode: {mode}. Using saliency mode instead.")
                 mode = TraceMode.SALIENCY
 
         # Initialize the backend if it doesn't exist yet
         if mode not in self.backends:
             logger.info(f"Initializing {mode.value} backend on first use")
-            if mode == TraceMode.ATTENTION:
-                self.backends[mode] = AttentionBackend(
-                    model=self.model,
-                    layer_names=self.layer_names,
-                    cache=self.cache,
-                    device=self.device
-                )
-            elif mode == TraceMode.SALIENCY:
-                self.backends[mode] = SaliencyBackend(
-                    model=self.model,
-                    layer_names=self.layer_names,
-                    cache=self.cache,
-                    device=self.device
-                )
+            self._get_backend(mode)
         
         # Get the appropriate backend based on the mode
         backend = self.backends[mode]
         layer_traces = []
         
-        # Prepare token information for records - needed for token_text and token_id fields
+        # Prepare token information for records
         input_ids = input_data["inputs"]["input_ids"][0].tolist()
         all_token_texts = [self._get_token_text(tid) for tid in input_ids]
-        
-        # MEMORY OPTIMIZATION: Always use batch mode for better memory management
-        logger.info("Using batch mode processing for optimal memory usage")
-        
-        # Get the backend's layer map to ensure correct indexing
-        layer_name_map = getattr(backend, "layer_name_map", {})
-        
-        # Trace through layers from last to first
-        current_targets = dict(target_tokens)  # Copy to avoid modifying the original
         
         # Force memory cleanup before starting layer processing
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        for layer_idx in reversed(range(len(self.layer_names))):
+        # MEMORY OPTIMIZATION: Process individual layers in reverse order
+        current_targets = dict(target_tokens)  # Copy to avoid modifying the original
+        
+        # Get the backend's layer map to ensure correct indexing
+        layer_name_map = getattr(backend, "layer_name_map", {})
+        
+        # Clear any previous cache data completely to prevent memory leaks
+        self.cache.clear()
+        
+        # OPTIMIZATION: Pre-cache important inputs with minimal necessary data
+        minimal_inputs = {}
+        for k, v in input_data["inputs"].items():
+            if isinstance(v, torch.Tensor):
+                if v.dtype in [torch.float32, torch.float64] and v.numel() > 1000:
+                    # Use half precision for large float tensors
+                    minimal_inputs[k] = v.to(torch.float16)
+                else:
+                    # Keep original dtype for small tensors and integer types
+                    minimal_inputs[k] = v
+            else:
+                minimal_inputs[k] = v
+        
+        # MEMORY OPTIMIZATION: Setup progressive layer processing
+        total_layers = len(self.layer_names)
+        
+        # Ensure cache is setup for the mode we're using
+        backend.ensure_cache(minimal_inputs, list(current_targets.keys()), single_pass=False)
+        
+        # Process each layer individually from last to first (important for causality)
+        for layer_idx in reversed(range(total_layers)):
             # Skip if no targets left
             if not current_targets:
+                logger.warning("No target tokens remaining, stopping trace early")
                 break
             
             logger.info(f"Processing layer {layer_idx} with {len(current_targets)} target tokens")
                 
-            # MEMORY OPTIMIZATION: Process each layer separately with explicit cache management
-            # Ensure necessary activations are cached for this specific layer
-            backend.ensure_cache(
-                input_data["inputs"],
-                target_indices=list(current_targets.keys()),
-                # MEMORY OPTIMIZATION: Force layer_batch_size=1 in the backend
-                layer_batch_size=1  
-            )
-                    
-            # Get the corresponding layer name if layer map is available
-            layer_name = layer_name_map.get(layer_idx, None)
-            if layer_name is None:
-                # Fall back to direct index if no map available
-                layer_name = str(layer_idx)
-                    
-            # Trace this layer
-            sources = backend.trace_layer(layer_idx, current_targets, self.config)
-            
-            # Skip if no sources found
-            if not sources:
-                continue
+            # OPTIMIZATION: Trace this layer
+            try:
+                sources = backend.trace_layer(layer_idx, current_targets, self.config)
                 
-            # Add token types if available
-            for source in sources:
-                idx = source["index"]
-                source["type"] = self.token_types.get(idx, "unknown")
-            
-            # Compute Logit Lens projections if requested
-            ll_projections = None
-            if compute_ll_projections and self.logit_backend is not None:
-                # Get unique token IDs from current targets and sources
-                token_indices = set(current_targets.keys()) | {s["index"] for s in sources}
+                # Skip if no sources found
+                if not sources:
+                    logger.warning(f"No sources found for layer {layer_idx}, continuing with next layer")
+                    continue
+                    
+                # Add token types if available
+                for source in sources:
+                    idx = source["index"]
+                    source["type"] = self.token_types.get(idx, "unknown")
                 
-                # MEMORY OPTIMIZATION: Limit batch size for logit lens projections
-                if token_indices:
-                    ll_projections = {}
+                # Compute Logit Lens projections if requested, with memory optimization
+                ll_projections = None
+                if compute_ll_projections and self.logit_backend is not None:
+                    # Get unique token IDs from current targets and sources
+                    token_indices = set(current_targets.keys()) | {s["index"] for s in sources}
                     
-                    # MEMORY OPTIMIZATION: Use smaller batches with explicit cleanup
-                    max_batch_size = 10  # Process tokens in small groups
-                    token_indices_list = list(token_indices)
-                    
-                    for i in range(0, len(token_indices_list), max_batch_size):
-                        batch_indices = token_indices_list[i:i+max_batch_size]
+                    if token_indices:
+                        # OPTIMIZATION: Process Logit Lens in small batches
+                        ll_projections = {}
+                        token_indices_list = sorted(list(token_indices))
                         
-                        # Optimize: use batch projection if available
-                        if hasattr(self.logit_backend, "project_tokens_batch"):
-                            # Use optimized batch projection
-                            batch_results = self.logit_backend.project_tokens_batch(
-                                layer_idx=layer_idx,
-                                token_indices=batch_indices,
-                                tokenizer=self.processor.tokenizer,
-                                top_k=3
-                            )
+                        # Use small batch size to reduce memory usage
+                        batch_size = 8  # Small enough to avoid OOM
+                        for i in range(0, len(token_indices_list), batch_size):
+                            batch_indices = token_indices_list[i:i+batch_size]
                             
-                            # Process batch results
-                            for token_idx, projection in batch_results.items():
-                                if projection and projection.get("predictions"):
-                                    ll_projections[token_idx] = {
-                                        "top1_token": projection["predictions"][0].get("text", ""),
-                                        "top1_prob": projection["predictions"][0].get("prob", 0.0),
-                                        "top1_logit": projection["predictions"][0].get("logit", 0.0),
-                                        "top2_token": projection["predictions"][1].get("text", "") if len(projection["predictions"]) > 1 else "",
-                                        "top2_prob": projection["predictions"][1].get("prob", 0.0) if len(projection["predictions"]) > 1 else 0.0
-                                    }
-                        else:
-                            # Fallback to individual token projection
-                            for token_idx in batch_indices:
-                                projection = self.logit_backend.project_token(
-                                    layer_idx=layer_idx,
-                                    token_idx=token_idx,
-                                    tokenizer=self.processor.tokenizer,
-                                    top_k=3
-                                )
-                                if projection and projection.get("predictions"):
-                                    ll_projections[token_idx] = {
-                                        "top1_token": projection["predictions"][0].get("text", ""),
-                                        "top1_prob": projection["predictions"][0].get("prob", 0.0),
-                                        "top1_logit": projection["predictions"][0].get("logit", 0.0),
-                                        "top2_token": projection["predictions"][1].get("text", "") if len(projection["predictions"]) > 1 else "",
-                                        "top2_prob": projection["predictions"][1].get("prob", 0.0) if len(projection["predictions"]) > 1 else 0.0
-                                    }
-                        
-                        # Force memory cleanup after each batch
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-            
-            # Create layer trace and append to records
-            layer_trace = {
-                "layer_idx": layer_idx,
-                "targets": current_targets,
-                "sources": sources,
-                "ll_projections": ll_projections,
-                "mode": mode.value
-            }
-            
-            layer_traces.append(layer_trace)
-            
-            # Group sources by target for proper record creation
-            sources_by_target = {}
-            for source in sources:
-                target_idx = source.get("target", -1)
-                if target_idx not in sources_by_target:
-                    sources_by_target[target_idx] = []
-                sources_by_target[target_idx].append(source)
-            
-            # Create records for all tokens involved in this layer (targets AND sources)
-            all_token_indices = set()
-            for source in sources:
-                all_token_indices.add(source["index"])
-                if "target" in source:
-                    all_token_indices.add(source["target"])
-                    
-            # Also add current targets as tokens
-            for target_idx in current_targets:
-                all_token_indices.add(target_idx)
+                            try:
+                                # Try using batch projection if available
+                                if hasattr(self.logit_backend, "project_tokens_batch"):
+                                    batch_results = self.logit_backend.project_tokens_batch(
+                                        layer_idx=layer_idx,
+                                        token_indices=batch_indices,
+                                        tokenizer=self.processor.tokenizer,
+                                        top_k=3
+                                    )
+                                    
+                                    # Process batch results
+                                    for token_idx, projection in batch_results.items():
+                                        if projection and projection.get("predictions"):
+                                            ll_projections[token_idx] = {
+                                                "top1_token": projection["predictions"][0].get("text", ""),
+                                                "top1_prob": projection["predictions"][0].get("prob", 0.0),
+                                                "top1_logit": projection["predictions"][0].get("logit", 0.0),
+                                                "top2_token": projection["predictions"][1].get("text", "") if len(projection["predictions"]) > 1 else "",
+                                                "top2_prob": projection["predictions"][1].get("prob", 0.0) if len(projection["predictions"]) > 1 else 0.0
+                                            }
+                                else:
+                                    # Fall back to individual token projection
+                                    for token_idx in batch_indices:
+                                        projection = self.logit_backend.project_token(
+                                            layer_idx=layer_idx,
+                                            token_idx=token_idx,
+                                            tokenizer=self.processor.tokenizer,
+                                            top_k=3
+                                        )
+                                        if projection and projection.get("predictions"):
+                                            ll_projections[token_idx] = {
+                                                "top1_token": projection["predictions"][0].get("text", ""),
+                                                "top1_prob": projection["predictions"][0].get("prob", 0.0),
+                                                "top1_logit": projection["predictions"][0].get("logit", 0.0),
+                                                "top2_token": projection["predictions"][1].get("text", "") if len(projection["predictions"]) > 1 else "",
+                                                "top2_prob": projection["predictions"][1].get("prob", 0.0) if len(projection["predictions"]) > 1 else 0.0
+                                            }
+                            except Exception as e:
+                                logger.warning(f"Error during LogitLens projection batch {i}: {e}")
+                            
+                            # Force cleanup after each batch
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
                 
-            # Make sure all indices are valid
-            all_token_indices = [idx for idx in all_token_indices if 0 <= idx < len(input_ids)]
-            
-            # Create enhanced records for all tokens involved
-            for token_idx in all_token_indices:
-                # Determine if this token is a target
-                is_target = token_idx in current_targets
-                
-                # Get token info
-                token_id = input_ids[token_idx] if token_idx < len(input_ids) else -1
-                token_text = all_token_texts[token_idx] if token_idx < len(all_token_texts) else self._get_token_text(token_id)
-                token_type = self.token_types.get(token_idx, "unknown") 
-                
-                # Collect source targets - i.e., which targets does this token act as a source for?
-                source_for_targets = []
-                for target in sources_by_target:
-                    if any(s["index"] == token_idx for s in sources_by_target[target]):
-                        source_for_targets.append(target)
-                
-                # Create source indices/weights list, but only for target tokens
-                sources_indices = []
-                sources_weights = []
-                if is_target and token_idx in sources_by_target:
-                    sources_indices = [s["index"] for s in sources_by_target[token_idx]]
-                    sources_weights = [s["weight"] for s in sources_by_target[token_idx]]
-                
-                # Create record with ALL fields from old version for compatibility
-                record = {
-                    "layer": layer_idx,
-                    "token_index": token_idx,
-                    "token_text": token_text,
-                    "token_id": token_id,
-                    "token_type": token_type,
-                    "is_target": is_target,
-                    "source_idx": token_idx,  # For compatibility with new fields
-                    "target_idx": token_idx if is_target else -1,  # For compatibility with new fields
-                    "source_for_targets": ",".join(map(str, source_for_targets)),
-                    "sources_indices": ",".join(map(str, sources_indices)),
-                    "sources_weights": ",".join(map(str, sources_weights)),
-                    "weight": current_targets.get(token_idx, 0.0) if is_target else 0.0,
-                    "raw_score": 0.0,  # Default for consistency
-                    "mode": mode.value,
-                    "type": token_type
+                # Create layer trace and append to records
+                layer_trace = {
+                    "layer_idx": layer_idx,
+                    "targets": current_targets,
+                    "sources": sources,
+                    "ll_projections": ll_projections,
+                    "mode": mode.value
                 }
                 
-                # Add source-specific data if this token is a source
-                if source_for_targets:
-                    # Find any source record for this token
-                    for target_idx in source_for_targets:
-                        source_record = next((s for s in sources_by_target[target_idx] if s["index"] == token_idx), None)
-                        if source_record:
-                            record["weight"] = source_record["weight"]
-                            record["raw_score"] = source_record["raw_score"]
-                            break
+                layer_traces.append(layer_trace)
                 
-                # Add Logit Lens projection data if available
-                if ll_projections and token_idx in ll_projections:
-                    ll_data = ll_projections[token_idx]
-                    record.update({
-                        "predicted_top_token": ll_data.get("top1_token", ""),
-                        "predicted_top_prob": ll_data.get("top1_prob", 0.0),
-                        "ll_top1_token": ll_data.get("top1_token", ""),
-                        "ll_top1_prob": ll_data.get("top1_prob", 0.0),
-                        "ll_top1_logit": ll_data.get("top1_logit", 0.0),
-                        "ll_top2_token": ll_data.get("top2_token", ""),
-                        "ll_top2_prob": ll_data.get("top2_prob", 0.0)
-                    })
-                else:
-                    # Add empty prediction fields for consistency
-                    record.update({
-                        "predicted_top_token": "",
-                        "predicted_top_prob": 0.0,
-                        "ll_top1_token": "",
-                        "ll_top1_prob": 0.0,
-                        "ll_top1_logit": 0.0,
-                        "ll_top2_token": "",
-                        "ll_top2_prob": 0.0
-                    })
+                # Group sources by target for record creation
+                sources_by_target = {}
+                for source in sources:
+                    target_idx = source.get("target", -1)
+                    if target_idx not in sources_by_target:
+                        sources_by_target[target_idx] = []
+                    sources_by_target[target_idx].append(source)
                 
-                # Append to the appropriate records list
-                self.records_by_mode[mode].append(record)
-            
-            # Update targets for next layer
-            current_targets = {s["index"]: s["weight"] for s in sources}
-            current_targets = SelectionStrategy.renormalize(current_targets, self.config, apply_layer_prune=True)
+                # Create records for all tokens involved in this layer
+                all_token_indices = set()
+                for source in sources:
+                    all_token_indices.add(source["index"])
+                    if "target" in source:
+                        all_token_indices.add(source["target"])
+                        
+                # Also add current targets
+                for target_idx in current_targets:
+                    all_token_indices.add(target_idx)
+                    
+                # Filter valid indices
+                all_token_indices = [idx for idx in all_token_indices if 0 <= idx < len(input_ids)]
+                
+                # Create records in small batches
+                for token_idx in all_token_indices:
+                    # Determine if this token is a target
+                    is_target = token_idx in current_targets
+                    
+                    # Get token info
+                    token_id = input_ids[token_idx] if token_idx < len(input_ids) else -1
+                    token_text = all_token_texts[token_idx] if token_idx < len(all_token_texts) else self._get_token_text(token_id)
+                    token_type = self.token_types.get(token_idx, "unknown") 
+                    
+                    # Process source relationships
+                    source_for_targets = []
+                    for target in sources_by_target:
+                        if any(s["index"] == token_idx for s in sources_by_target[target]):
+                            source_for_targets.append(target)
+                    
+                    # Create source indices/weights list, but only for target tokens
+                    sources_indices = []
+                    sources_weights = []
+                    if is_target and token_idx in sources_by_target:
+                        sources_indices = [s["index"] for s in sources_by_target[token_idx]]
+                        sources_weights = [s["weight"] for s in sources_by_target[token_idx]]
+                    
+                    # Create record (with all fields for compatibility)
+                    record = {
+                        "layer": layer_idx,
+                        "token_index": token_idx,
+                        "token_text": token_text,
+                        "token_id": token_id,
+                        "token_type": token_type,
+                        "is_target": is_target,
+                        "source_idx": token_idx,  # For compatibility
+                        "target_idx": token_idx if is_target else -1,  # For compatibility
+                        "source_for_targets": ",".join(map(str, source_for_targets)),
+                        "sources_indices": ",".join(map(str, sources_indices)),
+                        "sources_weights": ",".join(map(str, sources_weights)),
+                        "weight": current_targets.get(token_idx, 0.0) if is_target else 0.0,
+                        "raw_score": 0.0,  # Default for consistency
+                        "mode": mode.value,
+                        "type": token_type
+                    }
+                    
+                    # Add source-specific data if this token is a source
+                    if source_for_targets:
+                        # Find any source record for this token
+                        for target_idx in source_for_targets:
+                            source_record = next((s for s in sources_by_target[target_idx] if s["index"] == token_idx), None)
+                            if source_record:
+                                record["weight"] = source_record["weight"]
+                                record["raw_score"] = source_record["raw_score"]
+                                break
+                    
+                    # Add LogitLens projection data if available
+                    if ll_projections and token_idx in ll_projections:
+                        ll_data = ll_projections[token_idx]
+                        record.update({
+                            "predicted_top_token": ll_data.get("top1_token", ""),
+                            "predicted_top_prob": ll_data.get("top1_prob", 0.0),
+                            "ll_top1_token": ll_data.get("top1_token", ""),
+                            "ll_top1_prob": ll_data.get("top1_prob", 0.0),
+                            "ll_top1_logit": ll_data.get("top1_logit", 0.0),
+                            "ll_top2_token": ll_data.get("top2_token", ""),
+                            "ll_top2_prob": ll_data.get("top2_prob", 0.0)
+                        })
+                    else:
+                        # Add empty fields for consistency
+                        record.update({
+                            "predicted_top_token": "",
+                            "predicted_top_prob": 0.0,
+                            "ll_top1_token": "",
+                            "ll_top1_prob": 0.0,
+                            "ll_top1_logit": 0.0,
+                            "ll_top2_token": "",
+                            "ll_top2_prob": 0.0
+                        })
+                    
+                    # Append to records
+                    self.records_by_mode[mode].append(record)
+                
+                # Update targets for next layer - use selection strategy to control growth
+                current_targets = {s["index"]: s["weight"] for s in sources}
+                current_targets = SelectionStrategy.renormalize(current_targets, self.config, apply_layer_prune=True)
 
-            # MEMORY OPTIMIZATION: Clean the layer-specific cache to free memory
-            # Clear any temporary data in the backend cache for this layer
-            if hasattr(backend, 'cache'):
-                backend.cache.clear_single(layer_idx, "hidden")
-                backend.cache.clear_single(layer_idx, "attention")
-                backend.cache.clear_single(layer_idx, "grad")
-                # Keep saliency cache as it's the final result we need
-            
-            # Clear temporary variables to help GC
-            del sources, sources_by_target, all_token_indices, ll_projections
-            
-            # Aggressive memory cleanup after each layer
-            logger.debug(f"Completed layer {layer_idx}. Forcing GC and CUDA cache clear.")
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                # Cleanup layer-specific caches to save memory
+                if hasattr(backend, 'cache'):
+                    backend.cache.clear_single(layer_idx, "hidden")
+                    backend.cache.clear_single(layer_idx, "attention")
+                    backend.cache.clear_single(layer_idx, "grad")
+                
+                # Force garbage collection after each layer
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    
+            except Exception as e:
+                logger.error(f"Error processing layer {layer_idx}: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # Try to continue with next layer
+                continue
         
         # Save results
         results = {}
         if self.records_by_mode[mode]:
-            csv_path = self.io.write_trace_data(
-                trace_id=trace_id,
-                records=self.records_by_mode[mode],
-                metadata={
-                    "mode": mode.value, 
-                    "tracing_mode": mode.value,
-                    "target_tokens": target_tokens,
-                    "logit_lens_concepts": getattr(self.logit_backend, "concepts", []),
-                    "image_available": "original_image" in input_data,
-                    "feature_mapping": input_data.get("feature_mapping", {})
+            try:
+                csv_path = self.io.write_trace_data(
+                    trace_id=trace_id,
+                    records=self.records_by_mode[mode],
+                    metadata={
+                        "mode": mode.value, 
+                        "tracing_mode": mode.value,
+                        "target_tokens": target_tokens,
+                        "logit_lens_concepts": getattr(self.logit_backend, "concepts", []),
+                        "image_available": "original_image" in input_data,
+                        "feature_mapping": input_data.get("feature_mapping", {})
+                    }
+                )
+                results = {
+                    "trace_data_path": csv_path,
+                    "csv_path": csv_path,
+                    "num_records": len(self.records_by_mode[mode]),
+                    "layer_traces": layer_traces
                 }
-            )
-            results = {
-                "trace_data_path": csv_path,
-                "csv_path": csv_path,  # Add explicit CSV path for UI
-                "num_records": len(self.records_by_mode[mode]),
-                "layer_traces": layer_traces
-            }
+            except Exception as e:
+                logger.error(f"Error writing trace data: {e}")
+                results = {
+                    "error": f"Failed to write trace data: {e}",
+                    "num_records": len(self.records_by_mode[mode]),
+                    "layer_traces": layer_traces
+                }
             
             # Clear records after saving
             self.records_by_mode[mode] = []
