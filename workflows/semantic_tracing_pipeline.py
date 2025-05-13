@@ -77,26 +77,55 @@ def run_semantic_tracing_test(
         # Step 1: Load model with compatible options
         logger.info(f"Loading model: {model_id}")
         
-        # IMPORTANT FIX: Only pass parameters that the load_model function actually accepts
+        # IMPROVED: Enhanced model loading with proper 4-bit and flash attention settings
         load_options = {
-            "load_in_4bit": load_in_4bit,
             "device_map": "auto" if torch.cuda.is_available() else None
         }
         
-        # Optional: Enable flash attention for compatible models if available
+        # Set up quantization options if enabled
+        if load_in_4bit:
+            load_options["load_in_4bit"] = True
+            load_options["bnb_4bit_quant_type"] = "nf4"  # Use nf4 for better quality
+            load_options["bnb_4bit_compute_dtype"] = torch.bfloat16  # Maintain precision in compute
+            logger.info("Using 4-bit quantization with nf4 and bfloat16 compute dtype")
+        
+        # Try to enable flash attention if available
         try:
             import importlib.util
-            if importlib.util.find_spec("flash_attn") is not None:
-                if 'llava' in model_id.lower():
-                    load_options["use_flash_attn"] = True
-                    logger.info("Flash Attention available, enabling for compatible models")
+            flash_attn_spec = importlib.util.find_spec("flash_attn")
+            if flash_attn_spec is not None:
+                try:
+                    import flash_attn
+                    # Verify it's not just a stub module
+                    if hasattr(flash_attn, '__version__'):
+                        load_options["attn_implementation"] = "flash_attention_2"
+                        logger.info(f"Flash Attention {flash_attn.__version__} enabled")
+                    else:
+                        logger.warning("Flash Attention importable but version not found, using default attention")
+                except Exception as e:
+                    logger.warning(f"Flash Attention import failed: {e}, using default attention")
         except ImportError:
-            pass
+            logger.warning("Flash Attention not available, using default attention")
         
         model, processor = load_model(
             model_id=model_id,
             **load_options
         )
+        
+        # Verify quantization status
+        if load_in_4bit:
+            # Count quantized modules
+            quantized_modules = sum(1 for m in model.modules() 
+                                  if hasattr(m, 'weight') and 
+                                  hasattr(m.weight, 'quant_state'))
+            if quantized_modules == 0:
+                logger.error("4-bit quantization requested but no modules were quantized! Check bitsandbytes installation.")
+            else:
+                logger.info(f"Successfully loaded with 4-bit quantization ({quantized_modules} modules)")
+        
+        # Verify attention implementation
+        attn_impl = getattr(model.config, "_attn_implementation", "unknown")
+        logger.info(f"Using attention implementation: {attn_impl}")
         
         # Step 2: Load and process image with memory optimization
         logger.info(f"Loading image from: {image_url}")

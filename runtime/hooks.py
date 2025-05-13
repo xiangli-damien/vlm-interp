@@ -221,7 +221,7 @@ class TraceHookManager:
                 try:
                     outputs = self.model(
                         **minimal_inputs,
-                        output_hidden_states=True,
+                        output_hidden_states=False,
                         return_dict=True
                     )
                 except RuntimeError as e:

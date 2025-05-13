@@ -34,8 +34,8 @@ class TracingCache:
         
     def set(self, layer_idx: int, cache_type: str, tensor: torch.Tensor, detach: bool = True) -> None:
         """
-        Modified set method that aggressively offloads all tensors to CPU and converts them to float16 
-        to minimize memory usage.
+        Ultra memory-optimized set method that aggressively offloads tensors to CPU and 
+        converts them to float16 to minimize memory usage.
 
         Args:
             layer_idx (int): Index of the layer used as the cache key.
@@ -59,11 +59,15 @@ class TracingCache:
 
         # Force offload to CPU to free GPU memory
         if processed.device.type == "cuda":
-            processed = processed.cpu()
-            # Explicitly delete the original tensor to trigger immediate memory release
-            if id(processed) != id(tensor):  # Only if we created a new tensor
-                del tensor
-                if torch.cuda.is_available():
+            # Use non_blocking for asynchronous transfer when possible
+            processed = processed.cpu(non_blocking=True)
+        
+        # Explicitly delete the original tensor to trigger immediate memory release
+        if id(processed) != id(tensor):  # Only if we created a new tensor
+            del tensor
+            if torch.cuda.is_available():
+                # Use empty_cache selectively to avoid stalling GPU operations
+                if tensor.numel() > 1_000_000:  # Only for large tensors >1M elements
                     torch.cuda.empty_cache()
 
         # Store the processed tensor in the appropriate cache
