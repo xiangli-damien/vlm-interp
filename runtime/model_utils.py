@@ -46,25 +46,20 @@ def load_model(
     load_in_4bit: bool = False,
     enable_gradients: bool = False,
     device_map: Optional[str] = "auto",
-    # Add new optional parameters for quantization configuration
-    bnb_4bit_quant_type: str = "nf4",
-    bnb_4bit_compute_dtype: torch.dtype = torch.float16,
-    bnb_4bit_use_double_quant: bool = True,
-    **kwargs  # Catch any additional parameters
+    attn_implementation: Optional[str] = None,  # Allow this to be passed from caller
+    **kwargs  # Catch additional parameters
 ) -> Tuple[LlavaNextForConditionalGeneration, LlavaNextProcessor]:
     """
     Loads a LLaVA-Next model and processor with flexible support for Flash Attention and 4-bit quantization.
 
     Args:
         model_id (str): HuggingFace model ID to load.
-        use_flash_attn (bool): Whether to enable Flash Attention 2 (requires compatible GPU and library).
-        load_in_4bit (bool): Whether to load the model using 4-bit quantization (requires bitsandbytes).
+        use_flash_attn (bool): Whether to enable Flash Attention 2 (ignored if attn_implementation is provided).
+        load_in_4bit (bool): Whether to load the model using 4-bit quantization.
         enable_gradients (bool): If True, enables requires_grad on model parameters.
         device_map (Optional[str]): Device mapping for model loading. Defaults to "auto".
-        bnb_4bit_quant_type (str): Quantization type for 4-bit loading ("nf4" or "fp4").
-        bnb_4bit_compute_dtype (torch.dtype): Compute dtype for 4-bit quantization.
-        bnb_4bit_use_double_quant (bool): Whether to use double quantization for 4-bit loading.
-        **kwargs: Additional arguments to pass to the model's from_pretrained method.
+        attn_implementation (Optional[str]): Explicitly set the attention implementation.
+        **kwargs: Additional arguments to pass to from_pretrained.
 
     Returns:
         Tuple: (model, processor)
@@ -80,9 +75,18 @@ def load_model(
         raise RuntimeError(f"[ERROR] Failed to load processor: {e}") from e
 
     # --- Configure attention ---
-    attn_implementation = "flash_attention_2" if use_flash_attn else "eager"
-    if use_flash_attn:
-        print("[INFO] Flash Attention 2 requested. Will use attn_implementation='flash_attention_2'.")
+    # Only set attn_implementation if not already provided in kwargs
+    if attn_implementation is None and 'attn_implementation' not in kwargs:
+        attn_implementation = "flash_attention_2" if use_flash_attn else "eager"
+        print(f"[INFO] Setting attention implementation to '{attn_implementation}'")
+    else:
+        # Either use explicit parameter or one from kwargs
+        effective_attn = attn_implementation or kwargs.get('attn_implementation', 'eager')
+        print(f"[INFO] Using provided attention implementation: '{effective_attn}'")
+        # Remove from kwargs if it's there to avoid conflicts
+        if 'attn_implementation' in kwargs:
+            print("[INFO] Found attn_implementation in kwargs, using that value")
+            attn_implementation = kwargs.pop('attn_implementation')
 
     # --- Configure precision and device ---
     quantization_config = None
@@ -92,22 +96,24 @@ def load_model(
     # --- Configure 4-bit quantization (with fallback) ---
     if load_in_4bit and torch.cuda.is_available():
         try:
-            import bitsandbytes as bnb
-            from bitsandbytes import BitsAndBytesConfig
-
-            if version.parse(bnb.__version__) < version.parse("0.41.1"):
-                raise ImportError(f"bitsandbytes version {bnb.__version__} is too old. Please upgrade to >= 0.41.1.")
-
+            # FIX: Import BitsAndBytesConfig from transformers instead of bitsandbytes
+            from transformers import BitsAndBytesConfig
+            
+            # Handle quantization parameters that might be in kwargs
+            bnb_4bit_quant_type = kwargs.pop('bnb_4bit_quant_type', 'nf4')
+            bnb_4bit_compute_dtype = kwargs.pop('bnb_4bit_compute_dtype', torch.float16)
+            bnb_4bit_use_double_quant = kwargs.pop('bnb_4bit_use_double_quant', True)
+            
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_use_double_quant=bnb_4bit_use_double_quant,
                 bnb_4bit_quant_type=bnb_4bit_quant_type,
                 bnb_4bit_compute_dtype=bnb_4bit_compute_dtype
             )
-            print(f"[✓] 4-bit quantization enabled with {bnb_4bit_quant_type} format and {bnb_4bit_compute_dtype} compute dtype.")
+            print(f"[✓] 4-bit quantization enabled with {bnb_4bit_quant_type} format.")
 
         except ImportError as e:
-            print(f"[WARN] bitsandbytes not available or outdated: {e}")
+            print(f"[WARN] bitsandbytes not properly configured: {e}")
             print("[INFO] Falling back to float16 model...")
             load_in_4bit = False
             quantization_config = None
@@ -117,17 +123,33 @@ def load_model(
     # --- Load model ---
     try:
         print(f"[INFO] Loading model with dtype={model_dtype}, device_map={effective_device_map}, attn='{attn_implementation}'...")
+        
+        # Create clean load arguments
+        load_args = {
+            "torch_dtype": model_dtype,
+            "quantization_config": quantization_config,
+            "low_cpu_mem_usage": True,
+            "device_map": effective_device_map,
+            "trust_remote_code": True
+        }
+        
+        # Only add attn_implementation if it's set
+        if attn_implementation is not None:
+            load_args["attn_implementation"] = attn_implementation
+            
+        # Add any remaining kwargs
+        load_args.update(kwargs)
+        
+        # Print final arguments for debugging
+        clean_args = {k: v for k, v in load_args.items() if k != "quantization_config"}
+        print(f"[DEBUG] Final model loading arguments: {clean_args}")
+        
         model = LlavaNextForConditionalGeneration.from_pretrained(
             model_id,
-            torch_dtype=model_dtype,
-            quantization_config=quantization_config,
-            low_cpu_mem_usage=True,
-            device_map=effective_device_map,
-            attn_implementation=attn_implementation,
-            trust_remote_code=True,
-            **kwargs  # Pass any additional arguments
+            **load_args
         )
         print("[✓] Model loaded.")
+        
         if effective_device_map is None:
             print(f"[INFO] Model is on device: {model.device}")
         else:
