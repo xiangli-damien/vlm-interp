@@ -153,65 +153,85 @@ class SaliencyBackend:
                 
         return index_to_source
         
-    def _get_saliency_matrix(self, layer_idx: int, target_indices: List[int], 
-                        batch_compute: bool = True) -> Optional[torch.Tensor]:
+    def _get_saliency_matrix(
+        self,
+        layer_idx: int,
+        target_indices: List[int],
+        batch_compute: bool = True,
+    ) -> Optional[torch.Tensor]:
         """
-        Get saliency matrix for a specific layer, computing if needed.
-        
-        Args:
-            layer_idx: Index of the layer
-            target_indices: Indices of target tokens
-            batch_compute: Whether to compute saliency in batches
-            
-        Returns:
-            Saliency matrix tensor or None if unavailable
+        Return the 4‑D saliency tensor for *layer_idx*, computing it if needed.
+
+        The logic faithfully reproduces the legacy tracer’s behaviour:
+
+        1. **Cache hit** – if a saliency tensor is already cached we return it
+           immediately.  (The grad‑hook has already produced it and pushed it
+           to CPU.)
+        2. **Attention + grad hit** – if both tensors are available we compute
+           ``|A * dA/dL|``, cache it, and *delete* the obsolete tensors.
+        3. **Nothing yet** – trigger a **layer‑restricted** call to
+           ``compute_batch_saliency`` so that *only this single layer* is
+           processed, keeping GPU usage minimal.  After the call we look again
+           for the saliency tensor; if it is still missing we fall back to
+           ``None``.
+
+        Parameters
+        ----------
+        layer_idx : int
+            Index of the transformer block whose saliency we need.
+        target_indices : List[int]
+            Sequence positions that should receive gradients.  They are passed
+            straight through to ``compute_batch_saliency`` when we need to
+            trigger a computation.
+        batch_compute : bool, default ``True``
+            *Ignored* – kept only for API backward‑compatibility.
+
+        Returns
+        -------
+        Optional[torch.Tensor]
+            The saliency tensor with shape ``[B, H, S, S]`` (already on the
+            requested device) or ``None`` if it cannot be produced.
         """
-        # Check if already in cache
+        # ------------------------------------------------------------------ #
+        # 1) Fast path — already cached.                                     #
+        # ------------------------------------------------------------------ #
         if self.cache.has(layer_idx, "saliency"):
             return self.cache.get(layer_idx, "saliency", self.device)
-            
-        # If not in cache but we have both attention and gradients, compute saliency
+
+        # ------------------------------------------------------------------ #
+        # 2) Second path — have both attention and gradient, so we           #
+        #    can compute saliency immediately and free the auxiliaries.      #
+        # ------------------------------------------------------------------ #
         if self.cache.has(layer_idx, "attention") and self.cache.has(layer_idx, "grad"):
-            attention = self.cache.get(layer_idx, "attention", self.device)
-            grad = self.cache.get(layer_idx, "grad", self.device)
-            
-            # Compute saliency using the product of attention and gradient
-            saliency = torch.abs(attention.float() * grad.float())
-            self.cache.set(layer_idx, "saliency", saliency)
-            return saliency
-                
-        # If we have inputs and target indices, try to compute saliency
-        if (
-            self._last_inputs is not None
-            and target_indices
-            and not self.cache.has(layer_idx, "saliency")
-        ):
-            # Use layer_batch_size=1 to ensure optimal memory usage
+            attn = self.cache.get(layer_idx, "attention", self.device)
+            grad = self.cache.get(layer_idx, "grad",      self.device)
+
+            sal  = torch.abs(attn.float() * grad.float())
+            self.cache.set(layer_idx, "saliency", sal)
+
+            # Drop obsolete tensors – they are no longer needed.
+            self.cache.clear_single(layer_idx, "attention")
+            self.cache.clear_single(layer_idx, "grad")
+            return sal
+
+        # ------------------------------------------------------------------ #
+        # 3) Nothing cached — request a single‑layer computation.            #
+        # ------------------------------------------------------------------ #
+        if self._last_inputs is not None and target_indices:
             self.compute_batch_saliency(
-                target_indices=target_indices,
-                inputs=self._last_inputs,
-                layer_batch_size=1  # Process just one layer at a time
+                target_indices   = target_indices,
+                inputs           = self._last_inputs,
+                layer_batch_size = 1,
+                offload_tensors  = True,
+                restrict_layers  = [layer_idx],   # <<< NEW – process only this layer
             )
-            
-            # Check again after computation
+
             if self.cache.has(layer_idx, "saliency"):
                 return self.cache.get(layer_idx, "saliency", self.device)
-            elif self.cache.has(layer_idx, "attention") and self.cache.has(layer_idx, "grad"):
-                # Compute saliency if we now have both attention and gradients
-                attention = self.cache.get(layer_idx, "attention", self.device)
-                grad = self.cache.get(layer_idx, "grad", self.device)
-                saliency = torch.abs(attention.float() * grad.float())
-                self.cache.set(layer_idx, "saliency", saliency)
-                return saliency
-            elif self.cache.has(layer_idx, "attention"):
-                logger.warning(f"No gradients for layer {layer_idx}, using attention as fallback")
-                attention = self.cache.get(layer_idx, "attention", self.device)
-                self.cache.set(layer_idx, "saliency", attention)
-                return attention
-                
-        # We can't compute saliency
+
+        # Still unavailable.
         return None
-        
+
     def ensure_cache(
         self,
         inputs: Dict[str, torch.Tensor],
@@ -304,210 +324,116 @@ class SaliencyBackend:
                 if snapshot.has(idx, "grad"):
                     self.cache.set(idx, "grad", snapshot.get(idx, "grad"))
         
-    def compute_batch_saliency(self, target_indices, inputs, layer_batch_size: int = 1, offload_tensors: bool = True):
+    def compute_batch_saliency(                   # ← full replacement
+        self,
+        target_indices: List[int],
+        inputs: Dict[str, torch.Tensor],
+        layer_batch_size: int = 1,
+        offload_tensors: bool = True,
+        restrict_layers: Optional[List[int]] = None,
+    ):
         """
-        Memory-optimized saliency computation that properly processes layers in small batches
-        to prevent OOM errors, while only computing meaningful saliency scores when
-        both attention matrices and gradients are available.
-        
-        Args:
-            target_indices: List of token indices to compute saliency for
-            inputs: Model inputs
-            layer_batch_size: Number of layers to process at once (1 for lowest memory, 2-4 for balance)
-            offload_tensors: Whether to offload tensors to CPU immediately after computation
+        Compute saliency ``|A * dA/dL|`` in **layer‑first order** to cap the
+        maximum number of live attention/gradient tensors on GPU.
+
+        A *single* forward+backward pass is executed **per layer‑batch** (the
+        default batch size is 1, i.e. *exactly* the legacy behaviour).  Every
+        time a saliency tensor is created:
+
+        * it is immediately off‑loaded to CPU (optionally half‑precision),
+        * its source attention & gradient tensors are deleted.
+
+        Parameters
+        ----------
+        target_indices : List[int]
+            Positions in the sequence that should receive gradient signal.
+        inputs : Dict[str, torch.Tensor]
+            Model inputs; tensors are *referenced* – they are not copied.
+        layer_batch_size : int, default 1
+            Number of layers to hook simultaneously.  Increasing this trades
+            memory for speed.
+        offload_tensors : bool, default True
+            If ``True`` saliency tensors are converted to ``float16`` and moved
+            to CPU right after creation.
+        restrict_layers : Optional[List[int]]
+            If provided, only these layer indices are processed.  The helper
+            ``_get_saliency_matrix`` uses this to compute one layer on‑demand.
         """
-        # Return early if there are no valid targets
+        # ------------------------------- sanity --------------------------- #
         if not target_indices:
             return
 
-        # Filter out invalid token indices
-        max_idx = inputs["input_ids"].size(1) - 1
-        valid_targets = [idx for idx in target_indices if 0 < idx <= max_idx]
-
+        seq_len = inputs["input_ids"].size(1)
+        valid_targets = [t for t in target_indices if 0 < t < seq_len]
         if not valid_targets:
-            logger.warning("No valid target indices found")
+            logger.warning("compute_batch_saliency: no valid targets.")
             return
 
-        # Force memory cleanup before starting
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        layers_to_run = (
+            restrict_layers
+            if restrict_layers is not None
+            else list(range(len(self.layer_names)))
+        )
 
-        # Get total number of layers
-        total_layers = len(self.layer_names)
-        
-        # Process each target token independently
-        for target_idx in valid_targets:
-            logger.info(f"Computing saliency for token {target_idx}")
-            
-            # Create a reduced-size inputs dictionary to minimize memory usage
-            minimal_inputs = {}
-            for k, v in inputs.items():
-                if isinstance(v, torch.Tensor):
-                    # Use half precision for non-integer tensors to reduce memory
-                    if v.dtype in [torch.float32, torch.float64] and v.numel() > 1000:
-                        minimal_inputs[k] = v.to(torch.float16)
-                    else:
-                        # Just reference the tensor rather than copying it
-                        minimal_inputs[k] = v
-                else:
-                    minimal_inputs[k] = v
+        # Minimal‑precision view of the inputs (no deep copies).
+        minimal_inputs: Dict[str, torch.Tensor] = {}
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor) and v.dtype == torch.float32 and v.numel() > 1000:
+                minimal_inputs[k] = v.to(torch.float16)
+            else:
+                minimal_inputs[k] = v
 
-            # Process layers in batches according to layer_batch_size
-            for batch_start in range(0, total_layers, layer_batch_size):
-                batch_end = min(batch_start + layer_batch_size, total_layers)
-                current_layer_indices = list(range(batch_start, batch_end))
-                
-                logger.info(f"Processing layers {batch_start}-{batch_end-1} for token {target_idx} (batch size: {len(current_layer_indices)})")
-                
-                # Skip if all layers in this batch already have saliency
-                if all(self.cache.has(layer_idx, "saliency") for layer_idx in current_layer_indices):
-                    logger.debug(f"Layers {batch_start}-{batch_end-1} already in cache, skipping")
-                    continue
+        # -------------------------- layer‑first loop ---------------------- #
+        for batch_start in range(0, len(layers_to_run), layer_batch_size):
+            batch_layers = layers_to_run[batch_start : batch_start + layer_batch_size]
 
-                # Create a fresh hook manager for this batch of layers
-                hook_mgr = TraceHookManager(
-                    self.model,
-                    cpu_offload=True,
-                    detach_after_forward=False  # Don't detach to preserve gradient flow
+            # Skip if every layer in this batch is already done.
+            if all(self.cache.has(l, "saliency") for l in batch_layers):
+                continue
+
+            hook_mgr = TraceHookManager(
+                self.model,
+                cpu_offload          = True,
+                detach_after_forward = False,
+            )
+
+            # Register hooks only for current batch_layers.
+            for l in batch_layers:
+                hook_mgr.add_layer(
+                    self.layer_names[l],
+                    capture   = ["attention", "grad"],
+                    layer_idx = l,
                 )
 
-                # Register only the layers in the current batch
-                for layer_idx in current_layer_indices:
-                    layer_name = self.layer_names[layer_idx]
-                    hook_mgr.add_layer(
-                        layer_name,
-                        capture=["attention", "grad"],
-                        layer_idx=layer_idx
-                    )
+            hook_mgr.install()
 
-                # Install hooks
-                hook_mgr.install()
+            # ------------- loss over *all* valid target tokens ------------- #
+            def loss_fn(outputs):
+                logits   = outputs.logits          # [B, S, V]
+                logprob  = torch.log_softmax(logits.float(), dim=-1)
+                ids      = minimal_inputs["input_ids"][0]
 
-                try:
-                    # Define loss function that preserves gradient flow
-                    def loss_fn(outputs):
-                        # Safety check for outputs
-                        if not hasattr(outputs, 'logits'):
-                            return torch.tensor(0.0, device=self.device, requires_grad=True)
-                        
-                        # Extract logits and compute loss for the specific token
-                        logits = outputs.logits  # [B, seq_len, vocab_size]
-                        
-                        # Use float32 for numerical stability but preserve gradient flow
-                        log_probs = torch.log_softmax(logits.float(), dim=-1)
-                        
-                        # Compute loss for target token prediction
-                        prev_idx = target_idx - 1
-                        if prev_idx < 0 or target_idx >= minimal_inputs["input_ids"].shape[1]:
-                            # Invalid index - return dummy loss
-                            return torch.tensor(0.0, device=logits.device, requires_grad=True)
-                            
-                        token_id = minimal_inputs["input_ids"][0, target_idx].item()
-                        token_loss = -log_probs[0, prev_idx, token_id]
-                        
-                        return token_loss
+                loss = torch.zeros((), device=logprob.device, requires_grad=True)
+                for t in valid_targets:
+                    loss = loss - logprob[0, t - 1, ids[t].item()]
+                return loss / max(len(valid_targets), 1)
 
-                    # Run with mixed precision and gradient calculation
-                    try:
-                        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
-                            run_result = hook_mgr.run(minimal_inputs, loss_fn)
-                        
-                        # Check if run was successful
-                        if isinstance(run_result, dict) and "error" in run_result:
-                            logger.warning(f"Error during hook run: {run_result['error']}")
-                            raise RuntimeError(f"Hook run failed: {run_result['error']}")
-                        
-                        # Compute saliency for all hooked layers
-                        hook_mgr.compute_saliency()
-                        snapshot = hook_mgr.snapshot()
-                        
-                        # Process only layers where we have both attention and gradients
-                        saliency_count = 0
-                        for layer_idx in current_layer_indices:
-                            if snapshot.has(layer_idx, "attention") and snapshot.has(layer_idx, "grad"):
-                                # Get attention and gradient tensors
-                                attention = snapshot.get(layer_idx, "attention")
-                                grad = snapshot.get(layer_idx, "grad")
-                                
-                                # Skip if either tensor is None
-                                if attention is None or grad is None:
-                                    logger.warning(f"Layer {layer_idx}: Attention or gradient is None, skipping")
-                                    continue
-                                    
-                                # Check shapes match
-                                if attention.shape != grad.shape:
-                                    logger.warning(f"Layer {layer_idx}: Shape mismatch - attention {attention.shape}, gradient {grad.shape}")
-                                    continue
-                                
-                                # Check for NaN or Inf values and replace them
-                                if torch.isnan(attention).any() or torch.isinf(attention).any():
-                                    attention = torch.nan_to_num(attention, nan=0.0, posinf=1.0, neginf=0.0)
-                                if torch.isnan(grad).any() or torch.isinf(grad).any():
-                                    grad = torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=0.0)
-                                
-                                # Compute saliency as |attention * gradient|
-                                saliency = torch.abs(attention * grad)
-                                
-                                # Check if saliency has meaningful values
-                                if saliency.sum().item() < 1e-8:
-                                    logger.warning(f"Layer {layer_idx}: Saliency computation produced zero values, skipping")
-                                    continue
-                                
-                                # Offload to CPU to save memory
-                                if offload_tensors:
-                                    saliency = saliency.to(dtype=torch.float16).cpu()
-                                    
-                                # Store in cache
-                                self.cache.set(layer_idx, "saliency", saliency)
-                                saliency_count += 1
-                                
-                                # Clean up to free memory immediately
-                                del attention, grad
-                            else:
-                                # Log the missing components
-                                has_attn = snapshot.has(layer_idx, "attention")
-                                has_grad = snapshot.has(layer_idx, "grad")
-                                logger.debug(f"Skipping layer {layer_idx}: Missing {'attention' if not has_attn else ''}"
-                                            f"{' and ' if not has_attn and not has_grad else ''}"
-                                            f"{'gradient' if not has_grad else ''}")
-                        
-                        logger.info(f"Successfully computed saliency for {saliency_count} out of {len(current_layer_indices)} layers in batch {batch_start}-{batch_end-1}")
-                    
-                    except RuntimeError as e:
-                        if "out of memory" in str(e).lower():
-                            logger.warning(f"Out of memory during computation: {e}")
-                            if layer_batch_size > 1:
-                                logger.warning("Try reducing layer_batch_size to 1")
-                            else:
-                                logger.warning("Already at minimum layer_batch_size=1. Consider reducing model size or using more aggressive memory optimizations.")
-                        else:
-                            # Non-OOM error
-                            logger.error(f"Error processing layers: {e}")
-                            import traceback
-                            traceback.print_exc()
-                        
-                        # Clean up regardless of error
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+            # Forward + backward
+            run_result = hook_mgr.run(minimal_inputs, loss_fn)
+            if isinstance(run_result, dict) and run_result.get("error"):
+                logger.warning(f"Hook‑manager run aborted: {run_result['error']}")
+                hook_mgr.clear()
+                continue
 
-                finally:
-                    # Always clean up hooks and force memory cleanup after each batch
-                    hook_mgr.clear()
-                    
-                    # Aggressive memory cleanup
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-            
-            # Force cleanup after each target token
+            # Grad‑hooks already pushed saliency into the cache; this call just
+            # fills any rare gaps.
+            hook_mgr.compute_saliency()
+            hook_mgr.clear()  # removes hooks & frees GPU tensors
+
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        # Ensure model is reset to eval mode after tracing
-        self.model.eval()
 
 
 

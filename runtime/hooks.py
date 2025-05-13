@@ -367,54 +367,44 @@ class TraceHookManager:
     
     def compute_saliency(self) -> Dict[Union[int, str], torch.Tensor]:
         """
-        Compute saliency (|attention * gradient|) for layers with both captured.
-        
-        Returns:
-            Dictionary mapping layer identifiers to saliency tensors
+        Convert every (attention, gradient) pair still left in the cache into a
+        saliency tensor ``|A * dA/dL|`` and immediately drop the auxiliaries.
+
+        Returns
+        -------
+        Dict[Union[int, str], torch.Tensor]
+            Mapping from *layer index* to the newly generated saliency tensor.
         """
-        saliency_results = {}
-        
-        # Process each layer
+        out: Dict[Union[int, str], torch.Tensor] = {}
+
         for layer_name, info in self._layer_info.items():
-            layer_idx = info.get("index")
-            if layer_idx is None:
+            idx = info.get("index")
+            if idx is None:
                 continue
-                
-            # Check if we have both attention and gradients
-            has_attn = self.cache.has(layer_idx, "attention")
-            has_grad = self.cache.has(layer_idx, "grad")
-            
-            if has_attn and has_grad:
-                # Get tensors
-                attn = self.cache.get(layer_idx, "attention")
-                grad = self.cache.get(layer_idx, "grad")
-                
-                # Compute saliency if shapes match
-                if attn.shape == grad.shape:
-                    # Compute |attention * gradient|
-                    saliency = torch.abs(attn * grad)
-                    
-                    # Store in cache
-                    self.cache.set(layer_idx, "saliency", saliency)
-                    
-                    # Add to results
-                    saliency_results[layer_idx] = saliency
-                    
-                    # Clean up to save memory
-                    if self.cpu_offload:
-                        # We can remove the grad since we've computed saliency
-                        self.cache.clear_single(layer_idx, "grad")
-                else:
-                    logger.warning(f"Shape mismatch for layer {layer_idx}: attention {attn.shape}, gradient {grad.shape}")
-            else:
-                if not has_attn:
-                    logger.debug(f"Missing attention for layer {layer_idx}")
-                if not has_grad:
-                    logger.debug(f"Missing gradient for layer {layer_idx}")
-                    # Mark as missing for potential fallback
-                    self.cache.grad_missing[layer_idx] = True
-        
-        return saliency_results
+
+            if not (self.cache.has(idx, "attention") and self.cache.has(idx, "grad")):
+                # Mark missing grad – the SaliencyBackend might want to fall back.
+                if not self.cache.has(idx, "grad"):
+                    self.cache.grad_missing[idx] = True
+                continue
+
+            attn = self.cache.get(idx, "attention")
+            grad = self.cache.get(idx, "grad")
+
+            if attn.shape != grad.shape:
+                logger.warning(f"compute_saliency: shape mismatch in layer {idx}")
+                continue
+
+            sal = torch.abs(attn * grad)
+            self.cache.set(idx, "saliency", sal)
+            out[idx] = sal
+
+            # Memory hygiene – drop now‑useless tensors.
+            self.cache.clear_single(idx, "attention")
+            self.cache.clear_single(idx, "grad")
+
+        return out
+
     
     def _capture_custom_tensors(self) -> None:
         """Capture all registered custom tensors."""
