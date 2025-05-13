@@ -46,21 +46,32 @@ class SaliencyBackend:
         self._last_inputs = None   # Cache last inputs for re-computation if needed
         
     def trace_layer(self, layer_idx: int, target_tokens: Dict[int, float], 
-                    selection_config: SelectionConfig, batch_compute: bool = True) -> List[Dict[str, Any]]:
+                selection_config: SelectionConfig, batch_compute: bool = True) -> List[Dict[str, Any]]:
         """
-        Trace saliency patterns for a specific layer.
+        Trace saliency patterns for a specific layer with lazy computation.
         
         Args:
             layer_idx: Index of the layer to trace
             target_tokens: Dictionary mapping target token indices to their weights
             selection_config: Configuration for token selection
-            batch_compute: Whether to compute saliency in batches
-            
+            batch_compute: Whether to compute saliency in batches (kept for API compatibility)
+                
         Returns:
             List of source information dictionaries
         """
-        # Get saliency scores, computing if necessary
-        saliency_matrix = self._get_saliency_matrix(layer_idx, list(target_tokens.keys()), batch_compute)
+        # Lazy computation: Check if saliency exists, compute if needed
+        if not self.cache.has(layer_idx, "saliency"):
+            # Compute saliency only for this specific layer
+            self.compute_batch_saliency(
+                target_indices=list(target_tokens.keys()),
+                inputs=self._last_inputs,
+                layer_batch_size=1,  # Force single layer to avoid OOM
+                offload_tensors=True,
+                restrict_layers=[layer_idx]  # Only process this layer
+            )
+            
+        # Get saliency scores after computation
+        saliency_matrix = self.cache.get(layer_idx, "saliency", self.device)
         if saliency_matrix is None:
             return []
             
@@ -234,55 +245,23 @@ class SaliencyBackend:
         single_pass: bool = False
     ):  
         """
-        Ensure that all tensors required for saliency analysis are cached in advance.
-        This is a memory-optimized implementation consistent with the legacy version.
-
+        Minimalist cache initialization - only store inputs without pre-computing saliency.
+        This avoids the expensive computation that was causing OOM errors.
+        
         Args:
-            inputs (Dict[str, torch.Tensor]): Model input dictionary (must include 'input_ids', etc.)
-            target_indices (List[int], optional): Token indices to be used as saliency targets.
-            single_pass (bool): Whether to compute saliency for all layers in one forward-backward pass.
-                                Warning: this consumes a large amount of GPU memory.
+            inputs (Dict[str, torch.Tensor]): Model input dictionary
+            target_indices (List[int], optional): Token indices for saliency targets (not used for pre-computation)
+            single_pass (bool): Flag maintained for API compatibility (ignored)
         """
-        # 1) Clone and store the original inputs for reuse during multiple passes
+        # Simply clone and store the original inputs for reuse during layer-by-layer computation
         self._last_inputs = {
             k: v.clone() if isinstance(v, torch.Tensor) else v
             for k, v in inputs.items()
         }
-
-        # 2) If target tokens are specified and single_pass is False, use memory-efficient batch mode
-        if target_indices and not single_pass:
-            logger.info(f"Using batch-mode saliency computation for {len(target_indices)} target tokens.")
-
-            # For memory efficiency, compute one layer at a time (layer_batch_size=1)
-            self.compute_batch_saliency(
-                target_indices=target_indices,
-                inputs=self._last_inputs,
-                layer_batch_size=1
-            )
-            return
-
-        # 3) If single_pass=True, attempt to compute all saliency maps in a single forward+backward pass
-        if single_pass and target_indices:
-            logger.info(f"Using single-pass mode for {len(target_indices)} target tokens.")
-            logger.warning(
-                "Single-pass mode may cause out-of-memory (OOM) errors. "
-                "Switch to batch mode if this fails."
-            )
-
-            # NOTE: To ensure memory safety, we override the 'single pass' request
-            # and still process one token at a time, across all layers.
-            for target_idx in target_indices:
-                # Compute saliency for each target independently across all layers
-                self.compute_batch_saliency(
-                    target_indices=[target_idx],
-                    inputs=self._last_inputs,
-                    layer_batch_size=1
-                )
-
-                # Force garbage collection between targets to free memory
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+        
+        # Return immediately without pre-computing any saliency
+        # Actual computation will be performed on-demand in trace_layer
+        return
 
     def _run_hook_manager(self, hook_mgr, target_indices):
         """Helper method to run hook manager with appropriate loss function."""
@@ -328,36 +307,26 @@ class SaliencyBackend:
         restrict_layers: Optional[List[int]] = None,
     ) -> None:
         """
-        Compute ``|A * dA/dL|`` for a **small set of layers** in a memory‑safe
-        manner (default: *one* layer per forward/backward pass).
-
-        The routine is *layer‑first* not *target‑first*:  
-        ‑ we iterate over *layer batches* (usually just one layer),  
-        ‑ run a single forward+backward that sends gradients to **all**
-          ``target_indices`` in one go,  
-        ‑ convert attention×grad into saliency **immediately**, off‑load it to
-          CPU and then drop the original tensors.
+        Memory-optimized implementation that computes saliency for a small set of layers.
+        Processes one layer at a time by default to minimize memory usage.
 
         Parameters
         ----------
         target_indices:
-            List of sequence positions that act as “prediction locations” for
-            the self‑supervised loss used to obtain attention gradients.  All
-            valid indices are included in **every** backward pass; this
-            behaves just like the original tracer.
+            List of sequence positions that act as "prediction locations" for
+            the self-supervised loss used to obtain attention gradients.
         inputs:
-            The *same* pre‑built input dictionary used for normal decoding.
-            Tensors are **referenced** – they are *never* copied.
+            The pre-built input dictionary used for normal decoding.
+            Tensors are referenced, not copied.
         layer_batch_size:
-            Number of transformer blocks to hook simultaneously.  Raising this
-            can accelerate tracing on very large GPUs; keep it at 1 for ≤24 GB.
+            Number of transformer blocks to hook simultaneously.
+            Default: 1 (recommended for memory efficiency)
         offload_tensors:
-            If ``True`` saliency tensors are converted to ``float16`` and moved
-            to CPU as soon as they are created.
+            If True, tensors are converted to float16 and moved to CPU
+            immediately after creation. Default: True
         restrict_layers:
-            Optional whitelist of layer indices to process.  Used by
-            :py:meth:`_get_saliency_matrix` to compute *exactly one* layer
-            when it is needed on‑demand.
+            Optional whitelist of layer indices to process. Default: process
+            all layers
         """
         if not target_indices:
             return  # nothing to do
@@ -375,66 +344,75 @@ class SaliencyBackend:
             else list(range(len(self.layer_names)))
         )
 
-        # Build a *view* of `inputs` that uses half precision where possible.
+        # Force layer_batch_size to 1 for maximum memory efficiency
+        # (This is a key change to prevent OOM)
+        layer_batch_size = 1
+
+        # Build a *view* of `inputs` that uses half precision where possible
         minimal_inputs: Dict[str, torch.Tensor] = {}
         for key, tensor in inputs.items():
             if isinstance(tensor, torch.Tensor) and tensor.dtype == torch.float32 and tensor.numel() > 1000:
                 minimal_inputs[key] = tensor.to(torch.float16)
             else:
-                minimal_inputs[key] = tensor  # int tensors / small floats
+                minimal_inputs[key] = tensor
 
-        # ───────────────────── layer‑batch loop ───────────────────────── #
+        # ───────────────────── layer-by-layer processing ──────────────────── #
         for batch_start in range(0, len(layers_to_run), layer_batch_size):
             batch_layers = layers_to_run[batch_start : batch_start + layer_batch_size]
 
             if all(self.cache.has(l, "saliency") for l in batch_layers):
                 continue  # already done
 
+            # Create a new hook manager for each layer batch
             hook_mgr = TraceHookManager(
                 self.model,
-                cpu_offload          = True,
-                detach_after_forward = False,   # keep grads
+                cpu_offload=True,
+                detach_after_forward=True,  # Crucial: detach tensors immediately
             )
 
-            # Register only the layers we want to process now.
+            # Register only the layers we want to process now
             for l in batch_layers:
                 hook_mgr.add_layer(
                     self.layer_names[l],
-                    capture   = ["attention", "grad"],
-                    layer_idx = l,
+                    capture=["attention", "grad"],
+                    layer_idx=l,
                 )
             hook_mgr.install()
 
-            # Loss = negative log‑probability of *all* requested targets.
+            # Loss = negative log-probability of requested targets
             def loss_fn(outputs):
-                logits  = outputs.logits
+                logits = outputs.logits
+                # Use float32 for numerical stability but keep on same device
                 logprob = torch.log_softmax(logits.float(), dim=-1)
 
-                ids  = minimal_inputs["input_ids"][0]
+                ids = minimal_inputs["input_ids"][0]
                 loss = torch.zeros((), device=logprob.device, requires_grad=True)
                 for t in valid_targets:
                     loss = loss - logprob[0, t - 1, ids[t].item()]
                 return loss / max(len(valid_targets), 1)
 
-            # Forward + backward (gradients captured by hooks).
-            result = hook_mgr.run(minimal_inputs, loss_fn)
+            # Forward + backward (gradients captured by hooks)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
+                result = hook_mgr.run(minimal_inputs, loss_fn)
+            
+            # Clear CUDA cache immediately after backward pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
             if isinstance(result, dict) and result.get("error"):
-                logger.warning(f"Hook‑run aborted: {result['error']}")
-                hook_mgr.clear()
+                logger.warning(f"Hook-run aborted: {result['error']}")
+                hook_mgr.clear(keep_cache=True)  # Don't clear the cache
                 continue
 
-            # Compute any remaining saliency tensors & drop aux data.
-            hook_mgr.compute_saliency()
-            hook_mgr.clear()
+            # Saliency tensors already computed in gradient hooks, no need to call compute_saliency again
 
-            # Housekeeping.
+            # Clear hooks but keep the cache
+            hook_mgr.clear(keep_cache=True)
+
+            # Force aggressive memory cleanup
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-
-
-
 
     @staticmethod
     def mask_sources(saliency_matrix: torch.Tensor, 

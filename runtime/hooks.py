@@ -27,15 +27,16 @@ class TraceHookManager:
     """
     
     def __init__(self, model: nn.Module, cpu_offload: bool = True, pin_memory: bool = False,
-                 detach_after_forward: bool = False):
+                 detach_after_forward: bool = True):  # Default changed to True
         """
-        Initialize the hook manager.
+        Initialize the hook manager with memory-efficient settings.
         
         Args:
             model: The model to attach hooks to
             cpu_offload: Whether to offload tensors to CPU to save GPU memory
             pin_memory: Whether to pin memory for faster GPU transfer
             detach_after_forward: Whether to detach tensors after forward pass
+                                 (now True by default for memory efficiency)
         """
         self.model = model
         self.cpu_offload = cpu_offload
@@ -71,6 +72,9 @@ class TraceHookManager:
         
         if self._compiling:
             logger.warning("Hooks may be ignored during torch.compile. Consider using eager mode for tracing.")
+            
+        for p in self.model.parameters():
+            p.requires_grad_(False)
     
     def add_layer(self, layer_name: str, capture: Union[List[str], Tuple[str, ...]] = ("attention", "grad"), 
                  alias: Optional[str] = None, layer_idx: Optional[int] = None) -> bool:
@@ -182,6 +186,13 @@ class TraceHookManager:
     def run(self, inputs: Dict[str, torch.Tensor], loss_fn: Optional[Callable] = None) -> Any:
         """
         Ultra memory-optimized run method with proper error handling and fallbacks.
+        
+        Args:
+            inputs: Dictionary of input tensors
+            loss_fn: Optional loss function for gradient computation
+            
+        Returns:
+            Model outputs or error dictionary
         """
         if not self._installed:
             logger.warning("Hooks not installed. Installing...")
@@ -201,84 +212,91 @@ class TraceHookManager:
 
         try:
             # Disable gradient tracking unless loss_fn is provided
-            torch.set_grad_enabled(loss_fn is not None)
-
-            # Create a minimal input dictionary with mixed precision to save memory
-            minimal_inputs = {}
-            for k, v in inputs.items():
-                if isinstance(v, torch.Tensor):
-                    device = v.device
-                    # Use lower precision for large float tensors
-                    if v.dtype == torch.float32 and v.numel() > 1000:
-                        minimal_inputs[k] = v.to(torch.float16, device=device, non_blocking=True)
-                    else:
-                        minimal_inputs[k] = v.to(device, non_blocking=True)
-                else:
-                    minimal_inputs[k] = v
-
-            # Use deterministic algorithms when possible for reproducibility
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
-                try:
-                    outputs = self.model(
-                        **minimal_inputs,
-                        output_hidden_states=False,
-                        return_dict=True
-                    )
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower():
-                        logger.warning(f"OOM during forward pass: {e}")
-                        # Clear memory and return early with failure indicator
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        return {"error": "OOM during forward pass"}
-                    else:
-                        raise
-
-            # If a loss function is provided, compute gradients with proper error handling
-            if loss_fn is not None and outputs is not None:
-                try:
-                    # Compute loss with mixed precision
-                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
-                        loss = loss_fn(outputs)
-                        
-                    # Check if loss requires gradients
-                    if not loss.requires_grad:
-                        logger.warning("Loss does not require gradients. Skipping backward pass.")
-                        return outputs
-
-                    # Zero gradients with set_to_none for better memory efficiency
-                    self.model.zero_grad(set_to_none=True)
-                    
-                    # Use retain_graph=False to minimize memory usage during backward pass
-                    loss.backward(retain_graph=False)
-                    
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower():
-                        # Handle OOM during backward pass gracefully
-                        logger.warning(f"OOM during backward pass: {e}. Cleaning up...")
-                        
-                        # Release references to tensors
-                        if 'loss' in locals():
-                            del loss
-                        
-                        # Force garbage collection
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        
-                        # Update outputs to include error information
-                        if isinstance(outputs, dict):
-                            outputs["error"] = "OOM during backward pass"
+            with torch.set_grad_enabled(loss_fn is not None):
+                # Create a minimal input dictionary with mixed precision to save memory
+                minimal_inputs = {}
+                for k, v in inputs.items():
+                    if isinstance(v, torch.Tensor):
+                        device = v.device
+                        # Use lower precision for large float tensors
+                        if v.dtype == torch.float32 and v.numel() > 1000:
+                            minimal_inputs[k] = v.to(torch.float16, device=device, non_blocking=True)
                         else:
-                            # Create a new dict with the error if outputs is not a dict
-                            temp = {"original_outputs": outputs, "error": "OOM during backward pass"}
-                            outputs = temp
+                            minimal_inputs[k] = v.to(device, non_blocking=True)
                     else:
-                        # Re-raise other errors
-                        raise
+                        minimal_inputs[k] = v
 
-            return outputs
+                # Only use autocast for forward pass to reduce memory without sacrificing gradient accuracy
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
+                    try:
+                        outputs = self.model(
+                            **minimal_inputs,
+                            output_hidden_states=False,
+                            return_dict=True
+                        )
+                    except RuntimeError as e:
+                        if "out of memory" in str(e).lower():
+                            logger.warning(f"OOM during forward pass: {e}")
+                            # Clear memory and return early with failure indicator
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            return {"error": "OOM during forward pass"}
+                        else:
+                            raise
+
+                # Clean up forward pass memory immediately
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                # If a loss function is provided, compute gradients with proper error handling
+                if loss_fn is not None and outputs is not None:
+                    try:
+                        # Compute loss without autocast to allow proper gradient flow
+                        loss = loss_fn(outputs)
+                            
+                        # Check if loss requires gradients
+                        if not loss.requires_grad:
+                            logger.warning("Loss does not require gradients. Skipping backward pass.")
+                            return outputs
+
+                        # Zero gradients with set_to_none for better memory efficiency
+                        self.model.zero_grad(set_to_none=True)
+                        
+                        # Use retain_graph=False to minimize memory usage during backward pass
+                        loss.backward(retain_graph=False)
+                        
+                        # Clear memory immediately after backward
+                        del loss
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        
+                    except RuntimeError as e:
+                        if "out of memory" in str(e).lower():
+                            # Handle OOM during backward pass gracefully
+                            logger.warning(f"OOM during backward pass: {e}. Cleaning up...")
+                            
+                            # Release references to tensors
+                            if 'loss' in locals():
+                                del loss
+                            
+                            # Force garbage collection
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            
+                            # Update outputs to include error information
+                            if isinstance(outputs, dict):
+                                outputs["error"] = "OOM during backward pass"
+                            else:
+                                # Create a new dict with the error if outputs is not a dict
+                                temp = {"original_outputs": outputs, "error": "OOM during backward pass"}
+                                outputs = temp
+                        else:
+                            # Re-raise other errors
+                            raise
+
+                return outputs
 
         except Exception as e:
             logger.error(f"Error during hook manager run: {e}")
@@ -320,8 +338,14 @@ class TraceHookManager:
                 logger.info(f"Auto-assigned index {next_idx} to layer '{layer_name}'")
                 next_idx += 1
     
-    def clear(self) -> None:
-        """Remove all hooks and clear cache."""
+    def clear(self, keep_cache: bool = False) -> None:
+        """
+        Remove all hooks and optionally clear cache.
+        
+        Args:
+            keep_cache: If True, preserve the cache contents (useful when
+                    the cache has been transferred to another object)
+        """
         # Remove forward hooks
         for handle in self._forward_hooks.values():
             handle.remove()
@@ -337,12 +361,14 @@ class TraceHookManager:
             handle.remove()
         self._tensor_hooks = {}
         
-        # Clear cache
-        self.cache.clear()
-
+        # Clear layer-specific live tensors
         for info in self._layer_info.values():
             info.pop("live_attn", None)
             info.pop("live_hidden", None)
+        
+        # Only clear cache if keep_cache is False
+        if not keep_cache:
+            self.cache.clear()
 
         self._installed = False
         
@@ -351,7 +377,7 @@ class TraceHookManager:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
-        logger.info("All hooks removed and cache cleared")
+        logger.info("All hooks removed" + (" and cache cleared" if not keep_cache else " (cache preserved)"))
     
     def snapshot(self) -> TracingCache:
         """
@@ -430,7 +456,7 @@ class TraceHookManager:
                 
     def _create_forward_hook(self, layer_name: str, capture: List[str]) -> Callable:
         """
-        Create a forward hook function for the specified layer.
+        Create a memory-efficient forward hook function for the specified layer.
         
         Args:
             layer_name: Name of the layer
@@ -460,13 +486,9 @@ class TraceHookManager:
                         
                 # Store hidden state if found - ALWAYS DETACH AND MOVE TO CPU for memory efficiency
                 if hidden_state is not None:
-                    # Immediately detach and move to CPU regardless of self.detach_after_forward setting
-                    self.cache.set(
-                        layer_idx,
-                        "hidden",
-                        hidden_state,
-                        detach=True  # Force detach for memory efficiency
-                    )
+                    # Immediately detach and move to CPU regardless of setting
+                    cpu_hidden = hidden_state.detach().to(torch.float16).cpu()
+                    self.cache.set(layer_idx, "hidden", cpu_hidden, detach=False)
             
             # Process attention weights if requested
             if "attention" in capture or "grad" in capture:
@@ -488,10 +510,14 @@ class TraceHookManager:
                 
                 # Store attention weights if found
                 if attn_weights is not None:
-                    # Save the original tensor for gradient hooks
+                    # MEMORY OPTIMIZATION: Always detach and move to CPU immediately
+                    cpu_attn = attn_weights.detach().to(torch.float16).cpu()
+                    self.cache.set(layer_idx, "attention", cpu_attn, detach=False)
+                    
+                    # Save a reference to the original tensor for gradient hooks
                     if "grad" in capture and attn_weights.requires_grad:
-                        # Store the live tensor in layer info
-                        info["live_attn"] = attn_weights.detach()
+                        # MEMORY OPTIMIZATION: Only store a lightweight reference, not the full tensor
+                        info["live_attn"] = cpu_attn
                         
                         # Register gradient hook on the original tensor
                         tensor_hook_key = f"{layer_name}_attn_grad"
@@ -500,37 +526,37 @@ class TraceHookManager:
                         if tensor_hook_key in self._tensor_hooks:
                             self._tensor_hooks[tensor_hook_key].remove()
                             
-                        # Define gradient capture function - ENHANCED FOR MEMORY EFFICIENCY
+                        # Define gradient capture function with immediate saliency computation
                         def grad_hook(grad: torch.Tensor) -> None:
-                            # MEMORY OPTIMIZATION: Immediately compute saliency here
-                            # rather than storing both attention and gradient separately
+                            # Compute saliency immediately on CPU to save GPU memory
                             if "live_attn" in info:
                                 attn = info["live_attn"]
                                 
-                                # Compute saliency immediately
-                                saliency = torch.abs(attn * grad)
+                                # Move gradient to CPU immediately
+                                cpu_grad = grad.detach().to(torch.float16).cpu()
                                 
-                                # Convert to half precision and move to CPU immediately
-                                saliency = saliency.to(torch.float16).cpu()
+                                # Compute saliency on CPU
+                                saliency = torch.abs(attn * cpu_grad)
                                 
-                                # Store the saliency score
-                                self.cache.set(layer_idx, "saliency", saliency, detach=True)
+                                # Store the saliency score (already on CPU in float16)
+                                self.cache.set(layer_idx, "saliency", saliency, detach=False)
                                 
-                                # Clean up to free memory immediately
-                                del grad
+                                # Clean up immediately to save memory
+                                del cpu_grad
                                 info.pop("live_attn", None)
+                                
+                                # Force CPU garbage collection
+                                gc.collect()
                             else:
-                                # Fallback: store gradient separately
-                                self.cache.set(layer_idx, "grad", grad, detach=True)
+                                # Fallback: store gradient separately on CPU
+                                cpu_grad = grad.detach().to(torch.float16).cpu()
+                                self.cache.set(layer_idx, "grad", cpu_grad, detach=False)
+                                del cpu_grad
                         
                         # Register the hook
                         handle = attn_weights.register_hook(grad_hook)
                         self._tensor_hooks[tensor_hook_key] = handle
                         
-                    # Always store a detached copy of attention in cache, unless we're keeping for gradient
-                    if "attention" in capture and (not "grad" in capture or self.detach_after_forward):
-                        self.cache.set(layer_idx, "attention", attn_weights, detach=True)
-                            
         return hook_fn
 
     def _register_hooks(self):
