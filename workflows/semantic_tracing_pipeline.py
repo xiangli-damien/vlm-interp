@@ -74,36 +74,25 @@ def run_semantic_tracing_test(
     single_forward_pass = False
     
     try:
-        # Step 1: Load model with memory optimization options
+        # Step 1: Load model with compatible options
         logger.info(f"Loading model: {model_id}")
         
-        # Add memory optimization when loading
-        load_options = {}
-        if load_in_4bit:
-            load_options.update({
-                "load_in_4bit": True,
-                "bnb_4bit_compute_dtype": torch.float16,
-                "bnb_4bit_quant_type": "nf4"
-            })
-            
-        # Try to add torch.compile if available but only for certain models
+        # IMPORTANT FIX: Only pass parameters that the load_model function actually accepts
+        load_options = {
+            "load_in_4bit": load_in_4bit,
+            "device_map": "auto" if torch.cuda.is_available() else None
+        }
+        
+        # Optional: Enable flash attention for compatible models if available
         try:
-            import torch._dynamo
-            if 'llava' in model_id.lower() and not low_memory_mode:
-                load_options["torch_compile"] = True
-                logger.info("Using torch.compile for potential speedup")
+            import importlib.util
+            if importlib.util.find_spec("flash_attn") is not None:
+                if 'llava' in model_id.lower():
+                    load_options["use_flash_attn"] = True
+                    logger.info("Flash Attention available, enabling for compatible models")
         except ImportError:
             pass
-            
-        # Create device map for more efficient memory usage
-        if torch.cuda.is_available():
-            if torch.cuda.device_count() > 1:
-                # Use all available GPUs
-                load_options["device_map"] = "auto"
-            else:
-                # Single GPU - still use auto device_map for memory management
-                load_options["device_map"] = "auto"
-                
+        
         model, processor = load_model(
             model_id=model_id,
             **load_options
