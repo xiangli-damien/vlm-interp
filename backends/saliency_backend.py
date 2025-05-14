@@ -28,14 +28,15 @@ class SaliencyBackend(BaseBackend):
             inputs: Model input tensors
             target_indices: Indices of target tokens to analyze
         """
-        # Strip out any KV-cache / force full forward, detach for safety
+        # --- DEBUG LOG ---
+        print(f"[DEBUG][SaliencyBackend] ensure_cache inputs.keys(): {list(inputs.keys())}")
+        print(f"[DEBUG][SaliencyBackend] target_indices: {target_indices}")
         self.last_inputs = {
             k: v.detach()
             for k, v in inputs.items()
             if k not in ("past_key_values", "use_cache")
         }
-        # Ensure we do a full forward with attentions
-        self.last_inputs["use_cache"]       = False
+        self.last_inputs["use_cache"] = False
         self.last_inputs["output_attentions"] = True
     
     def _compute_single_layer(self, layer_idx: int, target_indices: List[int]) -> None:
@@ -47,8 +48,10 @@ class SaliencyBackend(BaseBackend):
             target_indices: Indices of target tokens
         """
         # Set up hook manager
-        hook_mgr = TraceHookManager(self.model, self.cache)
+        print(f"[DEBUG][SaliencyBackend] _compute_single_layer layer {layer_idx}, targets {target_indices}")
+        hook_mgr = TraceHookManager(self.model, self.cache, cpu_offload=self.cache.cpu_offload)
         
+        print(f"[DEBUG][SaliencyBackend] Registering hooks for layer '{self.layer_names[layer_idx]}'")
         hook_mgr.add_layer(
             self.layer_names[layer_idx],
             capture=("grad", "attention"),
@@ -57,6 +60,7 @@ class SaliencyBackend(BaseBackend):
         
         # Define loss function for backward pass
         def loss_fn(outputs):
+            print(f"[DEBUG][SaliencyBackend] loss_fn called for layer {layer_idx}")
             logits = outputs.logits.float()
             logp = torch.log_softmax(logits, -1)
             ids = self.last_inputs["input_ids"][0]
@@ -68,19 +72,24 @@ class SaliencyBackend(BaseBackend):
         
         # Install hooks, run forward/backward, and clear hooks
         hook_mgr.install()
+        print(f"[DEBUG][SaliencyBackend] Running forward+backward for layer {layer_idx}")
         hook_mgr.run(self.last_inputs, loss_fn)
+        print(f"[DEBUG][SaliencyBackend] Completed run for layer {layer_idx}")
         hook_mgr.clear(keep_cache=True)  # Keep cached saliency
         
         # Fallback: extremely rare – only if LightAttnFn path failed
-        if (not self.cache.has(layer_idx, "saliency")
-            and self.cache.has(layer_idx, "attn")
-            and self.cache.has(layer_idx, "grad")):
-            
+        has_sal = self.cache.has(layer_idx, "saliency")
+        has_attn = self.cache.has(layer_idx, "attn")
+        # we don't store raw grad by default; if you do, check has_grad
+        print(f"[DEBUG][SaliencyBackend] has_saliency={has_sal}, has_attn={has_attn}")
+        if (not has_sal and has_attn and self.cache.has(layer_idx, "grad")):
+
             # Get attention and gradient tensors
             att = self.cache.get(layer_idx, "attn", self.device)
             grad = self.cache.get(layer_idx, "grad", self.device)
             
             # Compute saliency |attention * gradient|
+            print(f"[DEBUG][SaliencyBackend] Running fallback A×grad for layer {layer_idx}")
             sal = (att * grad).abs()
             
             # Cache result and clean up intermediates
@@ -103,11 +112,13 @@ class SaliencyBackend(BaseBackend):
             List of source token records with importance weights
         """
         # Compute saliency if not already cached
+        print(f"[DEBUG][SaliencyBackend.trace_layer] entering layer {layer_idx}")
         if not self.cache.has(layer_idx, "saliency"):
             self._compute_single_layer(layer_idx, list(targets.keys()))
         
         # Get saliency scores from cache
         sal = self.cache.get(layer_idx, "saliency", self.device)
+        print(f"[DEBUG][SaliencyBackend.trace_layer] saliency map for layer {layer_idx}: { 'found' if sal is not None else 'None' }")
         
         if sal is None:
             print(f"Warning: Failed to compute saliency for layer {layer_idx}")

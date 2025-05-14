@@ -50,6 +50,10 @@ class LightAttnFn(torch.autograd.Function):
         
         # Compute saliency score |attention * gradient|
         # Taking mean across batch and head dimensions if present
+        # --- DEBUG LOG ---
+        print(f"[DEBUG][LightAttnFn] backward called for layer {ctx.layer}")
+        print(f"[DEBUG][LightAttnFn] attn.shape={tuple(attn.shape)}, grad.shape={tuple(grad.shape)}")
+        # Compute saliency score |attention * gradient|
         sal = (attn * grad).abs()
         if sal.dim() >= 4:  # [batch, head, seq, seq]
             sal = sal.mean((0, 1))
@@ -58,6 +62,8 @@ class LightAttnFn(torch.autograd.Function):
         
         # Store in global cache
         if ctx.layer != -1:
+            # --- DEBUG LOG ---
+            print(f"[DEBUG][LightAttnFn] storing saliency for layer {ctx.layer}")
             # Convert to float16 and move to CPU to save memory
             global_sal_cache.store(ctx.layer, sal)
         
