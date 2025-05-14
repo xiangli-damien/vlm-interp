@@ -263,6 +263,7 @@ class SemanticTracingWorkflow(GenerationMixin):
                 
                 # Add token text and ID if not present
                 if "text" not in record and idx < len(all_token_texts):
+                    record["text"] = all_token_texts[idx]
                     record["token_text"] = all_token_texts[idx]
                 if "id" not in record and idx < len(all_token_ids):
                     record["token_id"] = all_token_ids[idx]

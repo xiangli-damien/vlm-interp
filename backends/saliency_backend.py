@@ -43,10 +43,14 @@ class SaliencyBackend(BaseBackend):
         hook_mgr = TraceHookManager(self.model, self.cache)
         
         # Register hooks for the specific layer
+        # ► only need A·∇A 
+        #   LightAttnFn (in GradAttnHook) already keeps a reference to the
+        #   forward attention tensor and writes |A·∇A| into global_sal_cache
+        #   during backward, so storing a *detached* copy of A is wasteful.
         hook_mgr.add_layer(
             self.layer_names[layer_idx],
-            ("attention", "grad"),
-            layer_idx
+            capture=("grad",),
+            layer_idx=layer_idx,
         )
         
         # Define loss function for backward pass
@@ -65,10 +69,10 @@ class SaliencyBackend(BaseBackend):
         hook_mgr.run(self.last_inputs, loss_fn)
         hook_mgr.clear(keep_cache=True)  # Keep cached saliency
         
-        # If saliency not directly computed by hooks, calculate from attn+grad
-        if (not self.cache.has(layer_idx, "saliency") and
-            self.cache.has(layer_idx, "attn") and
-            self.cache.has(layer_idx, "grad")):
+        # Fallback: extremely rare – only if LightAttnFn path failed
+        if (not self.cache.has(layer_idx, "saliency")
+            and self.cache.has(layer_idx, "attn")
+            and self.cache.has(layer_idx, "grad")):
             
             # Get attention and gradient tensors
             att = self.cache.get(layer_idx, "attn", self.device)
@@ -141,7 +145,10 @@ class SaliencyBackend(BaseBackend):
         # Apply layer-level pruning
         results = self._prune_layer(results, sel_cfg)
         
-        # Layer complete - clean up saliency
+        # After the saliency vector is consumed, make sure any stray
+        # attention/grad tensors are gone as well (safety net).
         self.cache.clear_single(layer_idx, "saliency")
+        self.cache.clear_single(layer_idx, "attn")
+        self.cache.clear_single(layer_idx, "grad")
         
         return results

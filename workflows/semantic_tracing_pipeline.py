@@ -34,6 +34,8 @@ def run_semantic_tracing(
     generate_only: bool = False,
     concepts_to_track: Optional[List[str]] = None,
     tracing_mode: str = "saliency",
+    enable_gradients: bool = False,
+    use_flash_attn: bool = False,
     debug_mode: bool = False
 ) -> Dict[str, Any]:
     """
@@ -57,6 +59,8 @@ def run_semantic_tracing(
         generate_only: If True, only generate tokens without analysis
         concepts_to_track: List of concepts to track with logit lens
         tracing_mode: The tracing mode to use ("saliency", "attention", or "both")
+        enable_gradients: Whether to enable gradient calculation for tracing
+        use_flash_attn: Whether to use flash-attention for faster inference
         debug_mode: Whether to print detailed debug information
     
     Returns:
@@ -90,14 +94,16 @@ def run_semantic_tracing(
     print("\nLoading model and processor...")
     model, processor = load_model(
         model_id=model_id,
-        load_in_4bit=load_in_4bit, 
-        enable_gradients=True
+        use_flash_attn=use_flash_attn,
+        load_in_4bit=load_in_4bit,
+        enable_gradients=enable_gradients,
+        device_map="auto"
     )
     
     # 2. Load image
     print("\nLoading image...")
     from preprocess.image import load_image
-    image = load_image(image_path)
+    image = load_image(image_path, resize_to=(336, 336))
     
     # 3. Create selection config
     selection_config = SelectionConfig(
@@ -214,7 +220,9 @@ def run_semantic_tracing(
         output_info["target_tokens"] = [trace_results["target_token"]]
     
     # Save analysis summary
-    summary_path = os.path.join(output_dir, "csv_data", "analysis_summary.json")
+    csv_dir = os.path.join(output_dir, "csv_data")
+    os.makedirs(csv_dir, exist_ok=True)
+    summary_path = os.path.join(csv_dir, "analysis_summary.json")
     try:
         import json
         with open(summary_path, 'w') as f:

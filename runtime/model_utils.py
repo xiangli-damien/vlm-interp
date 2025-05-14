@@ -12,10 +12,9 @@ Includes functions for:
 import torch
 import torch.nn as nn
 import time
-from typing import Optional, Tuple, Union, List
+from typing import Optional, Tuple, Union, List, Dict, Any
 from packaging import version
 from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor
-
 
 # Import necessary components from transformers
 from transformers import (
@@ -40,144 +39,109 @@ MODEL_OPTIONS = {
     }
 }
 
+FLASH_MIN_VERSION = (2, 5)  # flash-attn >= 2.5 required for compatibility
+
+def _is_flash_attn_supported() -> bool:
+    """
+    Returns True if flash-attn is installed and its version meets the minimum.
+    """
+    try:
+        import flash_attn
+        ver = tuple(int(v) for v in flash_attn.__version__.split('.')[:2])
+        return ver >= FLASH_MIN_VERSION
+    except Exception:
+        return False
+
+def _create_4bit_config() -> BitsAndBytesConfig:
+    """
+    Constructs a default 4-bit quantization config (nf4, double quant).
+    """
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+    )
+
 def load_model(
     model_id: str,
+    *,
     use_flash_attn: bool = False,
     load_in_4bit: bool = False,
     enable_gradients: bool = False,
     device_map: Optional[str] = "auto",
-    attn_implementation: Optional[str] = None,  # Allow this to be passed from caller
-    **kwargs  # Catch additional parameters
+    **hf_kwargs: Dict[str, Any],
 ) -> Tuple[LlavaNextForConditionalGeneration, LlavaNextProcessor]:
     """
-    Loads a LLaVA-Next model and processor with flexible support for Flash Attention and 4-bit quantization.
+    Load a LLaVA-Next model + processor with optional flash-attention and 4-bit quantization.
 
     Args:
-        model_id (str): HuggingFace model ID to load.
-        use_flash_attn (bool): Whether to enable Flash Attention 2 (ignored if attn_implementation is provided).
-        load_in_4bit (bool): Whether to load the model using 4-bit quantization.
-        enable_gradients (bool): If True, enables requires_grad on model parameters.
-        device_map (Optional[str]): Device mapping for model loading. Defaults to "auto".
-        attn_implementation (Optional[str]): Explicitly set the attention implementation.
-        **kwargs: Additional arguments to pass to from_pretrained.
+        model_id: Hugging Face model identifier.
+        use_flash_attn: Enable flash-attn backend if available.
+        load_in_4bit: Enable 4-bit quantization (requires CUDA).
+        enable_gradients: If True, unfreeze attention projections for training.
+        device_map: Device placement strategy (e.g., 'auto' or explicit dict).
+        hf_kwargs: Additional kwargs forwarded to `from_pretrained`.
 
     Returns:
-        Tuple: (model, processor)
+        (model, processor)
     """
-    start_time = time.time()
-    print(f"[INFO] Loading model and processor from: {model_id}...")
+    t0 = time.time()
+    print(f"[INFO] Loading LLaVA-Next '{model_id}'")
 
-    # --- Load processor ---
-    try:
-        processor = LlavaNextProcessor.from_pretrained(model_id)
-        print("[✓] Processor loaded.")
-    except Exception as e:
-        raise RuntimeError(f"[ERROR] Failed to load processor: {e}") from e
+    # 1. Processor
+    processor = LlavaNextProcessor.from_pretrained(model_id)
+    print("[INFO] Processor loaded")
 
-    # --- Configure attention ---
-    # Only set attn_implementation if not already provided in kwargs
-    if attn_implementation is None and 'attn_implementation' not in kwargs:
-        attn_implementation = "flash_attention_2" if use_flash_attn else "eager"
-        print(f"[INFO] Setting attention implementation to '{attn_implementation}'")
+    # 2. Attention implementation
+    if use_flash_attn and torch.cuda.is_available() and _is_flash_attn_supported():
+        attn_impl = "flash_attention_2"
+        print("[INFO] Using flash-attention backend")
     else:
-        # Either use explicit parameter or one from kwargs
-        effective_attn = attn_implementation or kwargs.get('attn_implementation', 'eager')
-        print(f"[INFO] Using provided attention implementation: '{effective_attn}'")
-        # Remove from kwargs if it's there to avoid conflicts
-        if 'attn_implementation' in kwargs:
-            print("[INFO] Found attn_implementation in kwargs, using that value")
-            attn_implementation = kwargs.pop('attn_implementation')
+        attn_impl = "eager"
+        if use_flash_attn:
+            print("[WARNING] flash-attn unavailable or incompatible; using eager")
 
-    # --- Configure precision and device ---
-    quantization_config = None
-    model_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    effective_device_map = device_map if torch.cuda.is_available() else None
-
-    # --- Configure 4-bit quantization (with fallback) ---
+    # 3. Quantization config
+    quant_config = None
     if load_in_4bit and torch.cuda.is_available():
         try:
-            # FIX: Import BitsAndBytesConfig from transformers instead of bitsandbytes
-            from transformers import BitsAndBytesConfig
-            
-            # Handle quantization parameters that might be in kwargs
-            bnb_4bit_quant_type = kwargs.pop('bnb_4bit_quant_type', 'nf4')
-            bnb_4bit_compute_dtype = kwargs.pop('bnb_4bit_compute_dtype', torch.float16)
-            bnb_4bit_use_double_quant = kwargs.pop('bnb_4bit_use_double_quant', True)
-            
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=bnb_4bit_use_double_quant,
-                bnb_4bit_quant_type=bnb_4bit_quant_type,
-                bnb_4bit_compute_dtype=bnb_4bit_compute_dtype
-            )
-            print(f"[✓] 4-bit quantization enabled with {bnb_4bit_quant_type} format.")
-
-        except ImportError as e:
-            print(f"[WARN] bitsandbytes not properly configured: {e}")
-            print("[INFO] Falling back to float16 model...")
-            load_in_4bit = False
-            quantization_config = None
-    elif load_in_4bit:
-        print("[WARN] 4-bit quantization requires CUDA. Ignoring 'load_in_4bit=True'.")
-
-    # --- Load model ---
-    try:
-        print(f"[INFO] Loading model with dtype={model_dtype}, device_map={effective_device_map}, attn='{attn_implementation}'...")
-        
-        # Create clean load arguments
-        load_args = {
-            "torch_dtype": model_dtype,
-            "quantization_config": quantization_config,
-            "low_cpu_mem_usage": True,
-            "device_map": effective_device_map,
-            "trust_remote_code": True
-        }
-        
-        # Only add attn_implementation if it's set
-        if attn_implementation is not None:
-            load_args["attn_implementation"] = attn_implementation
-            
-        # Add any remaining kwargs
-        load_args.update(kwargs)
-        
-        # Print final arguments for debugging
-        clean_args = {k: v for k, v in load_args.items() if k != "quantization_config"}
-        print(f"[DEBUG] Final model loading arguments: {clean_args}")
-        
-        model = LlavaNextForConditionalGeneration.from_pretrained(
-            model_id,
-            **load_args
-        )
-        print("[✓] Model loaded.")
-        
-        if effective_device_map is None:
-            print(f"[INFO] Model is on device: {model.device}")
-        else:
-            print(f"[INFO] Model loaded with device_map: {effective_device_map}")
-
-    except ImportError as e:
-        raise ImportError(f"[ERROR] ImportError during model loading: {e}\n"
-                          "Check if 'accelerate' is installed, and 'flash-attn' if using flash_attention_2.")
-    except Exception as e:
-        if "out of memory" in str(e).lower():
-            print("[OOM] CUDA out-of-memory. Try enabling load_in_4bit or reduce model size.")
-        raise RuntimeError(f"[ERROR] Failed to load model: {e}") from e
-
-    # --- Configure gradients ---
-    if enable_gradients:
-        print("[INFO] Enabling gradients for model parameters...")
-        try:
-            model.train()
-            for param in model.parameters():
-                param.requires_grad = True
-            print("[✓] Gradients enabled.")
+            quant_config = _create_4bit_config()
+            print("[INFO] 4-bit quantization enabled (nf4)")
         except Exception as e:
-            print(f"[WARN] Could not enable gradients: {e}")
+            print(f"[WARNING] 4-bit config failed ({e}); falling back to fp16")
+    elif load_in_4bit:
+        print("[WARNING] 4-bit quantization requires CUDA; ignoring")
+
+    # 4. Assemble load args
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    effective_map = device_map if torch.cuda.is_available() else None
+    load_args: Dict[str, Any] = {
+        "torch_dtype": dtype,
+        "device_map": effective_map,
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": True,
+        "attn_implementation": attn_impl,
+        "quantization_config": quant_config,
+    }
+    load_args.update(hf_kwargs)
+
+    print(f"[DEBUG] load_args = {{'dtype': {dtype}, 'device_map': {effective_map}, 'attn_impl': '{attn_impl}'}}")
+    model = LlavaNextForConditionalGeneration.from_pretrained(model_id, **load_args)
+    print("[INFO] Model weights loaded")
+
+    # 5. Gradient settings
+    if enable_gradients and not load_in_4bit:
+        model.train()
+        for name, param in model.named_parameters():
+            if any(tag in name for tag in (".q_proj", ".k_proj", ".v_proj", ".o_proj")):
+                param.requires_grad_(True)
+        print("[INFO] Gradients enabled for attention projections only")
     else:
         model.eval()
 
-    elapsed = time.time() - start_time
-    print(f"[✓] Model and processor loaded in {elapsed:.2f} seconds.")
+    dt = time.time() - t0
+    print(f"[INFO] Completed in {dt:.2f}s | dtype={model.dtype}")
     return model, processor
     
 

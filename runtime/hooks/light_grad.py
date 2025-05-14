@@ -92,7 +92,10 @@ class GradAttnHook:
         """
         # Extract attention weights from output
         # For LLaVA-Next, attention is typically the second element in a tuple
-        attn = out[1] if isinstance(out, tuple) and len(out) > 1 else out
+        if isinstance(out, tuple):
+            attn = out[1] if len(out) > 1 else out[0]
+        else:
+            attn = out
         
         # Add layer index attribute to attention tensor for backward reference
         attn.layer_idx = self.layer_idx

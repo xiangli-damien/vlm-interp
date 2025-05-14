@@ -79,11 +79,6 @@ class TraceHookManager:
                 self.layer_hooks[layer_name][cap_type] = True
             
             elif cap_type == "grad":
-                # For gradient, use GradAttnHook that wraps with autograd function
-                # Skip if we've already registered an attention hook for this layer
-                if 'attention' in self.layer_hooks[layer_name]:
-                    continue
-                    
                 hook = GradAttnHook(layer_idx)
                 handle = module.register_forward_hook(hook)
                 self.hooks.append(handle)
