@@ -1,148 +1,107 @@
 """
-Light-weight gradient hooks for memory-efficient saliency tracing.
-Implements custom autograd functions to compute saliency immediately during backward pass.
+Lightweight gradient hooks for efficient saliency computation.
+Implements custom autograd Function to calculate |attention * gradient|
+during backward pass without retaining the full computation graph.
 """
 
 import torch
-import logging
-from typing import Optional, Tuple, Any
+import torch.nn as nn
+from typing import Any, Tuple, Dict, Optional, List
 
-# Configure logging
-logger = logging.getLogger("light_grad")
+# Import the global saliency cache
+from runtime.cache import global_sal_cache
 
-class AttnGradFn(torch.autograd.Function):
+
+class LightAttnFn(torch.autograd.Function):
     """
-    Custom autograd function for attention gradients.
-    Immediately processes attention matrices and gradients during backward pass,
-    saving saliency scores to CPU to minimize GPU memory usage.
+    Custom autograd function for efficient saliency computation.
+    Computes |attention * gradient| during backward pass and stores in global cache.
     """
     
     @staticmethod
     def forward(ctx, attn):
         """
-        Simply pass through the attention tensor for forward pass.
+        Forward pass - simply passes through the attention tensor.
         
         Args:
-            ctx: Context object for storing info needed in backward
+            ctx: Context for storing information for backward pass
             attn: Attention tensor
             
         Returns:
-            The original attention tensor (preserving computational graph)
+            The unmodified attention tensor
         """
         ctx.save_for_backward(attn)
-        # Store layer_idx from the tensor attribute (set by the hook)
-        ctx.layer_idx = getattr(attn, 'layer_idx', None)
+        ctx.layer = getattr(attn, 'layer_idx', -1)
         return attn
-        
+    
     @staticmethod
     def backward(ctx, grad):
         """
-        Immediately compute saliency during backward, offload to CPU, and free memory.
+        Backward pass - computes saliency score and stores in global cache.
         
         Args:
-            ctx: Context with saved tensors
-            grad: Gradient flowing back through this function
+            ctx: Context containing saved tensors
+            grad: Gradient tensor
             
         Returns:
-            The original gradient (for continued backprop)
+            The input gradient tensor (unchanged for regular backprop)
         """
-        # Safety check - if layer_idx is None, we can't store in cache
-        if ctx.layer_idx is None:
-            logger.debug("No layer_idx available in gradient hook, skipping saliency computation")
-            return grad
-            
         attn, = ctx.saved_tensors
         
-        try:
-            # Compute saliency only on CPU to save GPU memory
-            sal = (attn * grad).abs().mean(dim=(0,1)).to(torch.float16).cpu()
-            
-            # Store in global cache
-            from runtime.cache import global_saliency_cache
-            global_saliency_cache.store(ctx.layer_idx, sal)
-            
-            # Immediately release tensors to free memory
-            del attn, sal
-        except Exception as e:
-            logger.warning(f"Error in gradient backward hook: {e}")
+        # Compute saliency score |attention * gradient|
+        # Taking mean across batch and head dimensions if present
+        sal = (attn * grad).abs()
+        if sal.dim() >= 4:  # [batch, head, seq, seq]
+            sal = sal.mean((0, 1))
+        elif sal.dim() == 3:  # [batch, seq, seq] or [head, seq, seq]
+            sal = sal.mean(0)
         
-        # Return original gradient for continued backpropagation
+        # Store in global cache
+        if ctx.layer != -1:
+            # Convert to float16 and move to CPU to save memory
+            global_sal_cache.store(ctx.layer, sal)
+        
         return grad
 
 
-class LightAttnHook:
+class GradAttnHook:
     """
-    Light-weight hook for attention matrices.
-    Wraps attention tensors with custom autograd function.
+    Hook that wraps attention outputs with LightAttnFn for saliency computation.
     """
-    def __init__(self, layer_idx):
+    
+    def __init__(self, layer_idx: int):
         """
-        Initialize with layer index for proper storage.
+        Initialize the gradient attention hook.
         
         Args:
-            layer_idx: Index of the layer this hook is attached to
+            layer_idx: Index of the layer being hooked
         """
         self.layer_idx = layer_idx
-        
-    def __call__(self, module, inputs, outputs):
+    
+    def __call__(self, m: nn.Module, inp: Tuple[torch.Tensor, ...], out: Any) -> Any:
         """
-        Hook called during forward pass to wrap attention with our custom Function.
+        Forward hook function applied to attention module.
         
         Args:
-            module: The module being processed
-            inputs: Input tensors
-            outputs: Output tensors from the module
+            m: The module being hooked
+            inp: Input tensors to the module
+            out: Output from the module
             
         Returns:
-            Modified output with wrapped attention
+            Modified output with wrapped attention tensor
         """
-        # Handle different output structures
-        attn_weights = None
+        # Extract attention weights from output
+        # For LLaVA-Next, attention is typically the second element in a tuple
+        attn = out[1] if isinstance(out, tuple) and len(out) > 1 else out
         
-        # Extract attention from tuple outputs
-        if isinstance(outputs, tuple) and len(outputs) > 1:
-            hidden, attn = outputs[0], outputs[1]
-            
-            # Check if attn has the right shape (4D attention matrix)
-            if isinstance(attn, torch.Tensor) and len(attn.shape) == 4 and attn.shape[-1] == attn.shape[-2]:
-                attn_weights = attn
-            # Special case pattern: some models put attention matrix at position 2
-            elif len(outputs) > 2 and isinstance(outputs[2], torch.Tensor) and len(outputs[2].shape) == 4:
-                attn_weights = outputs[2]
-                hidden, attn = outputs[0], outputs[2]  # Reassign for later use
-                
-        # Handle BaseModelOutput structures
-        elif hasattr(outputs, "attentions") and outputs.attentions is not None:
-            # Models with HF BaseModelOutput format
-            if isinstance(outputs.attentions, tuple) and len(outputs.attentions) > 0:
-                attn_weights = outputs.attentions[0]  # Use first attention layer
-                hidden = outputs.last_hidden_state
+        # Add layer index attribute to attention tensor for backward reference
+        attn.layer_idx = self.layer_idx
         
-        # Process attention weights with our custom autograd function
-        if attn_weights is not None:
-            # Pass layer index to tensor as attribute for retrieval in Function
-            # Ensure it's an integer to avoid type issues in global_saliency_cache
-            attn_weights.layer_idx = int(self.layer_idx)
-            
-            # Wrap attention with our custom Function
-            wrapped = AttnGradFn.apply(attn_weights)
-            
-            # Return modified output keeping the same structure
-            if isinstance(outputs, tuple):
-                if outputs[1] is attn_weights:
-                    return (hidden, wrapped, *outputs[2:])
-                elif len(outputs) > 2 and outputs[2] is attn_weights:
-                    return (outputs[0], outputs[1], wrapped, *outputs[3:])
-            elif hasattr(outputs, "attentions"):
-                # For HF-style outputs, we need to create a new object with same attributes
-                result = outputs
-                # Replace the attention tuple with a new one containing our wrapped attention
-                if isinstance(outputs.attentions, tuple):
-                    result.attentions = (wrapped,) + outputs.attentions[1:]
-                return result
-        else:
-            # Log when we can't find attention weights
-            logger.debug(f"No attention weights found in layer {self.layer_idx} output structure")
-            
-        # If we couldn't identify or modify attention, return the original outputs
-        return outputs
+        # Apply custom autograd function
+        wrapped = LightAttnFn.apply(attn)
+        
+        # Return with same structure as input
+        if isinstance(out, tuple):
+            return (out[0], wrapped, *out[2:])
+        
+        return wrapped

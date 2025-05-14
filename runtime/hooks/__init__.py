@@ -1,11 +1,17 @@
 """
-Unified hook exports for model interpretation and tracing.
+Hook modules for model introspection.
+Provides components for capturing activations and gradients with minimal memory impact.
 """
 
 from runtime.hooks.manager import TraceHookManager
-from runtime.hooks.light_grad import AttnGradFn, LightAttnHook
+from runtime.hooks.light_grad import GradAttnHook, LightAttnFn
+from runtime.hooks.hidden import HiddenHook
+from runtime.hooks.attention import SaveAttnHook
 
-# Make LightGradHook an alias for LightAttnHook for backward compatibility
-LightGradHook = LightAttnHook
-
-__all__ = ["TraceHookManager", "LightAttnHook", "AttnGradFn", "LightGradHook"]
+__all__ = [
+    'TraceHookManager',
+    'GradAttnHook',
+    'LightAttnFn',
+    'HiddenHook',
+    'SaveAttnHook'
+]
