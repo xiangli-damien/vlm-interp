@@ -385,7 +385,7 @@ class SaliencyBackend:
             hook_mgr = TraceHookManager(
                 self.model,
                 cpu_offload=True,
-                detach_after_forward=True,  # Crucial: detach tensors immediately
+                detach_after_forward=False,  # Crucial: detach tensors immediately
             )
 
             # Register only the layers we want to process now

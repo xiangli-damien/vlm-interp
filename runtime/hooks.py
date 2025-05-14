@@ -73,8 +73,8 @@ class TraceHookManager:
         if self._compiling:
             logger.warning("Hooks may be ignored during torch.compile. Consider using eager mode for tracing.")
             
-        for p in self.model.parameters():
-            p.requires_grad_(False)
+        #for p in self.model.parameters():
+        #    p.requires_grad_(False)
     
     def add_layer(self, layer_name: str, capture: Union[List[str], Tuple[str, ...]] = ("attention", "grad"), 
                  alias: Optional[str] = None, layer_idx: Optional[int] = None) -> bool:
