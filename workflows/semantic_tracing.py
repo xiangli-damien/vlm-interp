@@ -122,8 +122,9 @@ class SemanticTracingWorkflow(GenerationMixin):
     """
 
     def __init__(self, model: torch.nn.Module, processor: Any, output_dir: str, 
-                 selection_config: Optional[SelectionConfig] = None,
-                 debug: bool = False):
+             selection_config: Optional[SelectionConfig] = None,
+             debug: bool = False, 
+             logit_lens_concepts: Optional[List[str]] = None):
         """
         Initialize the semantic tracing workflow.
 
@@ -147,6 +148,9 @@ class SemanticTracingWorkflow(GenerationMixin):
         self.config = selection_config or SelectionConfig()
 
         self.device = next(model.parameters()).device
+        self.logit_lens_concepts = logit_lens_concepts or [
+            "eiffel", "tower", "paris"
+        ]
 
         try:
             from runtime.model_utils import get_llm_attention_layer_names
@@ -173,9 +177,10 @@ class SemanticTracingWorkflow(GenerationMixin):
             self.logit_backend = LogitBackend(
                 model=self.model,
                 cache=self.cache,
-                device=self.device
+                device=self.device,
+                concepts=self.logit_lens_concepts
             )
-            logger.info("Logit Lens backend initialized.")
+            logger.info(f"Logit Lens backend initialized with {len(self.logit_lens_concepts)} concepts")
         except Exception as e:
             logger.warning(f"Could not initialize Logit Lens backend: {e}")
             self.logit_backend = None
@@ -434,43 +439,57 @@ class SemanticTracingWorkflow(GenerationMixin):
                 for source in sources:
                     idx = source["index"]
                     source["type"] = self.token_types.get(idx, "unknown")
-                
-                # Compute Logit Lens projections if requested, with memory optimization
+
+                # Compute Logit Lens projections if requested
                 ll_projections = None
                 if compute_ll_projections and self.logit_backend is not None:
                     # Get unique token IDs from current targets and sources
                     token_indices = set(current_targets.keys()) | {s["index"] for s in sources}
                     
                     if token_indices:
-                        # OPTIMIZATION: Process Logit Lens in small batches
+                        # Create TokenDecoder for better token decoding
+                        from runtime.decode import TokenDecoder
+                        token_decoder = TokenDecoder(self.processor.tokenizer)
+                        
+                        # Process LogitLens in small batches
                         ll_projections = {}
                         token_indices_list = sorted(list(token_indices))
                         
-                        # Use small batch size to reduce memory usage
-                        batch_size = 8  # Small enough to avoid OOM
+                        # Use batch processing to reduce memory usage
+                        batch_size = 8
                         for i in range(0, len(token_indices_list), batch_size):
                             batch_indices = token_indices_list[i:i+batch_size]
                             
                             try:
-                                # Try using batch projection if available
+                                # Try using batch projection method
                                 if hasattr(self.logit_backend, "project_tokens_batch"):
                                     batch_results = self.logit_backend.project_tokens_batch(
                                         layer_idx=layer_idx,
                                         token_indices=batch_indices,
                                         tokenizer=self.processor.tokenizer,
-                                        top_k=3
+                                        top_k=5
                                     )
                                     
                                     # Process batch results
                                     for token_idx, projection in batch_results.items():
                                         if projection and projection.get("predictions"):
+                                            # Get top prediction
+                                            top_pred = projection["predictions"][0]
+                                            
+                                            # Use TokenDecoder for better token text
+                                            top_text = token_decoder.decode_token(top_pred.get("token_id", 0))
+                                            
+                                            # Store with proper type conversion
                                             ll_projections[token_idx] = {
-                                                "top1_token": projection["predictions"][0].get("text", ""),
-                                                "top1_prob": projection["predictions"][0].get("prob", 0.0),
-                                                "top1_logit": projection["predictions"][0].get("logit", 0.0),
-                                                "top2_token": projection["predictions"][1].get("text", "") if len(projection["predictions"]) > 1 else "",
-                                                "top2_prob": projection["predictions"][1].get("prob", 0.0) if len(projection["predictions"]) > 1 else 0.0
+                                                "top1_token": top_text,
+                                                "top1_prob": float(top_pred.get("prob", 0.0)),
+                                                "top1_logit": float(top_pred.get("logit", 0.0)),
+                                                "top2_token": token_decoder.decode_token(projection["predictions"][1].get("token_id", 0)) if len(projection["predictions"]) > 1 else "",
+                                                "top2_prob": float(projection["predictions"][1].get("prob", 0.0)) if len(projection["predictions"]) > 1 else 0.0
                                             }
+                                            
+                                            # Log for debugging
+                                            print(f"Token {token_idx} → '{top_text}' (prob: {top_pred.get('prob', 0.0):.4f})")
                                 else:
                                     # Fall back to individual token projection
                                     for token_idx in batch_indices:
@@ -478,18 +497,27 @@ class SemanticTracingWorkflow(GenerationMixin):
                                             layer_idx=layer_idx,
                                             token_idx=token_idx,
                                             tokenizer=self.processor.tokenizer,
-                                            top_k=3
+                                            top_k=5
                                         )
+                                        
                                         if projection and projection.get("predictions"):
+                                            # Get top prediction
+                                            top_pred = projection["predictions"][0]
+                                            
+                                            # Use TokenDecoder for better token text
+                                            top_text = token_decoder.decode_token(top_pred.get("token_id", 0))
+                                            
                                             ll_projections[token_idx] = {
-                                                "top1_token": projection["predictions"][0].get("text", ""),
-                                                "top1_prob": projection["predictions"][0].get("prob", 0.0),
-                                                "top1_logit": projection["predictions"][0].get("logit", 0.0),
-                                                "top2_token": projection["predictions"][1].get("text", "") if len(projection["predictions"]) > 1 else "",
-                                                "top2_prob": projection["predictions"][1].get("prob", 0.0) if len(projection["predictions"]) > 1 else 0.0
+                                                "top1_token": top_text,
+                                                "top1_prob": float(top_pred.get("prob", 0.0)),
+                                                "top1_logit": float(top_pred.get("logit", 0.0)),
+                                                "top2_token": token_decoder.decode_token(projection["predictions"][1].get("token_id", 0)) if len(projection["predictions"]) > 1 else "",
+                                                "top2_prob": float(projection["predictions"][1].get("prob", 0.0)) if len(projection["predictions"]) > 1 else 0.0
                                             }
                             except Exception as e:
-                                logger.warning(f"Error during LogitLens projection batch {i}: {e}")
+                                print(f"Error during LogitLens projection: {e}")
+                                import traceback
+                                traceback.print_exc()
                             
                             # Force cleanup after each batch
                             gc.collect()
@@ -560,54 +588,21 @@ class SemanticTracingWorkflow(GenerationMixin):
                         "token_id": token_id,
                         "token_type": token_type,
                         "is_target": is_target,
-                        "source_idx": token_idx,  # For compatibility
-                        "target_idx": token_idx if is_target else -1,  # For compatibility
+                        "source_idx": token_idx,
+                        "target_idx": token_idx if is_target else -1,
                         "source_for_targets": ",".join(map(str, source_for_targets)),
                         "sources_indices": ",".join(map(str, sources_indices)),
                         "sources_weights": ",".join(map(str, sources_weights)),
                         "weight": current_targets.get(token_idx, 0.0) if is_target else 0.0,
-                        "raw_score": 0.0,  # Default for consistency
+                        "raw_score": 0.0,
                         "mode": mode.value,
                         "type": token_type
                     }
-                    
-                    # Add source-specific data if this token is a source
-                    if source_for_targets:
-                        # Find any source record for this token
-                        for target_idx in source_for_targets:
-                            source_record = next((s for s in sources_by_target[target_idx] if s["index"] == token_idx), None)
-                            if source_record:
-                                record["weight"] = source_record["weight"]
-                                record["raw_score"] = source_record["raw_score"]
-                                break
-                    
-                    # Add LogitLens projection data if available
-                    if ll_projections and token_idx in ll_projections:
-                        ll_data = ll_projections[token_idx]
-                        record.update({
-                            "predicted_top_token": ll_data.get("top1_token", ""),
-                            "predicted_top_prob": ll_data.get("top1_prob", 0.0),
-                            "ll_top1_token": ll_data.get("top1_token", ""),
-                            "ll_top1_prob": ll_data.get("top1_prob", 0.0),
-                            "ll_top1_logit": ll_data.get("top1_logit", 0.0),
-                            "ll_top2_token": ll_data.get("top2_token", ""),
-                            "ll_top2_prob": ll_data.get("top2_prob", 0.0)
-                        })
-                    else:
-                        # Add empty fields for consistency
-                        record.update({
-                            "predicted_top_token": "",
-                            "predicted_top_prob": 0.0,
-                            "ll_top1_token": "",
-                            "ll_top1_prob": 0.0,
-                            "ll_top1_logit": 0.0,
-                            "ll_top2_token": "",
-                            "ll_top2_prob": 0.0
-                        })
-                    
-                    # Append to records
+
+                    self._process_logit_lens_projections(token_idx, record, ll_projections)
+
                     self.records_by_mode[mode].append(record)
-                
+                                    
                 # Update targets for next layer - use selection strategy to control growth
                 current_targets = {s["index"]: s["weight"] for s in sources}
                 current_targets = SelectionStrategy.renormalize(current_targets, self.config, apply_layer_prune=True)
@@ -642,7 +637,7 @@ class SemanticTracingWorkflow(GenerationMixin):
                         "mode": mode.value, 
                         "tracing_mode": mode.value,
                         "target_tokens": target_tokens,
-                        "logit_lens_concepts": getattr(self.logit_backend, "concepts", []),
+                        "logit_lens_concepts": self.logit_lens_concepts,
                         "image_available": "original_image" in input_data,
                         "feature_mapping": input_data.get("feature_mapping", {})
                     }
@@ -671,7 +666,7 @@ class SemanticTracingWorkflow(GenerationMixin):
             "tracing_mode": mode.value,
             "target_tokens": target_tokens,
             "num_layers": len(self.layer_names),
-            "logit_lens_concepts": getattr(self.logit_backend, "concepts", []),
+            "logit_lens_concepts": self.logit_lens_concepts,
             "image_available": "original_image" in input_data,
             "feature_mapping": input_data.get("feature_mapping", {})
         }
@@ -979,3 +974,126 @@ class SemanticTracingWorkflow(GenerationMixin):
             import traceback
             traceback.print_exc()
             return []
+
+    def _process_logit_lens_projections(self, token_idx: int, record: Dict[str, Any], ll_projections: Dict[int, Dict[str, Any]]) -> None:
+        """
+        Process and add LogitLens projection data to a record with dynamic concept handling.
+        
+        This function adds LogitLens projection data to a trace record, ensuring compatibility
+        with both old and new field naming conventions. It also dynamically identifies concepts
+        from configured sources rather than hardcoding them.
+        
+        Args:
+            token_idx: The token index for which to add projections
+            record: The record to update with projection data
+            ll_projections: Dictionary mapping token indices to projection data
+        """
+        if ll_projections and token_idx in ll_projections:
+            ll_data = ll_projections[token_idx]
+            logger.debug(f"Processing LogitLens data for token {token_idx}: '{ll_data.get('top1_token', '')}'")
+            
+            # Add to record - ensuring we include BOTH old and new field names for compatibility
+            record.update({
+                # Original field names from old version
+                "predicted_top_token": ll_data.get("top1_token", ""),
+                "predicted_top_prob": float(ll_data.get("top1_prob", 0.0)),
+                
+                # New field names in new version
+                "ll_top1_token": ll_data.get("top1_token", ""),
+                "ll_top1_prob": float(ll_data.get("top1_prob", 0.0)),
+                "ll_top1_logit": float(ll_data.get("top1_logit", 0.0)),
+                "ll_top2_token": ll_data.get("top2_token", ""),
+                "ll_top2_prob": float(ll_data.get("top2_prob", 0.0))
+            })
+            
+            # Extract token texts for concept matching
+            top_token = ll_data.get("top1_token", "").lower()
+            second_token = ll_data.get("top2_token", "").lower()
+            top_prob = float(ll_data.get("top1_prob", 0.0))
+            second_prob = float(ll_data.get("top2_prob", 0.0))
+            
+            # Get tracked concepts from available sources (in order of priority)
+            tracked_concepts = []
+            
+            # 1. Try to get concepts from the logit lens backend
+            if hasattr(self, "logit_backend") and self.logit_backend is not None:
+                if hasattr(self.logit_backend, "concepts"):
+                    tracked_concepts = self.logit_backend.concepts
+                    logger.debug(f"Using {len(tracked_concepts)} concepts from logit_backend")
+            
+            # 2. Fall back to class-level concepts if available
+            if not tracked_concepts and hasattr(self, "logit_lens_concepts"):
+                tracked_concepts = self.logit_lens_concepts
+                logger.debug(f"Using {len(tracked_concepts)} class-level concepts")
+            
+            # 3. If we have metadata with concepts, use those
+            if not tracked_concepts:
+                try:
+                    metadata_concepts = next((meta.get("logit_lens_concepts", []) 
+                                            for meta in getattr(self, "metadata", {}).values()
+                                            if isinstance(meta, dict) and "logit_lens_concepts" in meta), [])
+                    if metadata_concepts:
+                        tracked_concepts = metadata_concepts
+                        logger.debug(f"Using {len(tracked_concepts)} concepts from metadata")
+                except Exception as e:
+                    logger.debug(f"Error getting concepts from metadata: {e}")
+            
+            # If no concepts defined, use default set for backward compatibility
+            if not tracked_concepts:
+                default_concepts = ["cat", "dog", "person", "building", "water", "sky", "car", 
+                                "eiffel", "tower", "paris", "france", "seine", "river", "landmark", "bridge"]
+                tracked_concepts = default_concepts
+                logger.debug(f"Using {len(tracked_concepts)} default concepts")
+            
+            # Process each concept and add to record
+            for concept in tracked_concepts:
+                concept_lower = concept.lower()
+                field_name = f"concept_{concept}_prob"
+                
+                # Some concepts might have uppercase first letter in field names (for backward compatibility)
+                if concept in ["eiffel", "tower", "paris", "france", "seine"]:
+                    field_name = f"concept_{concept.capitalize()}_prob"
+                
+                # Check if this concept appears in either top token
+                if concept_lower in top_token:
+                    record[field_name] = top_prob
+                    logger.debug(f"Found concept '{concept}' in top token")
+                elif concept_lower in second_token:
+                    record[field_name] = second_prob
+                    logger.debug(f"Found concept '{concept}' in second token")
+        else:
+            # Add empty fields for consistency
+            record.update({
+                "predicted_top_token": "",
+                "predicted_top_prob": 0.0,
+                "ll_top1_token": "",
+                "ll_top1_prob": 0.0,
+                "ll_top1_logit": 0.0,
+                "ll_top2_token": "",
+                "ll_top2_prob": 0.0
+            })
+            
+            if ll_projections and token_idx not in ll_projections:
+                logger.debug(f"Token {token_idx} not found in LogitLens projections")
+            elif not ll_projections:
+                logger.debug(f"No LogitLens projections available for token {token_idx}")
+
+    def set_logit_lens_concepts(self, concepts: List[str]) -> None:
+        """
+        Set the concepts to track in LogitLens projections.
+        
+        This method configures which concepts should be looked for in token projections.
+        These concepts will be used to create fields like 'concept_X_prob' in trace records.
+        
+        Args:
+            concepts: List of concept strings to track
+        """
+        # Store at the class level for fallback
+        self.logit_lens_concepts = concepts
+        
+        # Also set in the LogitLens backend if available
+        if hasattr(self, "logit_backend") and self.logit_backend is not None:
+            self.logit_backend.concepts = concepts
+            logger.info(f"Set {len(concepts)} concepts to track in LogitLens backend")
+        else:
+            logger.warning("LogitLens backend not available, concepts stored at workflow level only")

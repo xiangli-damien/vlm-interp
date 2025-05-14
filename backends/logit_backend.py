@@ -29,7 +29,7 @@ class LogitBackend:
     Projects hidden states through the LM head to analyze token predictions.
     """
     
-    def __init__(self, model: torch.nn.Module, cache: TracingCache, device: torch.device):
+    def __init__(self, model: torch.nn.Module, cache: TracingCache, device: torch.device, concepts: Optional[List[str]] = None):
         """
         Initialize the Logit Lens backend with appropriate dtype handling.
         
@@ -42,6 +42,13 @@ class LogitBackend:
         self.cache = cache
         self.device = device
         
+        # Default concepts to track (can be overridden)
+        self.concepts = concepts or [
+            "France"
+        ]
+        
+        logger.info(f"Initializing LogitBackend with concepts: {self.concepts}")
+
         # Get model dtype for consistent projection
         self.model_dtype = next(model.parameters()).dtype
         logger.info(f"Model using dtype: {self.model_dtype}")
@@ -233,11 +240,12 @@ class LogitBackend:
         
         return results
         
+    # In your LogitBackend class
     def project_token(self, 
                     layer_idx: int, 
                     token_idx: int, 
                     tokenizer=None, 
-                    top_k: int = 5) -> Dict[str, Any]:
+                    top_k: int = 3) -> Dict[str, Any]:
         """
         Project a single token through the LM head and return detailed prediction info.
         
@@ -251,12 +259,21 @@ class LogitBackend:
             Dictionary with token projection results
         """
         if self.lm_head is None:
-            logger.error("LM head not available for LogitBackend.project_token")
+            print("LM head not available for LogitBackend.project_token")
             return {}
+        
+        # Create token decoder if possible
+        token_decoder = None
+        if tokenizer is not None:
+            try:
+                from runtime.decode import TokenDecoder
+                token_decoder = TokenDecoder(tokenizer)
+            except ImportError:
+                pass
         
         # Check if we have the hidden states for this layer
         if not self.cache.has(layer_idx, "hidden"):
-            logger.warning(f"Hidden states for layer {layer_idx} not in cache")
+            print(f"Hidden states for layer {layer_idx} not in cache")
             return {}
             
         # Get the hidden states for this layer
@@ -264,7 +281,7 @@ class LogitBackend:
         
         # Check if token_idx is valid
         if token_idx >= hidden_states.shape[1]:
-            logger.warning(f"Token index {token_idx} out of bounds for hidden states of shape {hidden_states.shape}")
+            print(f"Token index {token_idx} out of bounds for hidden states of shape {hidden_states.shape}")
             return {}
             
         # Get hidden state for this token
@@ -296,16 +313,21 @@ class LogitBackend:
                 token_id = int(top_indices[batch_idx, k])
                 logit_value = float(logits_cpu[batch_idx, token_id])
                 
+                # Get token text using TokenDecoder if available
+                if token_decoder is not None:
+                    token_text = token_decoder.decode_token(token_id)
+                elif tokenizer is not None:
+                    token_text = tokenizer.decode([token_id])
+                else:
+                    token_text = f"<tok_{token_id}>"
+                    
                 pred = {
                     "token_id": token_id,
                     "prob": float(top_probs[batch_idx, k]),
                     "logit": logit_value,
-                    "rank": k + 1
+                    "rank": k + 1,
+                    "text": token_text
                 }
-                
-                # Add decoded text if tokenizer is provided
-                if tokenizer is not None:
-                    pred["text"] = tokenizer.decode([pred["token_id"]])
                     
                 result["predictions"].append(pred)
                 
