@@ -44,6 +44,10 @@ class SaveAttnHook:
         # For transformer layers, attention weights are typically the second output
         attn = out[1] if isinstance(out, tuple) and len(out) > 1 else out
         
+        # --- DEBUG LOG ---
+        print(f"[DEBUG][SaveAttnHook] saving attention for layer {self.layer_idx}")
+        print(f"[DEBUG][SaveAttnHook] attn.shape={tuple(attn.shape)}")
+        
         # Store in cache
         self.cache.set(self.layer_idx, "attn", attn)
         

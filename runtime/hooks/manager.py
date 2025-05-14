@@ -147,9 +147,13 @@ class TraceHookManager:
                     
                 # After backward pass, check for saliency results from global_sal_cache
                 # and transfer them to the main cache
+                print(f"[DEBUG][TraceHookManager] global_sal_cache keys before pop: {list(global_sal_cache._cache.keys())}")    
                 for layer_idx in list(global_sal_cache._cache.keys()):
                     sal = global_sal_cache.pop(layer_idx)
+                    print(f"[DEBUG][TraceHookManager] popped saliency for layer {layer_idx}; sal.shape={None if sal is None else tuple(sal.shape)}")
                     if sal is not None:
                         self.cache.set(layer_idx, "saliency", sal)
+                        print(f"[DEBUG][TraceHookManager] saved saliency to cache for layer {layer_idx}")
+                print(f"[DEBUG][TraceHookManager] global_sal_cache keys after pop: {list(global_sal_cache._cache.keys())}")
         
         return outputs
