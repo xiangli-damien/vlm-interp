@@ -26,7 +26,7 @@ from tqdm import tqdm
 from PIL import Image
 
 from preprocess.input_builder import prepare_inputs
-from runtime.hooks import TraceHookManager
+from runtime.hooks.manager import TraceHookManager
 from runtime.cache import TracingCache
 from backends.logit_backend import LogitBackend
 from runtime.model_utils import get_llm_attention_layer_names, load_model, get_module_by_name

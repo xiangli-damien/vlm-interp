@@ -1,5 +1,5 @@
 """
-Unified hook management system for model interpretation and tracing.
+Main hook management system for model interpretation and tracing.
 """
 
 import torch
@@ -14,8 +14,6 @@ from runtime.model_utils import get_module_by_name, get_llm_attention_layer_name
 # Configure logging
 logger = logging.getLogger("hook_manager")
 logger.setLevel(logging.INFO)
-
-
 
 class TraceHookManager:
     """
@@ -72,9 +70,6 @@ class TraceHookManager:
         
         if self._compiling:
             logger.warning("Hooks may be ignored during torch.compile. Consider using eager mode for tracing.")
-            
-        #for p in self.model.parameters():
-        #    p.requires_grad_(False)
     
     def add_layer(self, layer_name: str, capture: Union[List[str], Tuple[str, ...]] = ("attention", "grad"), 
                  alias: Optional[str] = None, layer_idx: Optional[int] = None) -> bool:
@@ -316,8 +311,6 @@ class TraceHookManager:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-
     
     def _assign_missing_indices(self) -> None:
         """
@@ -393,7 +386,7 @@ class TraceHookManager:
     
     def compute_saliency(self) -> Dict[Union[int, str], torch.Tensor]:
         """
-        Convert every *(attention, gradient)* pair still present in the cache
+        Convert every *(attention, gradient)* pair still present in the cache
         into a *saliency tensor* and *immediately* discard the source tensors.
 
         This method is idempotent and can be called multiple times; layers that
@@ -465,109 +458,55 @@ class TraceHookManager:
         Returns:
             Hook function
         """
-        def hook_fn(module: nn.Module, inputs: Tuple[torch.Tensor, ...], outputs: Any) -> None:
+        def hook_fn(module: nn.Module, inputs: Tuple[torch.Tensor, ...], outputs: Any) -> Any:
             info = self._layer_info[layer_name]
             layer_idx = info.get("index")
             
             # Skip if no layer index
             if layer_idx is None:
-                return
+                return outputs
                 
-            # Process hidden state if requested
-            if "hidden" in capture:
-                hidden_state = None
-                
-                # Try to find hidden state in output
-                if isinstance(outputs, torch.Tensor):
-                    hidden_state = outputs
-                elif isinstance(outputs, tuple) and len(outputs) > 0:
-                    if isinstance(outputs[0], torch.Tensor):
-                        hidden_state = outputs[0]
-                        
-                # Store hidden state if found - ALWAYS DETACH AND MOVE TO CPU for memory efficiency
-                if hidden_state is not None:
-                    # Immediately detach and move to CPU regardless of setting
-                    cpu_hidden = hidden_state.detach().to(torch.float16).cpu()
-                    self.cache.set(layer_idx, "hidden", cpu_hidden, detach=False)
+            # Extract hidden state and attention for consistent handling
+            hidden_state = None
+            attn_weights = None
             
-            # Process attention weights if requested
-            if "attention" in capture or "grad" in capture:
-                attn_weights = None
-                
-                # Try to find attention weights in output
-                if isinstance(outputs, tuple) and len(outputs) > 1:
-                    # Pattern 1: (hidden_state, attention_weights, ...)
-                    if (isinstance(outputs[1], torch.Tensor) and 
-                        len(outputs[1].shape) == 4 and 
-                        outputs[1].shape[-1] == outputs[1].shape[-2]):
-                        attn_weights = outputs[1]
-                    # Pattern 2: (hidden_state, present_key_value, attention_weights, ...)
-                    elif (len(outputs) > 2 and 
-                        isinstance(outputs[2], torch.Tensor) and 
-                        len(outputs[2].shape) == 4 and 
-                        outputs[2].shape[-1] == outputs[2].shape[-2]):
-                        attn_weights = outputs[2]
-                
-                # Store attention weights if found
-                if attn_weights is not None:
-                    # MEMORY OPTIMIZATION: Always detach and move to CPU immediately
-                    cpu_attn = attn_weights.detach().to(torch.float16).cpu()
+            # Try to find hidden state in output
+            if isinstance(outputs, torch.Tensor):
+                hidden_state = outputs
+            elif isinstance(outputs, tuple) and len(outputs) > 0:
+                if isinstance(outputs[0], torch.Tensor):
+                    hidden_state = outputs[0]
                     
-                    # Always store attention weights in the cache
-                    self.cache.set(layer_idx, "attention", cpu_attn, detach=False)
+            # Try to find attention weights
+            if isinstance(outputs, tuple) and len(outputs) > 1:
+                # Pattern 1: (hidden_state, attention_weights, ...)
+                if (isinstance(outputs[1], torch.Tensor) and 
+                    len(outputs[1].shape) == 4 and 
+                    outputs[1].shape[-1] == outputs[1].shape[-2]):
+                    attn_weights = outputs[1]
+                # Pattern 2: (hidden_state, present_key_value, attention_weights, ...)
+                elif (len(outputs) > 2 and 
+                    isinstance(outputs[2], torch.Tensor) and 
+                    len(outputs[2].shape) == 4 and 
+                    outputs[2].shape[-1] == outputs[2].shape[-2]):
+                    attn_weights = outputs[2]
                     
-                    # Check if we can compute gradients for this tensor
-                    if "grad" in capture:
-                        if attn_weights.requires_grad:
-                            # Save a reference to the original tensor for gradient hooks
-                            # IMPORTANT: Consistent storage of CPU tensor in info for grad_hook
-                            info["live_attn"] = cpu_attn
-                            
-                            # Register gradient hook on the original tensor
-                            tensor_hook_key = f"{layer_name}_attn_grad"
-                            
-                            # Remove previous hook if it exists
-                            if tensor_hook_key in self._tensor_hooks:
-                                self._tensor_hooks[tensor_hook_key].remove()
-                            
-                            # Define gradient capture function with immediate saliency computation
-                            def grad_hook(grad: torch.Tensor) -> None:
-                                # Compute saliency immediately on CPU to save GPU memory
-                                if "live_attn" in info:
-                                    attn = info["live_attn"]
-                                    
-                                    # Move gradient to CPU immediately
-                                    cpu_grad = grad.detach().to(torch.float16).cpu()
-                                    
-                                    # Compute saliency on CPU
-                                    saliency = torch.abs(attn * cpu_grad)
-                                    
-                                    # Store the saliency score (already on CPU in float16)
-                                    self.cache.set(layer_idx, "saliency", saliency, detach=False)
-                                    
-                                    # Also store grad for fallback scenarios
-                                    self.cache.set(layer_idx, "grad", cpu_grad, detach=False)
-                                    
-                                    # Clean up immediately to save memory
-                                    del cpu_grad
-                                    # NOTE: Don't remove live_attn here - other grad hooks might need it
-                                    # We'll clean it in clear() instead
-                                else:
-                                    # Fallback: store gradient separately on CPU
-                                    cpu_grad = grad.detach().to(torch.float16).cpu()
-                                    self.cache.set(layer_idx, "grad", cpu_grad, detach=False)
-                                    del cpu_grad
-                            
-                            # Register the hook
-                            handle = attn_weights.register_hook(grad_hook)
-                            self._tensor_hooks[tensor_hook_key] = handle
-                        else:
-                            # If attention weights don't require grad, still create saliency directly
-                            # using just attention weights as fallback
-                            logger.warning(f"Layer {layer_idx}: Attention weights don't require grad, using attention as fallback")
-                            saliency = cpu_attn.abs()
-                            self.cache.set(layer_idx, "saliency", saliency, detach=False)
-                            
+            # IMPORTANT FIX: Process hidden state BEFORE attention processing
+            # This ensures hidden state is captured even when LightAttnHook is used
+            if "hidden" in capture and hidden_state is not None:
+                # Immediately detach and move to CPU for memory efficiency
+                cpu_hidden = hidden_state.detach().to(torch.float16).cpu()
+                self.cache.set(layer_idx, "hidden", cpu_hidden, detach=False)
+            
+            # Process attention weights if needed and found
+            if ("attention" in capture or "grad" in capture) and attn_weights is not None:
+                # Use the LightAttnHook for efficient attention gradient processing
+                from runtime.hooks import LightAttnHook
+                return LightAttnHook(layer_idx)(module, inputs, outputs)
+                    
+            # Return outputs unchanged if no attention processing happened
+            return outputs
+                
         return hook_fn
 
     def _register_hooks(self):
@@ -607,5 +546,3 @@ class TraceHookManager:
         # Install hooks
         num_installed = self.hooks.install()
         logger.info(f"Installed {num_installed} hooks on language model layers")
-
-    

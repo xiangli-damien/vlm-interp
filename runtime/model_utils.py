@@ -287,3 +287,38 @@ def get_llm_attention_layer_names(model: nn.Module) -> List[str]:
         print(f"Found {len(attention_layer_names)} potential attention layer names in the language model.")
 
     return attention_layer_names
+
+
+def freeze_non_attention_params(model):
+    """
+    Freeze all parameters except attention-related ones to save memory.
+    
+    Args:
+        model: The model to freeze parameters for
+    """
+    frozen_count = 0
+    total_count = 0
+    
+    for name, param in model.named_parameters():
+        total_count += 1
+        # Only keep attention parameters for gradient computation
+        if ".attn." not in name:  # Ensure qkv/out proj can still compute gradients
+            param.requires_grad_(False)
+            frozen_count += 1
+    
+    print(f"Frozen {frozen_count}/{total_count} parameters ({frozen_count/total_count:.1%}) to save memory")
+    
+    # Disable KV-cache to reduce memory usage
+    if hasattr(model, 'config'):
+        model.config.use_cache = False
+        print("Disabled KV-cache to save memory")
+        
+    # Disable flash attention if present in LLaMA models
+    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+        flash_disabled = 0
+        for block in model.model.layers:
+            if hasattr(block, 'self_attn') and hasattr(block.self_attn, '_flash_attn_'):
+                block.self_attn._flash_attn_ = False
+                flash_disabled += 1
+        if flash_disabled > 0:
+            print(f"Disabled flash attention in {flash_disabled} layers to ensure proper attention weight calculation")

@@ -263,3 +263,38 @@ class TracingCache:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+class GlobalSaliencyCache:
+    """
+    Global cache for storing saliency tensors computed during backward pass.
+    This cache allows communication between autograd functions and model code.
+    """
+    def __init__(self):
+        """Initialize an empty saliency cache."""
+        self.sal = {}
+        
+    def store(self, idx, tensor):
+        """
+        Store a saliency tensor for a specific layer.
+        
+        Args:
+            idx: Layer index key
+            tensor: Saliency tensor to store
+        """
+        self.sal[idx] = tensor
+        
+    def pop(self, idx):
+        """
+        Remove and return a saliency tensor if it exists.
+        
+        Args:
+            idx: Layer index key
+            
+        Returns:
+            The saliency tensor or None if not found
+        """
+        return self.sal.pop(idx, None)
+
+# Global instance for sharing between components
+global_saliency_cache = GlobalSaliencyCache()

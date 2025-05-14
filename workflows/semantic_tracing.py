@@ -42,78 +42,53 @@ class SourceMerger:
     """Utility class for merging sources from different backends."""
     
     @staticmethod
-    def merge_sources(attention_sources: List[Dict[str, Any]], 
-                     saliency_sources: List[Dict[str, Any]],
-                     weight_factor: float = 0.5) -> List[Dict[str, Any]]:
+    def merge(self, other_cache: 'TracingCache') -> None:
         """
-        Merge sources from attention and saliency backends.
+        Merge another cache into this one, keeping only the highest priority data.
         
         Args:
-            attention_sources: List of source dictionaries from attention backend
-            saliency_sources: List of source dictionaries from saliency backend
-            weight_factor: Weight factor for combining scores (0.5 means equal weight)
-            
-        Returns:
-            List of merged source dictionaries
+            other_cache: Another TracingCache instance to merge from
         """
-        # Create index map for quick lookup
-        attention_map = {src["index"]: src for src in attention_sources}
-        saliency_map = {src["index"]: src for src in saliency_sources}
+        # Merge all cache types in priority order: saliency > grad > attention > hidden
+        # Process each layer index
+        all_layer_indices = set(
+            list(self.saliency.keys()) + 
+            list(self.grad.keys()) + 
+            list(self.attention.keys()) + 
+            list(self.hidden_states.keys()) +
+            list(other_cache.saliency.keys()) + 
+            list(other_cache.grad.keys()) + 
+            list(other_cache.attention.keys()) + 
+            list(other_cache.hidden_states.keys())
+        )
         
-        # Find all unique indices
-        all_indices = set(attention_map.keys()) | set(saliency_map.keys())
-        
-        # Merge sources
-        merged_sources = []
-        
-        for idx in all_indices:
-            attn_src = attention_map.get(idx)
-            saliency_src = saliency_map.get(idx)
-            
-            if attn_src and saliency_src:
-                # Both backends have this source - use the provided weight factor
-                merge_weight = weight_factor
-            elif attn_src:
-                # Only attention backend has this source
-                merge_weight = 0.0
+        for layer_idx in all_layer_indices:
+            # Priority 1: Saliency (pre-computed result)
+            if other_cache.has(layer_idx, "saliency"):
+                self.set(layer_idx, "saliency", other_cache.get(layer_idx, "saliency"), detach=False)
+                # Since we have saliency, we don't need attention or grad tensors
+                self.clear_single(layer_idx, "attention")
+                self.clear_single(layer_idx, "grad")
             else:
-                # Only saliency backend has this source
-                merge_weight = 1.0
+                # Priority 2 & 3: Grad and Attention (needed for computing saliency)
+                if other_cache.has(layer_idx, "grad"):
+                    self.set(layer_idx, "grad", other_cache.get(layer_idx, "grad"), detach=False)
+                if other_cache.has(layer_idx, "attention"):
+                    self.set(layer_idx, "attention", other_cache.get(layer_idx, "attention"), detach=False)
                 
-            # Create merged source
-            if attn_src and saliency_src:
-                # Combine weights with the specified factor
-                weight = (1 - merge_weight) * attn_src["weight"] + merge_weight * saliency_src["weight"]
-                raw_score = (1 - merge_weight) * attn_src["raw_score"] + merge_weight * saliency_src["raw_score"]
+                # Priority 4: Hidden states (only keep if not already present)
+                if not self.has(layer_idx, "hidden") and other_cache.has(layer_idx, "hidden"):
+                    self.set(layer_idx, "hidden", other_cache.get(layer_idx, "hidden"), detach=False)
+        
+        # Merge custom objects
+        for tag, obj in other_cache.custom.items():
+            if tag not in self.custom:
+                self.custom[tag] = obj
                 
-                merged_src = {
-                    "index": idx,
-                    "weight": weight,
-                    "raw_score": raw_score,
-                    "target": attn_src.get("target", saliency_src.get("target")),
-                    "type": attn_src.get("type", saliency_src.get("type", "unknown")),
-                    "attn_weight": attn_src["weight"],
-                    "saliency_weight": saliency_src["weight"],
-                    "attn_score": attn_src["raw_score"],
-                    "saliency_score": saliency_src["raw_score"],
-                    "merge_weight": merge_weight
-                }
-            elif attn_src:
-                # Only attention backend has this source
-                merged_src = dict(attn_src)
-                merged_src["merge_weight"] = merge_weight
-                merged_src["saliency_weight"] = 0.0
-                merged_src["saliency_score"] = 0.0
-            else:
-                # Only saliency backend has this source
-                merged_src = dict(saliency_src)
-                merged_src["merge_weight"] = merge_weight
-                merged_src["attn_weight"] = 0.0
-                merged_src["attn_score"] = 0.0
-                
-            merged_sources.append(merged_src)
-            
-        return merged_sources
+        # Merge gradient missing flags
+        for idx, missing in other_cache.grad_missing.items():
+            if idx not in self.grad_missing:
+                self.grad_missing[idx] = missing
 
 class SemanticTracingWorkflow(GenerationMixin):
     """
