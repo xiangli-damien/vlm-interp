@@ -132,10 +132,12 @@ class TraceHookManager:
         # Reset grad if doing backward pass
         if loss_fn is not None:
             self.model.zero_grad(set_to_none=True)
-        
-        # Forward pass
+
+        # Always ask the model to return attention maps
+        inputs_ = {**inputs, "output_attentions": True}
+
         with torch.set_grad_enabled(loss_fn is not None):
-            outputs = self.model(**inputs)
+            outputs = self.model(**inputs_)
             
             # Backward pass if loss function provided
             if loss_fn is not None:
