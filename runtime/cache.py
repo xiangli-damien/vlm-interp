@@ -164,6 +164,7 @@ class TracingCache:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+# runtime/cache.py (just add/update the _GlobalSalCache class)
 
 class _GlobalSalCache:
     """
@@ -183,7 +184,14 @@ class _GlobalSalCache:
             layer: Layer index
             sal: Saliency tensor (|attention * gradient|)
         """
-        self._cache[layer] = sal.detach().to(torch.float16).cpu()
+        # Make sure we store a detached copy to avoid memory leaks
+        # Use float32 for numerical stability
+        if sal.requires_grad:
+            sal = sal.detach()
+            
+        # Store with CPU offloading for memory efficiency
+        self._cache[layer] = sal.to(torch.float32).cpu()
+        print(f"[DEBUG][GlobalSalCache] Stored saliency for layer {layer}, shape: {tuple(sal.shape)}")
     
     def pop(self, layer: int) -> Optional[torch.Tensor]:
         """
@@ -195,8 +203,11 @@ class _GlobalSalCache:
         Returns:
             The cached saliency tensor, or None if not found
         """
-        return self._cache.pop(layer, None)
-
+        if layer in self._cache:
+            result = self._cache.pop(layer)
+            print(f"[DEBUG][GlobalSalCache] Popped saliency for layer {layer}")
+            return result
+        return None
 
 # Global singleton instance
 global_sal_cache = _GlobalSalCache()

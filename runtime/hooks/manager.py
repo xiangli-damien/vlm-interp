@@ -79,9 +79,21 @@ class TraceHookManager:
                 self.layer_hooks[layer_name][cap_type] = True
             
             elif cap_type == "grad":
+                # For capturing gradients, use GradAttnHook
                 hook = GradAttnHook(layer_idx)
                 handle = module.register_forward_hook(hook)
                 self.hooks.append(handle)
+                
+                # Also add a backward hook to catch gradients directly
+                def grad_hook(module, grad_input, grad_output):
+                    if len(grad_output) > 0 and grad_output[0] is not None:
+                        # Store the gradient directly in the cache
+                        self.cache.set(layer_idx, "grad", grad_output[0])
+                
+                # Register backward hook
+                b_handle = module.register_full_backward_hook(grad_hook)
+                self.hooks.append(b_handle)
+                
                 self.layer_hooks[layer_name][cap_type] = True
                 
             elif cap_type == "hidden":
@@ -135,8 +147,10 @@ class TraceHookManager:
 
         # Always ask the model to return attention maps
         inputs_ = {**inputs, "output_attentions": True}
-
+        
+        # Ensure we're tracking gradients if we have a loss function
         with torch.set_grad_enabled(loss_fn is not None):
+            # Run forward pass
             outputs = self.model(**inputs_)
             
             # Backward pass if loss function provided
@@ -144,6 +158,8 @@ class TraceHookManager:
                 loss = loss_fn(outputs)
                 if loss.requires_grad:
                     loss.backward()
+                else:
+                    print("[WARNING] Loss doesn't require gradients, skipping backward pass")
                     
                 # After backward pass, check for saliency results from global_sal_cache
                 # and transfer them to the main cache

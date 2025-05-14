@@ -1,7 +1,7 @@
+# runtime/hooks/light_grad.py
 """
 Lightweight gradient hooks for efficient saliency computation.
-Implements custom autograd Function to calculate |attention * gradient|
-during backward pass without retaining the full computation graph.
+Implements custom autograd Function to calculate |attention * gradient| during backward pass.
 """
 
 import torch
@@ -11,7 +11,6 @@ from typing import Any, Tuple, Dict, Optional, List
 # Import the global saliency cache
 from runtime.cache import global_sal_cache
 
-
 class LightAttnFn(torch.autograd.Function):
     """
     Custom autograd function for efficient saliency computation.
@@ -19,56 +18,60 @@ class LightAttnFn(torch.autograd.Function):
     """
     
     @staticmethod
-    def forward(ctx, attn):
+    def forward(ctx, attn, layer_idx):
         """
         Forward pass - simply passes through the attention tensor.
         
         Args:
             ctx: Context for storing information for backward pass
             attn: Attention tensor
+            layer_idx: Index of current layer
             
         Returns:
             The unmodified attention tensor
         """
         ctx.save_for_backward(attn)
-        ctx.layer = getattr(attn, 'layer_idx', -1)
+        ctx.layer_idx = layer_idx
+        # Important: We need to ensure the same tensor is returned
+        # to maintain the computational graph
         return attn
     
     @staticmethod
-    def backward(ctx, grad):
+    def backward(ctx, grad_output):
         """
         Backward pass - computes saliency score and stores in global cache.
         
         Args:
             ctx: Context containing saved tensors
-            grad: Gradient tensor
+            grad_output: Gradient tensor
             
         Returns:
             The input gradient tensor (unchanged for regular backprop)
         """
-        print(f"[DEBUG][LightAttnFn] backward called for layer {ctx.layer}; grad.shape={tuple(grad.shape)}")
         attn, = ctx.saved_tensors
-
-        # --- DEBUG LOG ---
-        print(f"[DEBUG][LightAttnFn] computing saliency for layer {ctx.layer}; attn.shape={tuple(attn.shape)}")
+        layer_idx = ctx.layer_idx
+        
+        print(f"[DEBUG][LightAttnFn] backward called for layer {layer_idx}; grad.shape={tuple(grad_output.shape)}")
+        
         # Compute saliency score |attention * gradient|
-        sal = (attn * grad).abs()
-        if sal.dim() >= 4:  # [batch, head, seq, seq]
+        sal = (attn * grad_output).abs()
+        
+        # Average over batch and head dimensions if present
+        if sal.dim() == 4:  # [batch, head, seq, seq]
             sal = sal.mean((0, 1))
         elif sal.dim() == 3:  # [batch, seq, seq] or [head, seq, seq]
             sal = sal.mean(0)
         
-        # --- DEBUG LOG ---
-        print(f"[DEBUG][LightAttnFn] computed saliency for layer {ctx.layer}; sal.shape={tuple(sal.shape)}")
+        print(f"[DEBUG][LightAttnFn] computed saliency for layer {layer_idx}; sal.shape={tuple(sal.shape)}")
         
         # Store in global cache
-        if ctx.layer != -1:
-            print(f"[DEBUG][LightAttnFn] storing saliency for layer {ctx.layer}; sal.shape={tuple(sal.shape)}")
-            # Convert to float16 and move to CPU to save memory
-            global_sal_cache.store(ctx.layer, sal)
+        if layer_idx != -1:
+            print(f"[DEBUG][LightAttnFn] storing saliency for layer {layer_idx}; sal.shape={tuple(sal.shape)}")
+            # Store the saliency map in global cache
+            global_sal_cache.store(layer_idx, sal)
         
-        return grad
-
+        # Return gradient unchanged - this is critical for proper backprop
+        return grad_output, None  # Also return None for the layer_idx gradient
 
 class GradAttnHook:
     """
@@ -97,20 +100,31 @@ class GradAttnHook:
             Modified output with wrapped attention tensor
         """
         # Extract attention weights from output
-        # For LLaVA-Next, attention is typically the second element in a tuple
-        if isinstance(out, tuple):
-            attn = out[1] if len(out) > 1 else out[0]
+        if not isinstance(out, tuple) or len(out) <= 1:
+            print(f"[WARNING][GradAttnHook] Unexpected output structure for layer {self.layer_idx}: {type(out)}")
+            return out
+        
+        attn_idx = 1  # Typically attention maps are the second element in output tuple
+        
+        if len(out) <= attn_idx:
+            print(f"[WARNING][GradAttnHook] Output tuple too short for layer {self.layer_idx}: {len(out)}")
+            return out
+        
+        attn = out[attn_idx]
+        if not torch.is_tensor(attn):
+            print(f"[WARNING][GradAttnHook] Expected attention tensor, got {type(attn)}")
+            return out
+        
+        # Only apply the function if we can compute gradients
+        if attn.requires_grad:
+            print(f"[DEBUG][GradAttnHook] Wrapping attention for layer {self.layer_idx}")
+            # Wrap with custom autograd function, explicitly passing layer_idx
+            wrapped_attn = LightAttnFn.apply(attn, self.layer_idx)
+            
+            # Return with modified attention tensor
+            new_out = list(out)
+            new_out[attn_idx] = wrapped_attn
+            return tuple(new_out)
         else:
-            attn = out
-        
-        # Add layer index attribute to attention tensor for backward reference
-        attn.layer_idx = self.layer_idx
-        
-        # Apply custom autograd function
-        wrapped = LightAttnFn.apply(attn)
-        
-        # Return with same structure as input
-        if isinstance(out, tuple):
-            return (out[0], wrapped, *out[2:])
-        
-        return wrapped
+            print(f"[WARNING][GradAttnHook] Attention tensor doesn't require gradients for layer {self.layer_idx}")
+            return out
