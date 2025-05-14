@@ -70,7 +70,6 @@ class SaliencyBackend(BaseBackend):
             layer_idx=layer_idx,
         )
         
-        # Define loss function for backward pass
         def loss_fn(outputs):
             print(f"[DEBUG][SaliencyBackend] loss_fn called for layer {layer_idx}")
             logits = outputs.logits
@@ -85,19 +84,23 @@ class SaliencyBackend(BaseBackend):
             # Get input IDs
             ids = self.last_inputs["input_ids"][0]
             
-            # Compute loss for target tokens
-            loss = 0
-            for t in target_indices:
-                # Skip tokens at position 0 (no previous prediction)
-                if t > 0:
-                    # Get probability of predicting token t given context up to t-1
-                    loss = loss - log_probs[0, t-1, ids[t]]
+            # Initialize loss as a tensor from the beginning
+            # Create a dummy tensor with requires_grad=True for the case where no targets contribute
+            dummy_tensor = torch.zeros(1, device=logits.device, dtype=logits.dtype, requires_grad=True)
             
-            if loss.requires_grad:
-                print(f"[DEBUG][SaliencyBackend] loss created with gradient tracking")
+            # Find valid targets (position > 0)
+            valid_targets = [t for t in target_indices if t > 0]
+            
+            if valid_targets:
+                # Compute loss for valid target tokens
+                loss = sum(-log_probs[0, t-1, ids[t]] for t in valid_targets)
             else:
-                print(f"[WARNING][SaliencyBackend] loss doesn't have requires_grad=True!")
-                
+                # If no valid targets (e.g., only position 0), 
+                # use the dummy tensor to ensure backward pass still works
+                print(f"[WARNING][SaliencyBackend] No valid targets (t > 0) found. Using dummy loss.")
+                loss = dummy_tensor
+            
+            print(f"[DEBUG][SaliencyBackend] loss created with gradient tracking: {loss.requires_grad}")
             return loss
         
         # Install hooks and run with loss function
@@ -164,10 +167,18 @@ class SaliencyBackend(BaseBackend):
         Returns:
             List of source token records with importance weights
         """
+
+        # Validate targets - the first token (index 0) can't have meaningful sources
+        valid_targets = {k: v for k, v in targets.items() if k > 0}
+        
+        if not valid_targets:
+            print(f"[WARNING] No valid targets (index > 0) for layer {layer_idx}. Cannot trace influences.")
+            return []
+        
         # Compute saliency if not already cached
         print(f"[DEBUG][SaliencyBackend.trace_layer] entering layer {layer_idx}")
         if not self.cache.has(layer_idx, "saliency"):
-            self._compute_single_layer(layer_idx, list(targets.keys()))
+            self._compute_single_layer(layer_idx, list(valid_targets.keys()))
         
         # Get saliency scores from cache
         sal = self.cache.get(layer_idx, "saliency", self.device)

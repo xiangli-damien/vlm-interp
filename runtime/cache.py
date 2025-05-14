@@ -164,8 +164,6 @@ class TracingCache:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-# runtime/cache.py (just add/update the _GlobalSalCache class)
-
 class _GlobalSalCache:
     """
     Global singleton cache for saliency scores calculated during backward passes.
