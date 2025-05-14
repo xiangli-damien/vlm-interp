@@ -28,8 +28,15 @@ class SaliencyBackend(BaseBackend):
             inputs: Model input tensors
             target_indices: Indices of target tokens to analyze
         """
-        # Store inputs for later computation (lazy execution)
-        self.last_inputs = {k: v.detach() for k, v in inputs.items()}
+        # Strip out any KV-cache / force full forward, detach for safety
+        self.last_inputs = {
+            k: v.detach()
+            for k, v in inputs.items()
+            if k not in ("past_key_values", "use_cache")
+        }
+        # Ensure we do a full forward with attentions
+        self.last_inputs["use_cache"]       = False
+        self.last_inputs["output_attentions"] = True
     
     def _compute_single_layer(self, layer_idx: int, target_indices: List[int]) -> None:
         """
@@ -42,14 +49,9 @@ class SaliencyBackend(BaseBackend):
         # Set up hook manager
         hook_mgr = TraceHookManager(self.model, self.cache)
         
-        # Register hooks for the specific layer
-        # ► only need A·∇A 
-        #   LightAttnFn (in GradAttnHook) already keeps a reference to the
-        #   forward attention tensor and writes |A·∇A| into global_sal_cache
-        #   during backward, so storing a *detached* copy of A is wasteful.
         hook_mgr.add_layer(
             self.layer_names[layer_idx],
-            capture=("grad",),
+            capture=("grad", "attention"),
             layer_idx=layer_idx,
         )
         
