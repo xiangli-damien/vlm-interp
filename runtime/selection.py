@@ -34,8 +34,7 @@ class SelectionStrategy:
     def select_sources(scores: torch.Tensor, config: SelectionConfig) -> List[Tuple[int, float]]:
         """
         Select source tokens based on importance scores using a coverage threshold.
-        Attempts to include non-zero indices when possible, while respecting the 
-        coverage parameter.
+        Handles both positive and negative importance values by selecting based on absolute magnitude.
         
         Args:
             scores: Tensor of importance scores for source tokens
@@ -49,26 +48,32 @@ class SelectionStrategy:
         
         # Convert to numpy for easier manipulation
         if isinstance(scores, torch.Tensor):
-            values = scores.cpu().abs().numpy()  # Take absolute values for importance
+            # Take absolute values for importance-based sorting, but preserve original values
+            values = scores.cpu().abs().numpy()  
             indices = np.arange(len(values))
+            original_values = scores.cpu().numpy()
         else:
-            values = np.abs(scores)  # Support numpy input
+            # Support numpy input
+            values = np.abs(scores)  
             indices = np.arange(len(values))
-        
-        # Identify non-zero indices
-        nonzero_indices = np.where(indices > 0)[0]
+            original_values = scores
         
         # Sort by importance scores (descending)
         sorted_order = np.argsort(-values)  # Negative for descending
         sorted_values = values[sorted_order]
         sorted_indices = indices[sorted_order]
+        sorted_original = original_values[sorted_order]
         
         # Calculate cumulative coverage
         total = sorted_values.sum()
-        if total <= 0:
-            # Fallback for zero sum: return the highest value or first index
-            return [(int(sorted_indices[0]), 1.0)] if len(sorted_indices) > 0 else []
         
+        # Handle edge case: near-zero total sum
+        if total <= 1e-10:
+            # Fallback: return a limited number of tokens with equal weights
+            max_idx = min(config.min_keep, len(sorted_indices))
+            return [(int(sorted_indices[i]), 1.0/max_idx) for i in range(max_idx)]
+        
+        # Calculate cumulative sum for coverage threshold
         cumsum = np.cumsum(sorted_values) / total
         
         # Find cutoff based on coverage threshold
@@ -77,39 +82,24 @@ class SelectionStrategy:
         # Apply min/max constraints
         cutoff_idx = min(max(cutoff_idx, config.min_keep), config.max_keep, len(sorted_indices))
         
-        # Create initial selection
+        # Get selected indices and values
         selected_indices = sorted_indices[:cutoff_idx]
+        selected_original = sorted_original[:cutoff_idx]
         selected_values = sorted_values[:cutoff_idx]
         
-        # Check if we have non-zero indices in our selection
-        has_nonzero = np.any(selected_indices > 0)
-        
-        # If we don't have any non-zero indices but they exist in the data,
-        # force inclusion of the highest scoring non-zero indices
-        if not has_nonzero and len(nonzero_indices) > 0:
-            # Find highest scoring non-zero indices
-            nonzero_scores = values[nonzero_indices]
-            best_nonzero_idx = nonzero_indices[np.argmax(nonzero_scores)]
-            
-            # Include this index if not already selected
-            if best_nonzero_idx not in selected_indices:
-                # Append to selection
-                selected_indices = np.append(selected_indices, best_nonzero_idx)
-                selected_values = np.append(selected_values, values[best_nonzero_idx])
-        
-        # Re-normalize values based on selection
-        selected_sum = selected_values.sum()
-        if selected_sum > 0:
-            normalized_values = selected_values / selected_sum
+        # Renormalize to make weights sum to 1.0 
+        sum_selected = np.sum(selected_values)
+        if sum_selected > 0:
+            normalized_weights = selected_values / sum_selected
         else:
-            normalized_values = np.ones_like(selected_values) / len(selected_values)
+            normalized_weights = np.ones_like(selected_values) / len(selected_values)
         
-        # Create final list of (index, weight) tuples
+        # Create result with original signs preserved but normalized magnitude
+        # This preserves the directionality of influence while normalizing importance
         result = []
-        for idx, val, norm_val in zip(selected_indices, values[selected_indices], normalized_values):
-            # Use the original score sign but normalized magnitude
-            sign = np.sign(scores[idx]) if isinstance(scores, torch.Tensor) else np.sign(scores[idx])
-            result.append((int(idx), float(sign * norm_val)))
+        for idx, orig_val, norm_w in zip(selected_indices, selected_original, normalized_weights):
+            sign = np.sign(orig_val) if abs(orig_val) > 1e-10 else 1.0
+            result.append((int(idx), float(sign * norm_w)))
         
         return result
     
@@ -129,14 +119,14 @@ class SelectionStrategy:
             return []
             
         # Sort sources by weight
-        sorted_sources = sorted(sources, key=lambda x: x[1], reverse=True)
+        sorted_sources = sorted(sources, key=lambda x: abs(x[1]), reverse=True)
         
         # Calculate cumulative weight sum
-        weights = np.array([s[1] for s in sorted_sources])
+        weights = np.array([abs(s[1]) for s in sorted_sources])
         total_sum = weights.sum()
         
         if total_sum <= 0:
-            return sorted_sources[:1] if sorted_sources else []
+            return sorted_sources[:config.min_keep_layer] if sorted_sources else []
             
         cumsum = np.cumsum(weights) / total_sum
         
@@ -173,9 +163,9 @@ class SelectionStrategy:
                 return {}
                 
         # Renormalize remaining weights
-        total = sum(token_weights.values())
-        if total <= 0:
-            # If total is zero or negative, use uniform weights
+        total = sum(abs(w) for w in token_weights.values())
+        if total <= 1e-10:
+            # If total is zero or very small, use uniform weights
             return {idx: 1.0 / len(token_weights) for idx in token_weights}
             
         return {idx: weight / total for idx, weight in token_weights.items()}

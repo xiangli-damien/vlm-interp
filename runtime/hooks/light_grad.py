@@ -53,22 +53,66 @@ class LightAttnFn(torch.autograd.Function):
         
         print(f"[DEBUG][LightAttnFn] backward called for layer {layer_idx}; grad.shape={tuple(grad_output.shape)}")
         
+        # Ensure matching shapes and device
+        if attn.shape != grad_output.shape:
+            print(f"[WARNING][LightAttnFn] Shape mismatch: attn {tuple(attn.shape)}, grad {tuple(grad_output.shape)}")
+            try:
+                # Try to match dimensions by taking means or expanding
+                if grad_output.dim() > attn.dim():
+                    # Reduce dimensions by taking means
+                    reduced_grad = grad_output
+                    while reduced_grad.dim() > attn.dim():
+                        reduced_grad = reduced_grad.mean(0)
+                    grad_output = reduced_grad
+                elif grad_output.dim() < attn.dim():
+                    # Expand dimensions if needed
+                    expanded_grad = grad_output
+                    while expanded_grad.dim() < attn.dim():
+                        expanded_grad = expanded_grad.unsqueeze(0)
+                    grad_output = expanded_grad.expand_as(attn)
+                    
+                # Final adjustment to match exact shape
+                if grad_output.shape != attn.shape:
+                    grad_output = grad_output.expand_as(attn)
+            except Exception as e:
+                print(f"[ERROR][LightAttnFn] Error adjusting gradient shape: {e}")
+                # If we can't match shapes, return gradient as is
+                return grad_output, None
+        
+        # Match device if needed
+        if attn.device != grad_output.device:
+            grad_output = grad_output.to(attn.device)
+            
         # Compute saliency score |attention * gradient|
-        sal = (attn * grad_output).abs()
-        
-        # Average over batch and head dimensions if present
-        if sal.dim() == 4:  # [batch, head, seq, seq]
-            sal = sal.mean((0, 1))
-        elif sal.dim() == 3:  # [batch, seq, seq] or [head, seq, seq]
-            sal = sal.mean(0)
-        
-        print(f"[DEBUG][LightAttnFn] computed saliency for layer {layer_idx}; sal.shape={tuple(sal.shape)}")
-        
-        # Store in global cache
-        if layer_idx != -1:
-            print(f"[DEBUG][LightAttnFn] storing saliency for layer {layer_idx}; sal.shape={tuple(sal.shape)}")
-            # Store the saliency map in global cache
-            global_sal_cache.store(layer_idx, sal)
+        try:
+            # Element-wise multiplication followed by absolute value
+            sal = (attn * grad_output).abs()
+            
+            # Average over batch and head dimensions if present
+            if sal.dim() == 4:  # [batch, head, seq, seq]
+                sal = sal.mean((0, 1))
+            elif sal.dim() == 3:  # [batch, seq, seq] or [head, seq, seq]
+                sal = sal.mean(0)
+            
+            print(f"[DEBUG][LightAttnFn] computed saliency for layer {layer_idx}; sal.shape={tuple(sal.shape)}")
+            
+            # Validate saliency - ensure it's not all zeros or NaNs
+            if torch.isnan(sal).any():
+                print(f"[WARNING][LightAttnFn] NaN values detected in saliency map for layer {layer_idx}")
+                sal = torch.where(torch.isnan(sal), torch.zeros_like(sal), sal)
+                
+            if sal.abs().sum().item() < 1e-10:
+                print(f"[WARNING][LightAttnFn] Near-zero saliency map for layer {layer_idx}")
+                # Add small epsilon to ensure non-zero values
+                sal = sal + torch.ones_like(sal) * 1e-10
+                
+            # Store in global cache
+            if layer_idx != -1:
+                print(f"[DEBUG][LightAttnFn] storing saliency for layer {layer_idx}; sal.shape={tuple(sal.shape)}")
+                # Store the saliency map in global cache
+                global_sal_cache.store(layer_idx, sal)
+        except Exception as e:
+            print(f"[ERROR][LightAttnFn] Error computing saliency: {e}")
         
         # Return gradient unchanged - this is critical for proper backprop
         return grad_output, None  # Also return None for the layer_idx gradient

@@ -155,8 +155,8 @@ class SaliencyBackend(BaseBackend):
             self.cache.clear_single(layer_idx, "grad")
     
     def trace_layer(self, layer_idx: int, 
-                targets: Dict[int, float],
-                sel_cfg: SelectionConfig) -> List[Dict[str, Any]]:
+                    targets: Dict[int, float],
+                    sel_cfg: SelectionConfig) -> List[Dict[str, Any]]:
         """
         Trace a specific layer using saliency scores.
         

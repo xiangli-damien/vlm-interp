@@ -342,6 +342,22 @@ class SemanticTracingWorkflow(GenerationMixin):
                 if key.endswith("_text") and isinstance(value, str):
                     r[key] = self._sanitize_text_for_display(value)
         
+        # 确保列名匹配老版本
+        for r in records:
+            # 修正列名以匹配老版本
+            if "token_text" not in r and "text" in r:
+                r["token_text"] = r["text"]
+            if "token_id" not in r and "id" in r:
+                r["token_id"] = r["id"]
+            if "predicted_top_token" not in r:
+                r["predicted_top_token"] = ""
+            if "predicted_top_prob" not in r:
+                r["predicted_top_prob"] = 0.0
+
+            if mode == "saliency" and "trace_id" in r:
+                if not str(r["trace_id"]).startswith("saliency_"):
+                    r["trace_id"] = f"saliency_{r['trace_id']}"
+        
         # Prepare metadata for saving
         metadata = {
             "trace_id": trace_id,
