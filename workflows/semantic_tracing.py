@@ -171,9 +171,9 @@ class SemanticTracingWorkflow(GenerationMixin):
         return text
     
     def trace(self, input_data: Dict[str, Any],
-              target_tokens: Dict[int, float],
-              mode: str = "saliency",
-              trace_id: Optional[str] = None) -> Dict[str, Any]:
+            target_tokens: Dict[int, float],
+            mode: str = "saliency",
+            trace_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Trace information flow for specific target tokens.
         
@@ -200,7 +200,7 @@ class SemanticTracingWorkflow(GenerationMixin):
         records = []
         current = target_tokens.copy()  # Make a copy to avoid modifying the original
         
-        # Get token info
+        # Get token info for reporting
         all_token_ids = input_data["inputs"]["input_ids"][0].tolist()
         all_token_texts = [self._get_token_text(tid) for tid in all_token_ids]
         
@@ -245,7 +245,14 @@ class SemanticTracingWorkflow(GenerationMixin):
             # Prepare targets for next layer
             next_dict = {s["index"]: s["weight"] for s in srcs}
             
-            # Renormalize and prune
+            # If next_dict is empty but we found sources, add a fallback mechanism
+            # This ensures tracing continues even if sources are sparse
+            if not next_dict and current:
+                print(f"[WARNING] Layer {layer} found no sources. Adding fallback targets.")
+                # Use previous layer targets as fallback with reduced weights
+                next_dict = {k: v * 0.5 for k, v in current.items()}
+            
+            # Renormalize and prune for next layer
             current = SelectionStrategy.renormalize(
                 next_dict, self.sel_cfg, apply_layer_prune=True
             )
@@ -254,6 +261,7 @@ class SemanticTracingWorkflow(GenerationMixin):
             if self.debug and current:
                 print(f"Next layer targets: {len(current)} tokens")
                 print(f"Total weight: {sum(current.values()):.4f}")
+    
         
         # Add token type information
         for record in records:

@@ -70,6 +70,10 @@ class SaliencyBackend(BaseBackend):
             layer_idx=layer_idx,
         )
         
+        # Filter to valid targets (position > 0) for loss computation
+        valid_targets = [t for t in target_indices if t > 0]
+        
+        # Define loss function for backward pass
         def loss_fn(outputs):
             print(f"[DEBUG][SaliencyBackend] loss_fn called for layer {layer_idx}")
             logits = outputs.logits
@@ -84,12 +88,9 @@ class SaliencyBackend(BaseBackend):
             # Get input IDs
             ids = self.last_inputs["input_ids"][0]
             
-            # Initialize loss as a tensor from the beginning
-            # Create a dummy tensor with requires_grad=True for the case where no targets contribute
+            # Initialize loss as a tensor with requires_grad=True
+            # Create a dummy tensor for the case where no valid targets contribute
             dummy_tensor = torch.zeros(1, device=logits.device, dtype=logits.dtype, requires_grad=True)
-            
-            # Find valid targets (position > 0)
-            valid_targets = [t for t in target_indices if t > 0]
             
             if valid_targets:
                 # Compute loss for valid target tokens
@@ -154,8 +155,8 @@ class SaliencyBackend(BaseBackend):
             self.cache.clear_single(layer_idx, "grad")
     
     def trace_layer(self, layer_idx: int, 
-                   targets: Dict[int, float],
-                   sel_cfg: SelectionConfig) -> List[Dict[str, Any]]:
+                targets: Dict[int, float],
+                sel_cfg: SelectionConfig) -> List[Dict[str, Any]]:
         """
         Trace a specific layer using saliency scores.
         
@@ -167,18 +168,22 @@ class SaliencyBackend(BaseBackend):
         Returns:
             List of source token records with importance weights
         """
-
-        # Validate targets - the first token (index 0) can't have meaningful sources
+        print(f"[DEBUG][SaliencyBackend.trace_layer] entering layer {layer_idx}")
+        
+        # Cache original targets before filtering
+        all_targets = targets.copy()
+        
+        # For loss computation, we need valid targets (index > 0)
+        # This is because token 0 has no previous context to compute loss against
         valid_targets = {k: v for k, v in targets.items() if k > 0}
         
-        if not valid_targets:
-            print(f"[WARNING] No valid targets (index > 0) for layer {layer_idx}. Cannot trace influences.")
-            return []
+        # If we have no valid targets, we can still proceed with computation
+        # but we need to handle the empty case for saliency computation
+        compute_targets = valid_targets if valid_targets else all_targets
         
         # Compute saliency if not already cached
-        print(f"[DEBUG][SaliencyBackend.trace_layer] entering layer {layer_idx}")
         if not self.cache.has(layer_idx, "saliency"):
-            self._compute_single_layer(layer_idx, list(valid_targets.keys()))
+            self._compute_single_layer(layer_idx, list(compute_targets.keys()))
         
         # Get saliency scores from cache
         sal = self.cache.get(layer_idx, "saliency", self.device)
@@ -188,19 +193,22 @@ class SaliencyBackend(BaseBackend):
             print(f"Warning: Failed to compute saliency for layer {layer_idx}")
             return []
         
-        # Process each target token
+        # Process EACH target token - including index 0 targets
+        # This follows the original implementation which processed all targets
         results = []
         
-        for tgt, w in targets.items():
+        for tgt, w in all_targets.items():
             # Get saliency vector for this target (causal: only consider past tokens)
             if tgt < sal.shape[0]:
+                # For token 0, there are no previous tokens (empty saliency vector)
                 vec = sal[tgt, :tgt]
                 
                 # Skip if empty (e.g., first token)
                 if vec.numel() == 0:
+                    print(f"[INFO] Token {tgt} has no previous context, skipping.")
                     continue
                 
-                # Select important source tokens
+                # Select important source tokens - no validation here
                 srcs = SelectionStrategy.select_sources(vec, sel_cfg)
                 
                 # Record selected sources
@@ -216,8 +224,9 @@ class SaliencyBackend(BaseBackend):
             else:
                 print(f"[WARNING] Target index {tgt} is out of bounds for saliency shape {sal.shape}")
         
-        # Apply layer-level pruning
-        results = self._prune_layer(results, sel_cfg)
+        # Apply layer-level pruning if we have results
+        if results:
+            results = self._prune_layer(results, sel_cfg)
         
         # Clean up after use
         self.cache.clear_single(layer_idx, "saliency")

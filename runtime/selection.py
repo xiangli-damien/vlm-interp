@@ -34,6 +34,8 @@ class SelectionStrategy:
     def select_sources(scores: torch.Tensor, config: SelectionConfig) -> List[Tuple[int, float]]:
         """
         Select source tokens based on importance scores using a coverage threshold.
+        Attempts to include non-zero indices when possible, while respecting the 
+        coverage parameter.
         
         Args:
             scores: Tensor of importance scores for source tokens
@@ -44,32 +46,72 @@ class SelectionStrategy:
         """
         if scores.numel() == 0:
             return []
-            
-        # Sort scores in descending order
-        sorted_values, sorted_indices = torch.sort(scores, descending=True)
-        sorted_values = sorted_values.cpu().numpy()
-        sorted_indices = sorted_indices.cpu().numpy()
         
-        # Calculate cumulative sum and normalize
-        total_sum = sorted_values.sum()
-        if total_sum <= 0:
+        # Convert to numpy for easier manipulation
+        if isinstance(scores, torch.Tensor):
+            values = scores.cpu().abs().numpy()  # Take absolute values for importance
+            indices = np.arange(len(values))
+        else:
+            values = np.abs(scores)  # Support numpy input
+            indices = np.arange(len(values))
+        
+        # Identify non-zero indices
+        nonzero_indices = np.where(indices > 0)[0]
+        
+        # Sort by importance scores (descending)
+        sorted_order = np.argsort(-values)  # Negative for descending
+        sorted_values = values[sorted_order]
+        sorted_indices = indices[sorted_order]
+        
+        # Calculate cumulative coverage
+        total = sorted_values.sum()
+        if total <= 0:
+            # Fallback for zero sum: return the highest value or first index
             return [(int(sorted_indices[0]), 1.0)] if len(sorted_indices) > 0 else []
-            
-        cumsum = np.cumsum(sorted_values) / total_sum
         
-        # Determine cutoff index based on coverage threshold
+        cumsum = np.cumsum(sorted_values) / total
+        
+        # Find cutoff based on coverage threshold
         cutoff_idx = np.searchsorted(cumsum, config.beta_target, side='right')
+        
+        # Apply min/max constraints
         cutoff_idx = min(max(cutoff_idx, config.min_keep), config.max_keep, len(sorted_indices))
         
-        # Create list of selected (index, weight) tuples
-        selected_sources = []
-        selected_sum = sorted_values[:cutoff_idx].sum()
+        # Create initial selection
+        selected_indices = sorted_indices[:cutoff_idx]
+        selected_values = sorted_values[:cutoff_idx]
         
-        for i in range(cutoff_idx):
-            norm_weight = sorted_values[i] / selected_sum if selected_sum > 0 else 1.0
-            selected_sources.append((int(sorted_indices[i]), float(norm_weight)))
+        # Check if we have non-zero indices in our selection
+        has_nonzero = np.any(selected_indices > 0)
+        
+        # If we don't have any non-zero indices but they exist in the data,
+        # force inclusion of the highest scoring non-zero indices
+        if not has_nonzero and len(nonzero_indices) > 0:
+            # Find highest scoring non-zero indices
+            nonzero_scores = values[nonzero_indices]
+            best_nonzero_idx = nonzero_indices[np.argmax(nonzero_scores)]
             
-        return selected_sources
+            # Include this index if not already selected
+            if best_nonzero_idx not in selected_indices:
+                # Append to selection
+                selected_indices = np.append(selected_indices, best_nonzero_idx)
+                selected_values = np.append(selected_values, values[best_nonzero_idx])
+        
+        # Re-normalize values based on selection
+        selected_sum = selected_values.sum()
+        if selected_sum > 0:
+            normalized_values = selected_values / selected_sum
+        else:
+            normalized_values = np.ones_like(selected_values) / len(selected_values)
+        
+        # Create final list of (index, weight) tuples
+        result = []
+        for idx, val, norm_val in zip(selected_indices, values[selected_indices], normalized_values):
+            # Use the original score sign but normalized magnitude
+            sign = np.sign(scores[idx]) if isinstance(scores, torch.Tensor) else np.sign(scores[idx])
+            result.append((int(idx), float(sign * norm_val)))
+        
+        return result
     
     @staticmethod
     def prune_layer(sources: List[Tuple[int, float]], config: SelectionConfig) -> List[Tuple[int, float]]:
