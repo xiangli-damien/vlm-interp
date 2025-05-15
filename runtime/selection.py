@@ -43,20 +43,17 @@ class SelectionStrategy:
         Returns:
             List of (token_idx, weight) tuples for selected sources
         """
-        if scores.numel() == 0:
-            return []
-        
-        # Convert to numpy for easier manipulation
         if isinstance(scores, torch.Tensor):
-            # Take absolute values for importance-based sorting, but preserve original values
-            values = scores.cpu().abs().numpy()  
-            indices = np.arange(len(values))
-            original_values = scores.cpu().numpy()
+            scores_np = scores.cpu().numpy()
         else:
-            # Support numpy input
-            values = np.abs(scores)  
-            indices = np.arange(len(values))
-            original_values = scores
+            scores_np = np.asarray(scores)
+
+        if scores_np.size == 0:
+            return []
+
+        values = np.abs(scores_np)
+        indices = np.arange(len(values))
+        original_values = scores_np
         
         # Sort by importance scores (descending)
         sorted_order = np.argsort(-values)  # Negative for descending
