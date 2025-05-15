@@ -33,14 +33,11 @@ class SaliencyBackend(BaseBackend):
         print(f"[DEBUG][SaliencyBackend] ensure_cache inputs.keys(): {list(inputs.keys())}")
         print(f"[DEBUG][SaliencyBackend] target_indices: {target_indices}")
         self.last_inputs = {
-            k: v.detach().clone()  # Make sure we have our own copy
-            for k, v in inputs.items()
+            k: v for k, v in inputs.items()
             if k not in ("past_key_values", "use_cache")
         }
         self.last_inputs["use_cache"] = False
         self.last_inputs["output_attentions"] = True
-        
-        # Store target indices for later use
         self.target_indices = target_indices
     
     def _compute_single_layer(self, layer_idx: int, target_indices: List[int]) -> None:
@@ -76,7 +73,7 @@ class SaliencyBackend(BaseBackend):
         # Define loss function for backward pass
         def loss_fn(outputs):
             print(f"[DEBUG][SaliencyBackend] loss_fn called for layer {layer_idx}")
-            logits = outputs.logits
+            logits = outputs.logits.float()
             
             # Use float32 for more stable softmax computation
             if logits.dtype != torch.float32:

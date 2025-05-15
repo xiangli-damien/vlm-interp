@@ -29,28 +29,11 @@ class HiddenHook:
     
     def __call__(self, module: nn.Module, inp: Tuple[torch.Tensor, ...], out: Any) -> Any:
         """
-        Forward hook function applied to model layer.
-        
-        Args:
-            module: The module being hooked
-            inp: Input tensors to the module
-            out: Output from the module
-            
-        Returns:
-            Unmodified output (hook is non-intrusive)
+        Forward hook
         """
-        # Extract hidden state from output
-        # For transformer layers, hidden state is typically the first output or the output itself
         hid = out[0] if isinstance(out, tuple) else out
 
-        # ► detach & move‑to‑CPU before caching – avoids a *copy* later
-        self.cache.set(self.layer_idx, "hidden", hid, detach=True)
+        cached = hid.detach().cpu() if self.cache.cpu_offload else hid.detach()
+        self.cache.set(self.layer_idx, "hidden", cached)
 
-        # Important: return a *detached* tensor back to the graph so that
-        # PyTorch doesn’t hold the original GPU buffer alive.  If the layer
-        # returns a tuple we must rebuild it; otherwise just the tensor.
-        if isinstance(out, tuple):
-            # keep same structure (first elem replaced by detached view)
-            return (hid.detach(),) + out[1:]
-        else:
-            return hid.detach()
+        return out

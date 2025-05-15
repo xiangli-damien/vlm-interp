@@ -171,180 +171,138 @@ class SemanticTracingWorkflow(GenerationMixin):
         return text
     
     def trace(self, input_data: Dict[str, Any],
-            target_tokens: Dict[int, float],
-            mode: str = "saliency",
-            trace_id: Optional[str] = None) -> Dict[str, Any]:
+          target_tokens: Dict[int, float],
+          mode: str = "saliency",
+          trace_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Trace information flow for specific target tokens.
-        
+
         Args:
             input_data: Prepared input data
             target_tokens: Dictionary mapping target token indices to weights
             mode: Analysis mode ('saliency' or 'attention')
             trace_id: Optional unique identifier for this trace
-            
+
         Returns:
             Dictionary with analysis results
         """
         if not trace_id:
             self.trace_id_counter += 1
             trace_id = f"{mode}_{self.trace_id_counter}"
-        
-        # Get appropriate backend
+
         backend = self._get_backend(mode)
-        
-        # Ensure necessary data is cached
         backend.ensure_cache(input_data["inputs"], list(target_tokens.keys()))
-        
-        # Process layers from deepest to shallowest
+
         records = []
-        current = target_tokens.copy()  # Make a copy to avoid modifying the original
-        
-        # Get token info for reporting
+        current = target_tokens.copy()
+
         all_token_ids = input_data["inputs"]["input_ids"][0].tolist()
         all_token_texts = [self._get_token_text(tid) for tid in all_token_ids]
-        
-        # Create token type masks for plotting/visualization
         seq_len = len(all_token_ids)
-        token_types = [0] * seq_len  # Default: generated tokens
-        text_indices = input_data.get("text_indices", [])
-        image_indices = input_data.get("image_indices", [])
-        
-        # Set token types
-        for idx in text_indices:
-            if isinstance(idx, torch.Tensor):
-                idx = idx.item()
-            if 0 <= idx < seq_len:
-                token_types[idx] = 1  # Text tokens
-        
-        for idx in image_indices:
-            if isinstance(idx, torch.Tensor):
-                idx = idx.item()
-            if 0 <= idx < seq_len:
-                token_types[idx] = 2  # Image tokens
-        
-        # Process layers from deepest to shallowest
+
+        token_types = [0] * seq_len  # 0: generated
+        for idx in input_data.get("text_indices", []):
+            token_types[int(idx.item()) if isinstance(idx, torch.Tensor) else idx] = 1
+        for idx in input_data.get("image_indices", []):
+            token_types[int(idx.item()) if isinstance(idx, torch.Tensor) else idx] = 2
+
         for layer in reversed(range(len(self.layer_names))):
             if not current:
                 if self.debug:
                     print(f"No target tokens for layer {layer}, stopping trace")
                 break
-            
+
             if self.debug:
                 print(f"Processing layer {layer} with {len(current)} targets")
-                print(f"Target token weights: {current}")
-            
-            # Trace this layer
+
             srcs = backend.trace_layer(layer, current, self.sel_cfg)
-            
-            # Record source information
+
             for s in srcs:
-                # Add layer information
                 records.append({"layer": layer, **s})
-            
-            # Prepare targets for next layer
+
             next_dict = {s["index"]: s["weight"] for s in srcs}
-            
-            # If next_dict is empty but we found sources, add a fallback mechanism
-            # This ensures tracing continues even if sources are sparse
             if not next_dict and current:
                 print(f"[WARNING] Layer {layer} found no sources. Adding fallback targets.")
-                # Use previous layer targets as fallback with reduced weights
                 next_dict = {k: v * 0.5 for k, v in current.items()}
-            
-            # Renormalize and prune for next layer
+
             current = SelectionStrategy.renormalize(
                 next_dict, self.sel_cfg, apply_layer_prune=True
             )
-            
-            # Debug info
-            if self.debug and current:
-                print(f"Next layer targets: {len(current)} tokens")
-                print(f"Total weight: {sum(current.values()):.4f}")
-    
-        
-        # Add token type information
+
+        # === Add token type, text, id to each record ===
         for record in records:
             idx = record["index"]
             if 0 <= idx < len(token_types):
                 record["token_type"] = token_types[idx]
-                
-                # Add token text and ID if not present
-                if "text" not in record and idx < len(all_token_texts):
-                    record["text"] = all_token_texts[idx]
-                    record["token_text"] = all_token_texts[idx]
-                if "id" not in record and idx < len(all_token_ids):
-                    record["token_id"] = all_token_ids[idx]
-        
-        # Enrich with logit lens projections (to add pred_top and pred_prob)
+                record_type_map = {0: "generated", 1: "text", 2: "image"}
+                record["type"] = record_type_map.get(token_types[idx], "generated")
+            if "text" not in record and idx < len(all_token_texts):
+                record["text"] = all_token_texts[idx]
+                record["token_text"] = all_token_texts[idx]
+            if "id" not in record and idx < len(all_token_ids):
+                record["token_id"] = all_token_ids[idx]
+
+        # === Collect all unique token indices for logit lens projection ===
         all_unique_indices = set()
         for r in records:
             all_unique_indices.add(r["index"])
             if "target" in r:
                 all_unique_indices.add(r["target"])
-        
-        # Get logit lens backend and ensure hidden states are available
+
+        # === Logit lens projection (optional enrichment) ===
         logit_backend = self._get_backend("logit")
         logit_backend.ensure_hidden(input_data["inputs"])
-        
-        # Get projections for all relevant tokens
+
         if all_unique_indices:
             try:
                 projections = logit_backend.project_tokens(
-                    0, list(all_unique_indices), self.processor.tokenizer
+                    layer,
+                    list(all_unique_indices),
+                    self.processor.tokenizer
                 )
-                
-                # Add projection info to records
                 for r in records:
                     if r["index"] in projections:
                         predictions = projections[r["index"]].get("predictions", [])
                         if predictions:
                             r["predicted_top_token"] = self._sanitize_text_for_display(predictions[0]["token"])
                             r["predicted_top_prob"] = predictions[0]["prob"]
-                            
-                            # Also add concept probabilities if available
-                            concepts = projections[r["index"]].get("concept_predictions", {})
-                            for concept, data in concepts.items():
-                                r[f"concept_{concept}_prob"] = data.get("probability", 0.0)
+                        concepts = projections[r["index"]].get("concept_predictions", {})
+                        for concept, data in concepts.items():
+                            r[f"concept_{concept}_prob"] = data.get("probability", 0.0)
             except Exception as e:
                 print(f"Warning: Failed to compute logit lens projections: {e}")
-        
-        # Calculate additional CSV metadata needed for compatibility
+
+        # === 3-B Fix: Build reverse index from target → source records ===
+        target_to_sources = {}
+        for rec in records:
+            tgt = rec["target"]
+            target_to_sources.setdefault(tgt, []).append(rec)
+
+        # === Final record enrichment ===
         for r in records:
-            # Find if each token is a target
             r["is_target"] = r["index"] in target_tokens
-            
-            # Find which targets this token is a source for
-            source_targets = []
-            for other_record in records:
-                if "target" in other_record and other_record["target"] == r["index"]:
-                    source_targets.append(other_record["index"])
-            
+
+            # Tokens this one is a source for
+            source_targets = [
+                other["index"] for other in records
+                if "target" in other and other["target"] == r["index"]
+            ]
             r["source_for_targets"] = ",".join(map(str, source_targets))
-            
-            # Add source relationship for visualization
+
+            # ✅ New: Accurately populate sources for targets
             if r["is_target"]:
-                sources_indices = []
-                sources_weights = []
-                for other_record in records:
-                    if "target" in other_record and other_record["index"] == r["target"]:
-                        sources_indices.append(other_record["index"])
-                        sources_weights.append(other_record["weight"])
-                
-                r["sources_indices"] = ",".join(map(str, sources_indices))
-                r["sources_weights"] = ",".join(map(str, sources_weights))
-                
-            # Add trace_id
+                srcs = target_to_sources.get(r["index"], [])
+                r["sources_indices"] = ",".join(str(s["index"]) for s in srcs)
+                r["sources_weights"] = ",".join(f'{s["weight"]:.6f}' for s in srcs)
+
             r["trace_id"] = trace_id
-            
-            # Sanitize any text fields
+
             for key, value in r.items():
                 if key.endswith("_text") and isinstance(value, str):
                     r[key] = self._sanitize_text_for_display(value)
-        
-        # 确保列名匹配老版本
+
+        # === Compatibility with older CSV format ===
         for r in records:
-            # 修正列名以匹配老版本
             if "token_text" not in r and "text" in r:
                 r["token_text"] = r["text"]
             if "token_id" not in r and "id" in r:
@@ -353,16 +311,13 @@ class SemanticTracingWorkflow(GenerationMixin):
                 r["predicted_top_token"] = ""
             if "predicted_top_prob" not in r:
                 r["predicted_top_prob"] = 0.0
+            if mode == "saliency" and "trace_id" in r and not str(r["trace_id"]).startswith("saliency_"):
+                r["trace_id"] = f"saliency_{r['trace_id']}"
 
-            if mode == "saliency" and "trace_id" in r:
-                if not str(r["trace_id"]).startswith("saliency_"):
-                    r["trace_id"] = f"saliency_{r['trace_id']}"
-        
-        # Prepare metadata for saving
         metadata = {
             "trace_id": trace_id,
             "mode": mode,
-            "tracing_mode": mode,  # For compatibility with old format
+            "tracing_mode": mode,
             "token_types": input_data.get("token_types", {}),
             "target_tokens": [
                 {
@@ -377,18 +332,12 @@ class SemanticTracingWorkflow(GenerationMixin):
             "image_available": "original_image" in input_data,
             "logit_lens_concepts": self.logit_lens_concepts,
         }
-        
-        # Add feature mapping for visualization if available
+
         if "feature_mapping" in input_data:
             metadata["feature_mapping"] = input_data["feature_mapping"]
-        
-        # Save trace data to CSV
-        csv_path = self.trace_io.write_trace_data(
-            trace_id,
-            records,
-            metadata=metadata
-        )
-        
+
+        csv_path = self.trace_io.write_trace_data(trace_id, records, metadata=metadata)
+
         return {
             "csv": csv_path,
             "records": len(records),
@@ -397,6 +346,7 @@ class SemanticTracingWorkflow(GenerationMixin):
             "target_tokens": metadata["target_tokens"],
             "metadata_path": os.path.join(self.output_dir, "csv_data", "trace_metadata.json")
         }
+
     
     def analyze_specific_token(self, input_data: Dict[str, Any],
                              token_idx: int,

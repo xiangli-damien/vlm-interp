@@ -18,10 +18,10 @@ class SelectionConfig:
     """Configuration parameters for token selection and pruning."""
     beta_target: float = 0.8  # Coverage threshold for selecting source nodes
     beta_layer: float = 1.0   # Coverage threshold for pruning at layer level
-    min_keep: int = 2         # Minimum nodes to keep per target
+    min_keep: int = 4         # Minimum nodes to keep per target
     max_keep: int = 8        # Maximum nodes to keep per target
-    min_keep_layer: int = 6   # Minimum nodes to keep per layer
-    max_keep_layer: int = 500  # Maximum nodes to keep per layer
+    min_keep_layer: int = 8   # Minimum nodes to keep per layer
+    max_keep_layer: int = 400  # Maximum nodes to keep per layer
 
 
 class SelectionStrategy:
