@@ -11,6 +11,8 @@ from typing import Any, Tuple, Dict, Optional, List
 # Import the global saliency cache
 from runtime.cache import global_sal_cache
 
+_tensor_registry = {}
+
 class LightAttnFn(torch.autograd.Function):
     """
     Custom autograd function for efficient saliency computation.
@@ -33,13 +35,12 @@ class LightAttnFn(torch.autograd.Function):
         ctx.save_for_backward(attn)
         ctx.layer_idx = layer_idx
         
-        # Create wrapped tensor and add _base attribute
-        attn_wrapped = attn  # Reference to maintain computational graph
-        attn_wrapped._base = attn  # Add reference to original tensor
+        # Register the original tensor in our global registry
+        _tensor_registry[id(attn)] = attn
         
         # Important: We need to ensure the same tensor is returned
         # to maintain the computational graph
-        return attn_wrapped
+        return attn
     
     @staticmethod
     def backward(ctx, grad_output):

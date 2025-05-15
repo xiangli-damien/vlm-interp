@@ -44,9 +44,9 @@ class SaveAttnHook:
         # For transformer layers, attention weights are typically the second output
         attn = out[1] if isinstance(out, tuple) and len(out) > 1 else out
         
-        # Check if this tensor has been wrapped by LightAttnFn
-        # and get the original tensor if available
-        attn_base = getattr(attn, "_base", attn)
+        # Check if this tensor has been registered in our tensor registry
+        from runtime.hooks.light_grad import _tensor_registry
+        attn_base = _tensor_registry.get(id(attn), attn)
         
         # --- DEBUG LOG ---
         print(f"[DEBUG][SaveAttnHook] saving attention for layer {self.layer_idx}")
