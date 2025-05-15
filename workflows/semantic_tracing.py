@@ -275,8 +275,9 @@ class SemanticTracingWorkflow(GenerationMixin):
         # === 3-B Fix: Build reverse index from target → source records ===
         target_to_sources = {}
         for rec in records:
-            tgt = rec["target"]
-            target_to_sources.setdefault(tgt, []).append(rec)
+            if "target" in rec:
+                tgt = rec["target"]
+                target_to_sources.setdefault(tgt, []).append(rec)
 
         # === Final record enrichment ===
         for r in records:
@@ -289,11 +290,11 @@ class SemanticTracingWorkflow(GenerationMixin):
             ]
             r["source_for_targets"] = ",".join(map(str, source_targets))
 
-            # ✅ New: Accurately populate sources for targets
+            # New: Accurately populate sources for targets
             if r["is_target"]:
                 srcs = target_to_sources.get(r["index"], [])
                 r["sources_indices"] = ",".join(str(s["index"]) for s in srcs)
-                r["sources_weights"] = ",".join(f'{s["weight"]:.6f}' for s in srcs)
+                r["sources_weights"] = ",".join(str(s["weight"]) for s in srcs)
 
             r["trace_id"] = trace_id
 

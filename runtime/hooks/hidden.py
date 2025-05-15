@@ -33,7 +33,11 @@ class HiddenHook:
         """
         hid = out[0] if isinstance(out, tuple) else out
 
-        cached = hid.detach().cpu() if self.cache.cpu_offload else hid.detach()
-        self.cache.set(self.layer_idx, "hidden", cached)
+        cached = hid.detach()
+        self.cache.set(self.layer_idx, "hidden",
+                       cached.cpu() if self.cache.cpu_offload else cached)
 
-        return out
+        # return a detached view to free GPU mem
+        if isinstance(out, tuple):
+            return (hid.detach(),) + out[1:]
+        return hid.detach()
