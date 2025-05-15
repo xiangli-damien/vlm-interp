@@ -1,11 +1,11 @@
 from backends.attention_backend import AttentionBackend
-from backends.logit_backend import LogitBackend
+from backends.logit_backend import LogitLensBackend
 from backends.saliency_backend import SaliencyBackend
 from backends.base_backend import BaseBackend
 
 __all__ = [
     "AttentionBackend",
-    "LogitBackend",
+    "LogitLensBackend",
     "SaliencyBackend",
     "BaseBackend",
 ]

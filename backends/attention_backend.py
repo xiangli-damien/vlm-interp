@@ -1,107 +1,116 @@
+# backends/attention_backend.py
 """
-Attention-based semantic tracing backend.
-Analyzes information flow using attention weights without gradient computation.
+Attention backend for capturing raw attention weights from a model.
 """
 
-from typing import Dict, List, Optional, Any, Tuple
 import torch
-
-from runtime.cache import TracingCache
-from runtime.selection import SelectionConfig, SelectionStrategy
-from runtime.hooks import TraceHookManager
+import gc
+from typing import Dict, List, Any, Optional, Tuple
+import logging
+from runtime.hooks import register_hooks, remove_hooks
 from backends.base_backend import BaseBackend
 
+logger = logging.getLogger(__name__)
 
 class AttentionBackend(BaseBackend):
     """
-    Backend for analyzing information flow using attention weights.
-    Uses direct attention values without gradient computation.
+    Backend for capturing raw attention weights from model layers.
+    More lightweight than saliency as it doesn't require gradient computation.
     """
     
-    def ensure_cache(self, inputs: Dict[str, torch.Tensor], target_indices: List[int]) -> None:
+    def __init__(self, model, device=None, cpu_offload=True):
         """
-        Ensure attention weights are cached for all layers.
+        Initialize the attention backend.
         
         Args:
-            inputs: Model input tensors
-            target_indices: Indices of target tokens to analyze
+            model: The model to analyze
+            device: Device to run computations on
+            cpu_offload: Whether to offload tensors to CPU when possible
         """
-        # Skip if attention is already cached for first layer
-        if self.cache.has(0, "attn"):
-            return
+        super().__init__(model, device, cpu_offload)
+        self.hooks = []
+        self.attention_maps = {}
+        self.hooked_layers = set()
         
-        # Set up hook manager
-        hook_mgr = TraceHookManager(self.model, self.cache)
-        
-        # Register hooks for all layers
-        for i, name in enumerate(self.layer_names):
-            hook_mgr.add_layer(name, ("attention",), layer_idx=i)
-        
-        # Install hooks and run forward pass
-        hook_mgr.install()
-        hook_mgr.run(inputs, loss_fn=None)
-        hook_mgr.clear()
-        
-        # Verify that attention was actually cached
-        if not self.cache.has(0, "attn"):
-            print("Warning: Attention weights were not cached properly. Check hook implementation.")
-    
-    def trace_layer(self, layer_idx: int, 
-                   targets: Dict[int, float],
-                   sel_cfg: SelectionConfig) -> List[Dict[str, Any]]:
+    def setup(self, layer_names: List[str]) -> None:
         """
-        Trace a specific layer using attention weights.
+        Set up hooks for the specified layers.
         
         Args:
-            layer_idx: Index of the layer to trace
-            targets: Dictionary mapping target token indices to weights
-            sel_cfg: Configuration for token selection and pruning
+            layer_names: List of layer names to analyze
+        """
+        self.cleanup()  # Clear any existing hooks
+        self.hooked_layers = set(layer_names)
+        
+        # Register forward hooks for all specified layers
+        hooks = register_hooks(
+            self.model,
+            layer_names,
+            forward_hook=self._create_forward_hook
+        )
+        
+        self.hooks.extend(hooks)
+        logger.info(f"Registered attention hooks for {len(self.hooks)} layers")
+        
+    def _create_forward_hook(self, layer_name: str):
+        """Create a forward hook for capturing attention weights."""
+        def hook(module, inputs, outputs):
+            attn_weights = None
+            
+            # Identify attention weights in outputs
+            if isinstance(outputs, tuple) and len(outputs) > 0:
+                # Pattern 1: (hidden_state, attn_weights, ...)
+                if len(outputs) > 1 and isinstance(outputs[1], torch.Tensor) and outputs[1].ndim == 4:
+                    attn_weights = outputs[1]
+                # Pattern 2: (hidden_state, cache, attn_weights, ...)
+                elif len(outputs) > 2 and isinstance(outputs[2], torch.Tensor) and outputs[2].ndim == 4:
+                    attn_weights = outputs[2]
+            
+            if attn_weights is not None:
+                # Store the weights tensor, detached to avoid memory issues
+                processed_attn = attn_weights.detach()
+                if self.cpu_offload:
+                    processed_attn = processed_attn.cpu()
+                self.attention_maps[layer_name] = processed_attn
+        
+        return hook
+        
+    def compute(self, inputs: Dict[str, torch.Tensor], target_indices: List[int]) -> Dict[str, Any]:
+        """
+        Compute attention weights for the given inputs.
+        Target indices are provided for API compatibility but not used, as attention
+        is the same regardless of which tokens we're analyzing.
+        
+        Args:
+            inputs: Model inputs
+            target_indices: Indices of target tokens (not used for pure attention)
             
         Returns:
-            List of source token records with importance weights
+            Dictionary with attention maps per layer
         """
-        # Get attention weights from cache
-        att = self.cache.get(layer_idx, "attn", self.device)
+        self.clear_results()
         
-        if att is None:
-            print(f"Warning: No attention weights found for layer {layer_idx}")
-            return []
+        # Single forward pass to capture attention for all layers
+        with torch.no_grad():
+            _ = self.model(**{k: v for k, v in inputs.items() if k != "token_type_ids"},
+                          output_attentions=True,
+                          use_cache=False)
         
-        # Average over batch and head dimensions if present
-        if att.ndim == 4:  # [batch, head, seq, seq]
-            att = att.mean((0, 1))
-        elif att.ndim == 3:  # [batch, seq, seq] or [head, seq, seq]
-            att = att.mean(0)
+        return {"attention_maps": self.attention_maps}
         
-        # Process each target token
-        result = []
+    def clear_results(self) -> None:
+        """Clear previous computation results."""
+        self.attention_maps.clear()
         
-        for tgt, w in targets.items():
-            # Get attention vector for this target (causal: only consider past tokens)
-            vec = att[tgt, :tgt]
-            
-            # Skip if empty (e.g., first token)
-            if vec.numel() == 0:
-                continue
-            
-            # Select important source tokens
-            srcs = SelectionStrategy.select_sources(vec, sel_cfg)
-            
-            # Record selected sources
-            for sidx, sw in srcs:
-                result.append({
-                    "index": sidx,          # Token index
-                    "weight": sw * w,       # Global importance weight
-                    "raw": sw,              # Raw importance score
-                    "target": tgt,          # Which token this is a source for
-                    "attention_score": sw,  # Same as raw, for clarity
-                    "type": "unknown"       # Will be filled later by workflow
-                })
+    def cleanup(self) -> None:
+        """Remove all hooks and free resources."""
+        remove_hooks(self.hooks)
+        self.hooks.clear()
         
-        # Apply layer-level pruning
-        result = self._prune_layer(result, sel_cfg)
+        self.clear_results()
+        self.clear_cache()
         
-        # Clear attention tensor to save memory
-        self.cache.clear_single(layer_idx, "attn")
-        
-        return result
+        self.hooked_layers.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

@@ -183,40 +183,57 @@ def get_image_token_spans(
 
 
 def prepare_inputs(
-    *,
     model,
     processor,
     image: Union[str, Image.Image],
     prompt: str,
-    resize_to: Optional[Tuple[int, int]] = None,
+    resize_to: Optional[Tuple[int, int]] = None
 ) -> Dict[str, Any]:
     """
-    End-to-end helper that produces the complete input payload for workflows.
+    Prepare model inputs from raw data.
     
     Args:
         model: The model to prepare inputs for
         processor: The model's processor
         image: PIL image, path, or URL
         prompt: Text prompt
-        resize_to: Optional tuple (width, height) to resize image
-    
+        resize_to: Optional size to resize image to
+        
     Returns:
         Dictionary with all necessary inputs and metadata
     """
-    # 1) image normalisation --------------------------------------------------
+    # 1. Load and process image
     pil_img = image if isinstance(image, Image.Image) else load_image(
         image, resize_to=resize_to
     )
-
-    # 2) prompt ---------------------------------------------------------------
-    formatted_prompt = build_formatted_prompt(processor, prompt)
-
-    # 3) tokenisation ---------------------------------------------------------
-    inputs = processor(images=pil_img, text=formatted_prompt, return_tensors="pt")
+    
+    # 2. Format prompt
+    if hasattr(processor, "apply_chat_template"):
+        # Modern HF processors use chat templates
+        conversation = [
+            {"role": "user", "content": prompt}
+        ]
+        formatted_prompt = processor.apply_chat_template(
+            conversation, 
+            add_generation_prompt=True,
+            return_tensors=None
+        )
+    else:
+        # Fallback formatting
+        formatted_prompt = f"USER: {prompt}\nASSISTANT:"
+    
+    # 3. Process inputs
+    inputs = processor(
+        images=pil_img,
+        text=formatted_prompt,
+        return_tensors="pt"
+    )
+    
+    # 4. Move to model device
     device = next(model.parameters()).device
     inputs = {k: v.to(device) for k, v in inputs.items()}
-
-    # 4) image‑token ID -------------------------------------------------------
+    
+    # 5. Get image token ID
     image_token_id = getattr(model.config, "image_token_index", None)
     if image_token_id is None:
         try:
@@ -225,34 +242,36 @@ def prepare_inputs(
             )
         except Exception:
             image_token_id = 32000  # fallback
-            logger.warning("Falling back to default image‑token ID 32000")
-
-    # 5) bookkeeping ----------------------------------------------------------
-    txt_idxs, img_idxs = get_token_indices(inputs["input_ids"].cpu(), image_token_id)
-    token_types = {int(i): "text" for i in txt_idxs}
-    token_types.update({int(i): "image" for i in img_idxs})
-
-    # Get image spans for feature mapping
-    image_spans = get_image_token_spans(inputs["input_ids"].cpu(), image_token_id)
-
-    logger.info(
-        f"Prepared inputs: text: {len(txt_idxs)}, image: {len(img_idxs)}, "
-        f"total: {inputs['input_ids'].shape[1]}"
-    )
+            logger.warning("Falling back to default image token ID 32000")
+    
+    # 6. Get token indices
+    text_indices, image_indices = get_token_indices(inputs["input_ids"], image_token_id)
+    
+    # 7. Get image spans for feature mapping
+    image_spans = get_image_token_spans(inputs["input_ids"], image_token_id)
+    
+    # 8. Create token type dictionary
+    token_types = {}
+    for i in text_indices:
+        token_types[int(i)] = "text"
+    for i in image_indices:
+        token_types[int(i)] = "image"
+    
+    logger.info(f"Prepared inputs with {len(text_indices)} text tokens, {len(image_indices)} image tokens")
 
     return {
-        "inputs": inputs,
-        "text_indices": txt_idxs,
-        "image_indices": img_idxs,
-        "token_types": token_types,
-        "formatted_prompt": formatted_prompt,
-        "original_image": pil_img,
-        "original_image_size_hw": (pil_img.height, pil_img.width),  # Added for VisionMapper
-        "image_token_id": int(image_token_id),
-        "image_spans": image_spans,  # Added for feature mapping
-        "token_lengths": {
-            "text": len(txt_idxs),
-            "image": len(img_idxs),
-            "total": inputs["input_ids"].shape[1],
-        },
-    }
+    "inputs": inputs,
+    "text_indices": text_indices,
+    "image_indices": image_indices,
+    "token_types": token_types,
+    "formatted_prompt": formatted_prompt,
+    "original_image": pil_img,
+    "original_image_size_hw": (pil_img.height, pil_img.width),
+    "image_token_id": int(image_token_id),
+    "image_spans": image_spans,
+    "token_lengths": {
+        "text": len(text_indices),
+        "image": len(image_indices),
+        "total": inputs["input_ids"].shape[1],
+    },
+}

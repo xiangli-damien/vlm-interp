@@ -1,211 +1,148 @@
 # runtime/cache.py
 """
-Tensor caching system optimized for memory efficiency in semantic tracing.
-Provides centralized tensor management with CPU offloading capabilities.
+Caching utilities for model activations and intermediate results.
 """
 
 import torch
 import gc
-from typing import Dict, Union, Optional, List, Any
+from typing import Dict, Any, Optional, List
 
-class TracingCache:
+class ActivationCache:
     """
-    Memory-efficient tensor cache for semantic tracing.
-    Handles automatic detachment and CPU offloading of large tensors.
+    Cache for storing model activations (hidden states) during inference.
+    Provides utilities for efficient memory management.
     """
     
     def __init__(self, cpu_offload: bool = True):
         """
-        Initialize the tensor cache.
+        Initialize the activation cache.
         
         Args:
-            cpu_offload: Whether to move tensors to CPU to conserve GPU memory
+            cpu_offload: Whether to offload tensors to CPU when possible
         """
-        self.hidden: Dict[int, torch.Tensor] = {}
-        self.attn: Dict[int, torch.Tensor] = {}
-        self.grad: Dict[int, torch.Tensor] = {}
-        self.saliency: Dict[int, torch.Tensor] = {}  # Using standardized name "saliency"
-        self.grad_missing: Dict[int, bool] = {}
+        self.hidden_states: Dict[str, torch.Tensor] = {}
+        self.attention_maps: Dict[str, torch.Tensor] = {}
         self.cpu_offload = cpu_offload
-        
-        # Size threshold for aggressive cleanup (1M elements)
-        self.large_tensor_threshold = 1e6
     
-    def set(self, layer: int, kind: str, tensor: torch.Tensor, detach: bool = True) -> None:
+    def store_hidden_state(self, layer_name: str, hidden_state: torch.Tensor) -> None:
         """
-        Store a tensor in the cache with automatic detachment and offloading.
+        Store a hidden state tensor for a specific layer.
         
         Args:
-            layer: Layer index
-            kind: Tensor type ('hidden', 'attn', 'grad', or 'saliency')
-            tensor: The tensor to store
-            detach: Whether to detach the tensor from the computation graph
+            layer_name: Name of the layer
+            hidden_state: The hidden state tensor
         """
-        # Validate kind parameter
-        if kind not in ['hidden', 'attn', 'grad', 'saliency']:  # Using standardized name "saliency"
-            raise ValueError(f"Invalid tensor kind: {kind}")
+        # Detach to avoid memory leaks
+        processed = hidden_state.detach()
         
-        # Process tensor (detach and convert to CPU if needed)
-        if detach and tensor.requires_grad:
-            tensor = tensor.detach()
-            
-        # Convert to float16 for memory savings and send to CPU if enabled
+        # Offload to CPU if requested
         if self.cpu_offload:
-            # For numerical stability, use float32 for gradient and saliency 
-            if kind in ['grad', 'saliency']:
-                tensor = tensor.to(torch.float32).cpu()
-            else:
-                tensor = tensor.to(torch.float16).cpu()
+            processed = processed.cpu()
         
-        # Store tensor in appropriate dictionary
-        cache_dict = getattr(self, kind)
-        cache_dict[layer] = tensor
-        
-        # Aggressive cleanup for large tensors
-        if tensor.numel() > self.large_tensor_threshold and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self.hidden_states[layer_name] = processed
     
-    def get(self, layer: int, kind: str, device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
+    def store_attention_map(self, layer_name: str, attention_map: torch.Tensor) -> None:
         """
-        Retrieve a tensor from the cache, optionally moving it to the specified device.
+        Store an attention map tensor for a specific layer.
         
         Args:
-            layer: Layer index
-            kind: Tensor type ('hidden', 'attn', 'grad', or 'saliency')
-            device: Optional device to move the tensor to
+            layer_name: Name of the layer
+            attention_map: The attention map tensor
+        """
+        # Detach to avoid memory leaks
+        processed = attention_map.detach()
+        
+        # Offload to CPU if requested
+        if self.cpu_offload:
+            processed = processed.cpu()
+        
+        self.attention_maps[layer_name] = processed
+    
+    def get_hidden_state(self, layer_name: str, device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
+        """
+        Get a hidden state tensor for a specific layer.
+        
+        Args:
+            layer_name: Name of the layer
+            device: Device to move the tensor to
             
         Returns:
-            The cached tensor, or None if not found
+            The hidden state tensor, or None if not found
         """
-        # Validate kind parameter
-        if kind not in ['hidden', 'attn', 'grad', 'saliency']:  # Using standardized name "saliency"
-            raise ValueError(f"Invalid tensor kind: {kind}")
-        
-        # Get tensor from appropriate dictionary
-        cache_dict = getattr(self, kind)
-        tensor = cache_dict.get(layer)
-        
-        if tensor is None:
+        if layer_name not in self.hidden_states:
             return None
         
-        # Move to requested device if specified
+        tensor = self.hidden_states[layer_name]
+        
+        # Move to requested device if provided
         if device is not None and tensor.device != device:
             tensor = tensor.to(device)
-            
+        
         return tensor
     
-    def has(self, layer: int, kind: str) -> bool:
+    def get_attention_map(self, layer_name: str, device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
         """
-        Check if a tensor exists in the cache.
+        Get an attention map tensor for a specific layer.
         
         Args:
-            layer: Layer index
-            kind: Tensor type ('hidden', 'attn', 'grad', or 'saliency')
+            layer_name: Name of the layer
+            device: Device to move the tensor to
             
         Returns:
-            True if the tensor exists, False otherwise
+            The attention map tensor, or None if not found
         """
-        # Validate kind parameter
-        if kind not in ['hidden', 'attn', 'grad', 'saliency']:  # Using standardized name "saliency"
-            raise ValueError(f"Invalid tensor kind: {kind}")
+        if layer_name not in self.attention_maps:
+            return None
         
-        # Check appropriate dictionary
-        cache_dict = getattr(self, kind)
-        return layer in cache_dict
+        tensor = self.attention_maps[layer_name]
+        
+        # Move to requested device if provided
+        if device is not None and tensor.device != device:
+            tensor = tensor.to(device)
+        
+        return tensor
     
-    def clear_single(self, layer: int, kind: str) -> None:
+    def store_model_outputs(self, outputs: Any, output_types: List[str] = None) -> None:
         """
-        Remove a specific tensor from the cache.
+        Store model outputs in the cache.
         
         Args:
-            layer: Layer index
-            kind: Tensor type ('hidden', 'attn', 'grad', or 'saliency')
+            outputs: The model outputs
+            output_types: Types of outputs to store (default: ["hidden_states", "attentions"])
         """
-        # Validate kind parameter
-        if kind not in ['hidden', 'attn', 'grad', 'saliency']:  # Using standardized name "saliency"
-            raise ValueError(f"Invalid tensor kind: {kind}")
+        if output_types is None:
+            output_types = ["hidden_states", "attentions"]
         
-        # Remove from appropriate dictionary
-        cache_dict = getattr(self, kind)
-        if layer in cache_dict:
-            del cache_dict[layer]
-            
-        # Clean up after deletion
+        # Store hidden states if available
+        if "hidden_states" in output_types and hasattr(outputs, "hidden_states"):
+            hidden_states = outputs.hidden_states
+            if hidden_states is not None:
+                for idx, hidden_state in enumerate(hidden_states):
+                    layer_name = f"layer_{idx}"
+                    self.store_hidden_state(layer_name, hidden_state)
+        
+        # Store attention maps if available
+        if "attentions" in output_types and hasattr(outputs, "attentions"):
+            attentions = outputs.attentions
+            if attentions is not None:
+                for idx, attention in enumerate(attentions):
+                    layer_name = f"layer_{idx}"
+                    self.store_attention_map(layer_name, attention)
+    
+    def clear_hidden_states(self) -> None:
+        """Clear all cached hidden states."""
+        self.hidden_states.clear()
         gc.collect()
+    
+    def clear_attention_maps(self) -> None:
+        """Clear all cached attention maps."""
+        self.attention_maps.clear()
+        gc.collect()
+    
+    def clear_all(self) -> None:
+        """Clear all cached tensors."""
+        self.clear_hidden_states()
+        self.clear_attention_maps()
+        
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    
-    def clear(self, kind: Optional[str] = None) -> None:
-        """
-        Clear the entire cache or a specific kind of tensors.
-        
-        Args:
-            kind: Optional tensor type to clear ('hidden', 'attn', 'grad', or 'saliency').
-                  If None, clears all tensors.
-        """
-        if kind is None:
-            # Clear all caches
-            self.hidden.clear()
-            self.attn.clear()
-            self.grad.clear()
-            self.saliency.clear()  # Using standardized name "saliency"
-            self.grad_missing.clear()
-        else:
-            # Validate kind parameter
-            if kind not in ['hidden', 'attn', 'grad', 'saliency']:  # Using standardized name "saliency"
-                raise ValueError(f"Invalid tensor kind: {kind}")
-            
-            # Clear specific cache
-            cache_dict = getattr(self, kind)
-            cache_dict.clear()
-        
-        # Clean up memory
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-class _GlobalSalCache:
-    """
-    Global singleton cache for saliency scores calculated during backward passes.
-    Used to communicate saliency values computed by custom autograd functions.
-    """
-    
-    def __init__(self):
-        """Initialize the global saliency cache."""
-        self._cache: Dict[int, torch.Tensor] = {}
-    
-    def store(self, layer: int, saliency: torch.Tensor) -> None:  # Changed parameter name from sal to saliency
-        """
-        Store a saliency tensor for a specific layer.
-        
-        Args:
-            layer: Layer index
-            saliency: Saliency tensor (|attention * gradient|)
-        """
-        # Make sure we store a detached copy to avoid memory leaks
-        # Use float32 for numerical stability
-        if saliency.requires_grad:
-            saliency = saliency.detach()
-            
-        # Store with CPU offloading for memory efficiency
-        self._cache[layer] = saliency.to(torch.float32).cpu()
-        print(f"[DEBUG][GlobalSalCache] Stored saliency for layer {layer}, shape: {tuple(saliency.shape)}")
-    
-    def pop(self, layer: int) -> Optional[torch.Tensor]:
-        """
-        Retrieve and remove a saliency tensor from the cache.
-        
-        Args:
-            layer: Layer index
-            
-        Returns:
-            The cached saliency tensor, or None if not found
-        """
-        if layer in self._cache:
-            result = self._cache.pop(layer)
-            print(f"[DEBUG][GlobalSalCache] Popped saliency for layer {layer}")
-            return result
-        return None
-
-# Global singleton instance
-global_sal_cache = _GlobalSalCache()

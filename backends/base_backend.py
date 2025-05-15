@@ -1,108 +1,73 @@
 # backends/base_backend.py
 """
-Base interface for all semantic tracing backends.
-Defines the common API for different analysis methods.
+Base backend for all tracing methods.
+Defines the common interface and utilities for backend implementations.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Any, Tuple
-
 import torch
+import logging
+from typing import Dict, List, Optional, Tuple, Any, Union, Set
 
-from runtime.cache import TracingCache
-from runtime.selection import SelectionConfig
-
+logger = logging.getLogger(__name__)
 
 class BaseBackend(ABC):
     """
-    Abstract base class for semantic tracing backends.
-    Defines common functionality for different analysis approaches.
+    Abstract base class for all tracing backends.
+    Defines the common interface that all backends must implement.
     """
     
-    def __init__(self, model: torch.nn.Module, layer_names: List[str],
-                 cache: TracingCache, device: torch.device):
+    def __init__(self, model, device=None, cpu_offload=True):
         """
         Initialize the backend.
         
         Args:
             model: The model to analyze
-            layer_names: Names of layers to trace
-            cache: Tensor cache for data sharing
-            device: Computation device
+            device: Device to run computations on
+            cpu_offload: Whether to offload tensors to CPU when possible
         """
         self.model = model
-        self.layer_names = layer_names
-        self.cache = cache
-        self.device = device
-    
+        self.device = device or next(model.parameters()).device
+        self.cpu_offload = cpu_offload
+        self.cache = {}
+        
     @abstractmethod
-    def ensure_cache(self, inputs: Dict[str, torch.Tensor], target_indices: List[int]) -> None:
+    def setup(self, layer_names: List[str]) -> None:
         """
-        Ensure required data is cached before tracing.
+        Set up the backend for the specified layers.
         
         Args:
-            inputs: Model input tensors
+            layer_names: List of layer names to analyze
+        """
+        pass
+    
+    @abstractmethod
+    def compute(self, inputs: Dict[str, torch.Tensor], target_indices: List[int]) -> Dict[str, Any]:
+        """
+        Compute the backend's specific outputs for the given inputs and targets.
+        
+        Args:
+            inputs: Model inputs
             target_indices: Indices of target tokens to analyze
+            
+        Returns:
+            Dictionary with backend-specific outputs
         """
         pass
     
     @abstractmethod
-    def trace_layer(self, layer_idx: int, 
-                    target_tokens: Dict[int, float],
-                    sel_cfg: SelectionConfig) -> List[Dict[str, Any]]:
-        """
-        Trace a specific layer, analyzing influences on target tokens.
-        
-        Args:
-            layer_idx: Index of the layer to trace
-            target_tokens: Dictionary mapping target token indices to weights
-            sel_cfg: Configuration for token selection and pruning
-            
-        Returns:
-            List of source token records with importance weights
-        """
+    def cleanup(self) -> None:
+        """Clean up any resources used by the backend."""
         pass
     
-    def _prune_layer(self, sources: List[Dict[str, Any]], sel_cfg: SelectionConfig) -> List[Dict[str, Any]]:
-        """
-        Apply layer-level pruning to reduce the number of active source nodes.
+    def clear_cache(self) -> None:
+        """Clear the backend's cache."""
+        self.cache.clear()
         
-        Args:
-            sources: List of source token records
-            sel_cfg: Selection configuration parameters
-            
-        Returns:
-            Pruned list of source token records
-        """
-        if not sources:
-            return []
+    def __enter__(self):
+        """Support context manager interface."""
+        return self
         
-        # Sort sources by absolute weight (descending)
-        sources = sorted(sources, key=lambda x: abs(x["weight"]), reverse=True)
-        
-        # Calculate cumulative coverage
-        weights = [abs(s["weight"]) for s in sources]
-        total = sum(weights)
-        
-        if total <= 0:
-            # If total weight is zero, keep just a minimum number
-            return sources[:sel_cfg.min_keep_layer]
-        
-        # Calculate cumulative coverage
-        cumsum = 0
-        keep_idx = 0
-        
-        for i, w in enumerate(weights):
-            cumsum += w
-            coverage = cumsum / total
-            
-            # Find cutoff index based on coverage
-            if coverage >= sel_cfg.beta_layer:
-                keep_idx = i + 1  # Include the current index
-                break
-        
-        # Apply min/max constraints
-        keep_idx = max(keep_idx, sel_cfg.min_keep_layer)
-        keep_idx = min(keep_idx, sel_cfg.max_keep_layer, len(sources))
-        
-        return sources[:keep_idx]
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Clean up resources when exiting context."""
+        self.cleanup()

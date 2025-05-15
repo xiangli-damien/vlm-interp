@@ -1,167 +1,198 @@
+# backends/logit_backend.py
 """
-Logit lens backend for semantic tracing.
-Analyzes hidden states by projecting through the language model head.
+Logit lens backend for analyzing hidden states by projecting through the LM head.
 """
 
-from typing import Dict, List, Optional, Any, Tuple
 import torch
-
-from runtime.cache import TracingCache
-from runtime.hooks import TraceHookManager
+import gc
+from typing import Dict, List, Any, Optional, Tuple
+import logging
+from runtime.hooks import register_hooks, remove_hooks
 from backends.base_backend import BaseBackend
 
+logger = logging.getLogger(__name__)
 
-class LogitBackend(BaseBackend):
+class LogitLensBackend(BaseBackend):
     """
-    Backend for projecting hidden states through the language model head.
-    Provides token predictions at intermediate layers.
+    Backend for logit lens analysis, projecting hidden states through the LM head 
+    to examine token predictions at different layers.
     """
     
-    def __init__(self, model: torch.nn.Module, layer_names: List[str],
-                 cache: TracingCache, device: torch.device,
-                 concepts: Optional[List[str]] = None, top_k: int = 5):
+    def __init__(self, model, device=None, cpu_offload=True):
         """
-        Initialize the logit backend.
+        Initialize the logit lens backend.
         
         Args:
             model: The model to analyze
-            layer_names: Names of layers to trace
-            cache: Tensor cache for data sharing
-            device: Computation device
-            concepts: Optional list of concept strings to track
-            top_k: Number of top predictions to return
+            device: Device to run computations on
+            cpu_offload: Whether to offload tensors to CPU when possible
         """
-        super().__init__(model, layer_names, cache, device)
-        self.concepts = concepts or []
-        self.top_k = top_k
-    
-    def ensure_cache(self, inputs: Dict[str, torch.Tensor], target_indices: List[int]) -> None:
+        super().__init__(model, device, cpu_offload)
+        self.hooks = []
+        self.hidden_states = {}
+        self.hooked_layers = set()
+        self.projections = {}
+        
+        # Get the LM head for projections
+        if hasattr(model, 'lm_head'):
+            self.lm_head = model.lm_head
+        elif hasattr(model, 'language_model') and hasattr(model.language_model, 'lm_head'):
+            self.lm_head = model.language_model.lm_head
+        else:
+            raise ValueError("Could not find LM head in model. Required for logit lens.")
+        
+    def setup(self, layer_names: List[str]) -> None:
         """
-        Ensure hidden states are cached for all layers.
-        This is used when logit_backend is directly called.
+        Set up hooks for the specified layers.
         
         Args:
-            inputs: Model input tensors
-            target_indices: Indices of target tokens to analyze
+            layer_names: List of layer names to analyze
         """
-        self.ensure_hidden(inputs)
-    
-    def ensure_hidden(self, inputs: Dict[str, torch.Tensor]) -> None:
+        self.cleanup()  # Clear any existing hooks
+        self.hooked_layers = set(layer_names)
+        
+        # Register forward hooks for all specified layers
+        hooks = register_hooks(
+            self.model,
+            layer_names,
+            forward_hook=self._create_forward_hook
+        )
+        
+        self.hooks.extend(hooks)
+        logger.info(f"Registered hidden state hooks for {len(self.hooks)} layers")
+        
+    def _create_forward_hook(self, layer_name: str):
+        """Create a forward hook for capturing hidden states."""
+        def hook(module, inputs, outputs):
+            hidden_state = None
+            
+            # Identify hidden state in outputs
+            if isinstance(outputs, torch.Tensor):
+                # Simplest case: output is the hidden state tensor
+                hidden_state = outputs
+            elif isinstance(outputs, tuple) and len(outputs) > 0 and isinstance(outputs[0], torch.Tensor):
+                # Common case: output is a tuple, first element is the hidden state
+                hidden_state = outputs[0]
+            
+            if hidden_state is not None:
+                # Store the hidden state, detached to avoid memory issues
+                processed_hs = hidden_state.detach()
+                if self.cpu_offload:
+                    processed_hs = processed_hs.cpu()
+                self.hidden_states[layer_name] = processed_hs
+            else:
+                logger.warning(f"Could not identify hidden state in output of layer '{layer_name}'")
+        
+        return hook
+        
+    def compute(self, inputs: Dict[str, torch.Tensor], target_indices: List[int]) -> Dict[str, Any]:
         """
-        Ensure hidden states are cached for all layers.
+        Compute logit lens projections for the given inputs and target indices.
         
         Args:
-            inputs: Model input tensors
-        """
-        # Skip if hidden states are already cached for first layer
-        if self.cache.has(0, "hidden"):
-            return
-        
-        # Set up hook manager
-        hook_mgr = TraceHookManager(self.model, self.cache)
-        
-        # Register hooks for all layers
-        for i, name in enumerate(self.layer_names):
-            hook_mgr.add_layer(name, ("hidden",), i)
-        
-        # Install hooks and run forward pass
-        hook_mgr.install()
-        hook_mgr.run(inputs, loss_fn=None)
-        hook_mgr.clear()
-    
-    def project_tokens(self, layer_idx: int, token_idx_list: List[int], 
-                       tokenizer: Any) -> Dict[int, Dict[str, Any]]:
-        """
-        Project hidden states for specific tokens through language model head.
-        
-        Args:
-            layer_idx: Index of the layer to analyze
-            token_idx_list: List of token indices to project
-            tokenizer: Tokenizer for converting IDs to text
+            inputs: Model inputs
+            target_indices: Indices of token positions to analyze
             
         Returns:
-            Dictionary mapping token indices to projection results
+            Dictionary with logit lens projections per layer and token
         """
-        # Get hidden states from cache
-        hidden = self.cache.get(layer_idx, "hidden", self.device)
+        self.clear_results()
         
-        if hidden is None:
-            print(f"Warning: No hidden states found for layer {layer_idx}")
+        if not target_indices:
+            logger.warning("No target indices provided. Cannot compute logit lens projections.")
             return {}
         
-        # Extract hidden states for requested tokens
-        if hidden.dim() == 3:  # [batch, seq, dim]
-            slice = hidden[:, token_idx_list]
-        else:  # [seq, dim]
-            slice = hidden[token_idx_list]
+        # Ensure model in eval mode
+        self.model.eval()
         
-        # Project through language model head
-        logits = self.model.language_model.lm_head(slice).float()
+        # Forward pass to capture hidden states for all layers
+        with torch.no_grad():
+            _ = self.model(**{k: v for k, v in inputs.items() if k != "token_type_ids"},
+                          output_hidden_states=True)
         
-        # Convert to probabilities
-        if logits.dim() == 3:  # [batch, tokens, vocab]
-            probs = torch.softmax(logits, -1)[0]  # Remove batch dimension
-        else:  # [tokens, vocab]
-            probs = torch.softmax(logits, -1)
+        # Compute projections for each token position in each layer
+        self.projections = self._compute_projections(target_indices)
         
-        # Get top-k predictions
-        topk = torch.topk(probs, self.top_k, dim=-1)
-        
-        # Prepare result dictionary
-        result = {}
-        
-        for i, idx in enumerate(token_idx_list):
-            token_indices = topk.indices[i].tolist()
-            token_probs = topk.values[i].tolist()
-            
-            # Create prediction entries with text
-            predictions = [
-                {
-                    "token": tokenizer.decode([t]),
-                    "prob": float(p),
-                    "token_id": t
-                }
-                for t, p in zip(token_indices, token_probs)
-            ]
-            
-            # Store predictions for this token
-            result[idx] = {"predictions": predictions}
-            
-            # Add concept predictions if requested
-            if self.concepts:
-                concept_predictions = {}
-                
-                for concept in self.concepts:
-                    # Tokenize the concept
-                    concept_token_ids = tokenizer.encode(concept, add_special_tokens=False)
-                    
-                    if concept_token_ids:
-                        # Get probability for this concept's tokens
-                        concept_probs = [probs[i, t].item() for t in concept_token_ids]
-                        max_prob = max(concept_probs)
-                        
-                        concept_predictions[concept] = {
-                            "probability": max_prob,
-                            "token_ids": concept_token_ids
-                        }
-                
-                result[idx]["concept_predictions"] = concept_predictions
-        
-        return result
-        
-    def trace_layer(self, layer_idx: int, 
-                   targets: Dict[int, float],
-                   sel_cfg: Any) -> List[Dict[str, Any]]:
+        return {"projections": self.projections}
+    
+    def _compute_projections(self, token_indices: List[int]) -> Dict[str, Dict[int, Dict[str, Any]]]:
         """
-        This backend doesn't actually trace, but fulfills the interface. 
-        Instead, it computes projections that are used by other backends.
+        Project hidden states through LM head for specific token positions.
         
         Args:
-            layer_idx: Index of the layer to analyze
-            targets: Dictionary mapping target token indices to weights
-            sel_cfg: Configuration for token selection and pruning
+            token_indices: Indices of token positions to analyze
             
         Returns:
-            Always returns an empty list (used only via project_tokens)
+            Nested dict: {layer_name: {token_idx: {projection_data}}}
         """
-        return []
+        projections = {}
+        
+        # Process each layer
+        for layer_name, hidden_states in self.hidden_states.items():
+            layer_projections = {}
+            
+            # Move hidden states to LM head device if needed
+            hidden_states_device = hidden_states.device
+            lm_head_device = next(self.lm_head.parameters()).device
+            
+            if hidden_states_device != lm_head_device:
+                hidden_states = hidden_states.to(lm_head_device)
+            
+            # Process each token index
+            try:
+                for token_idx in token_indices:
+                    if token_idx >= hidden_states.shape[1]:
+                        logger.warning(f"Token index {token_idx} exceeds sequence length. Skipping.")
+                        continue
+                    
+                    # Extract hidden state for this token position
+                    token_hidden = hidden_states[:, token_idx:token_idx+1]
+                    
+                    # Project through LM head
+                    token_logits = self.lm_head(token_hidden).float()
+                    token_probs = torch.softmax(token_logits, dim=-1)
+                    
+                    # Get top-k predictions
+                    k = 5  # Number of top predictions to track
+                    top_probs, top_indices = torch.topk(token_probs[0, 0], k)
+                    
+                    # Store results for this token
+                    token_projections = {
+                        "logits": token_logits[0, 0].detach().cpu() if self.cpu_offload else token_logits[0, 0].detach(),
+                        "top_k": {
+                            "indices": top_indices.cpu().tolist() if self.cpu_offload else top_indices.tolist(),
+                            "probs": top_probs.cpu().tolist() if self.cpu_offload else top_probs.tolist()
+                        }
+                    }
+                    
+                    layer_projections[token_idx] = token_projections
+            
+            finally:
+                # Clean up if moved to different device
+                if hidden_states_device != lm_head_device:
+                    del hidden_states
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            
+            # Store projections for this layer
+            projections[layer_name] = layer_projections
+        
+        return projections
+        
+    def clear_results(self) -> None:
+        """Clear previous computation results."""
+        self.hidden_states.clear()
+        self.projections.clear()
+        
+    def cleanup(self) -> None:
+        """Remove all hooks and free resources."""
+        remove_hooks(self.hooks)
+        self.hooks.clear()
+        
+        self.clear_results()
+        self.clear_cache()
+        
+        self.hooked_layers.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

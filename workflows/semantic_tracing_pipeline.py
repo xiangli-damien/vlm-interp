@@ -1,270 +1,147 @@
+# workflows/semantic_tracing_pipeline.py
 """
-End-to-end semantic tracing pipeline for comprehensive analysis.
-Combines all workflow components into a convenient interface.
+End-to-end pipeline for running semantic tracing on VLMs.
 """
 
-import os
-import time
 import torch
-import gc
-from typing import Dict, List, Optional, Any, Tuple, Union
-from PIL import Image
+import os
+import logging
+import time
+from typing import Dict, List, Tuple, Optional, Union, Any
 
-from runtime.model_utils import load_model
+from workflows.semantic_tracing import SemanticTracer
+from runtime.model_utils import load_model, get_llm_attention_layer_names
 from runtime.selection import SelectionConfig
 from preprocess.input_builder import prepare_inputs
-from workflows.semantic_tracing import SemanticTracingWorkflow
+from preprocess.image import load_image
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-def run_semantic_tracing(
+def run_semantic_tracing_pipeline(
     model_id: str,
-    image_path: str, 
-    prompt: str,
-    output_dir: str,
-    beta_target: float = 0.8,
-    beta_layer: float = 0.7,
-    min_keep: int = 3,
-    max_keep: int = 10,
-    min_keep_layer: int = 8,
-    max_keep_layer: int = 400,
+    image_path: str,
+    prompt_text: str,
+    output_dir: str = "semantic_tracing_results",
     num_tokens: int = 1,
-    load_in_4bit: bool = True,
     target_token_idx: Optional[int] = None,
     analyze_specific_indices: Optional[List[int]] = None,
-    generate_only: bool = False,
-    concepts_to_track: Optional[List[str]] = None,
+    analyze_last_token: bool = False,
+    load_in_4bit: bool = True,
     tracing_mode: str = "saliency",
-    enable_gradients: bool = False,
-    use_flash_attn: bool = False,
-    debug_mode: bool = False
+    single_forward_pass: bool = False,
+    selection_config: Optional[Dict[str, Any]] = None,
+    logit_lens_concepts: Optional[List[str]] = None,
+    image_size: Optional[Tuple[int, int]] = None,
+    cpu_offload: bool = True,
+    debug: bool = False
 ) -> Dict[str, Any]:
     """
-    Run semantic tracing analysis on an image-text pair with advanced options.
+    Run a complete semantic tracing pipeline on a VLM.
     
     Args:
-        model_id: HuggingFace model ID
+        model_id: Hugging Face model ID
         image_path: Path to the image file
-        prompt: Text prompt to use
+        prompt_text: Text prompt
         output_dir: Directory to save results
-        beta_target: Coverage threshold for selecting source nodes per target
-        beta_layer: Coverage threshold for pruning at layer level
-        min_keep: Minimum nodes to keep per target
-        max_keep: Maximum nodes to keep per target
-        min_keep_layer: Minimum nodes to keep per layer
-        max_keep_layer: Maximum nodes to keep per layer
         num_tokens: Number of tokens to generate and analyze
+        target_token_idx: Specific token index to analyze
+        analyze_specific_indices: List of token indices to analyze
+        analyze_last_token: Whether to analyze last token in prompt
         load_in_4bit: Whether to load the model in 4-bit precision
-        target_token_idx: Index of specific token to analyze (if None, uses first generated token)
-        analyze_specific_indices: List of specific token indices to analyze
-        generate_only: If True, only generate tokens without analysis
-        concepts_to_track: List of concepts to track with logit lens
-        tracing_mode: The tracing mode to use ("saliency", "attention", or "both")
-        enable_gradients: Whether to enable gradient calculation for tracing
-        use_flash_attn: Whether to use flash-attention for faster inference
-        debug_mode: Whether to print detailed debug information
-    
+        tracing_mode: "saliency", "attention", or "both"
+        single_forward_pass: Use one forward pass for all layers
+        selection_config: Configuration for node selection
+        logit_lens_concepts: Concepts to track with logit lens
+        image_size: Size to resize the image to
+        cpu_offload: Whether to offload tensors to CPU when possible
+        debug: Whether to print additional debug information
+        
     Returns:
-        Dictionary with paths to saved CSV files and metadata
+        Dictionary with semantic tracing results
     """
-    start_time = time.time()
-    print(f"=== Starting Semantic Tracing Analysis ===")
-    print(f"Model: {model_id}")
-    print(f"Image: {image_path}")
-    print(f"Prompt: {prompt}")
-    print(f"Output Directory: {output_dir}")
-    print(f"Tracing Mode: {tracing_mode}")
-    
-    # Create organized output directory structure
+    # 1. Set up directories
     os.makedirs(output_dir, exist_ok=True)
     
-    # Print analysis mode information
-    if generate_only:
-        mode_str = f"Generating {num_tokens} tokens without analysis"
-    elif analyze_specific_indices:
-        mode_str = f"Generating {num_tokens} tokens and analyzing specific indices: {analyze_specific_indices}"
-    else:
-        mode_str = f"Analyzing {num_tokens} token(s)"
-    print(f"Mode: {mode_str}")
-    
-    # Print node selection parameters
-    print(f"Coverage Parameters: β_target={beta_target}, β_layer={beta_layer}")
-    print(f"Node Limits: min_keep={min_keep}, max_keep={max_keep}, min_keep_layer={min_keep_layer}, max_keep_layer={max_keep_layer}")
-    
-    # 1. Load model and processor
-    print("\nLoading model and processor...")
+    # 2. Load model and processor
+    logger.info(f"Loading model: {model_id}")
     model, processor = load_model(
         model_id=model_id,
-        use_flash_attn=use_flash_attn,
         load_in_4bit=load_in_4bit,
-        enable_gradients=enable_gradients,
-        device_map="auto"
+        enable_gradients=True  # Required for saliency analysis
     )
     
-    # 2. Load image
-    print("\nLoading image...")
-    from preprocess.image import load_image
-    image = load_image(image_path, resize_to=(336, 336))
+    # 3. Load image
+    logger.info(f"Loading image: {image_path}")
+    image = load_image(image_path, resize_to=image_size)
     
-    # 3. Create selection config
-    selection_config = SelectionConfig(
-        beta_target=beta_target,
-        beta_layer=beta_layer,
-        min_keep=min_keep,
-        max_keep=max_keep,
-        min_keep_layer=min_keep_layer,
-        max_keep_layer=max_keep_layer
+    # 4. Prepare inputs
+    logger.info("Preparing inputs")
+    input_data = prepare_inputs(
+        model=model,
+        processor=processor,
+        image=image,
+        prompt=prompt_text
     )
     
-    # 4. Create semantic tracing workflow
-    workflow = SemanticTracingWorkflow(
+    # 5. Create selection config if provided
+    if selection_config:
+        sel_config = SelectionConfig(
+            beta_target=selection_config.get("beta_target", 0.8),
+            beta_layer=selection_config.get("beta_layer", 1.0),
+            min_keep=selection_config.get("min_keep", 4),
+            max_keep=selection_config.get("max_keep", 6),
+            min_keep_layer=selection_config.get("min_keep_layer", 8),
+            max_keep_layer=selection_config.get("max_keep_layer", 400)
+        )
+    else:
+        sel_config = None
+    
+    # 6. Create tracer
+    logger.info("Initializing semantic tracer")
+    tracer = SemanticTracer(
         model=model,
         processor=processor,
         output_dir=output_dir,
-        selection_config=selection_config,
-        logit_lens_concepts=concepts_to_track,
-        debug=debug_mode
+        selection_config=sel_config,
+        logit_lens_concepts=logit_lens_concepts,
+        cpu_offload=cpu_offload,
+        debug=debug
     )
     
-    # 5. Prepare inputs
-    print("\nPreparing inputs...")
-    input_data = workflow.prepare_inputs(image, prompt)
+    # 7. Run tracing
+    logger.info(f"Running semantic tracing with mode: {tracing_mode}")
+    start_time = time.time()
     
-    # 6. Run semantic tracing based on the selected mode
-    print("\nRunning semantic tracing...")
-    
-    if generate_only:
-        # Generate tokens without analysis (for faster generation)
-        gen_results = workflow.autoregressive_generate(input_data["inputs"], num_tokens)
-        
-        # Create results without trace data
-        trace_results = {
-            "full_sequence": gen_results["full_sequence"],
-            "generated_tokens": gen_results["generated_tokens"],
-            "original_seq_len": gen_results["original_seq_len"],
-        }
-    elif analyze_specific_indices:
-        # Generate all tokens first, then analyze specific indices
-        trace_results = workflow.generate_all_then_analyze_specific(
-            input_data=input_data,
-            num_tokens=num_tokens,
-            analyze_indices=analyze_specific_indices,
-            tracing_mode=tracing_mode
-        )
-    elif target_token_idx is not None:
-        # Analyze a specific token
-        result = workflow.analyze_specific_token(
-            input_data=input_data,
-            token_idx=target_token_idx,
-            mode=tracing_mode
-        )
-        trace_results = {
-            "trace_results": {tracing_mode: result},
-            "target_token": result["target_tokens"][0] if "target_tokens" in result else None,
-            "metadata_path": result.get("metadata_path"),
-        }
-    elif num_tokens > 1:
-        # Analyze multiple consecutively generated tokens
-        trace_results = workflow.generate_and_trace(
-            input_data=input_data,
-            num_tokens=num_tokens,
-            mode=tracing_mode
-        )
-    else:
-        # Generate and analyze a single token
-        result = workflow.generate_and_trace(
-            input_data=input_data,
-            num_tokens=1,
-            mode=tracing_mode
-        )
-        # Simplify results structure for single token
-        trace_results = {
-            "trace_results": result["trace_results"],
-            "target_token": result["target_tokens"][0] if result.get("target_tokens") else None,
-            "full_sequence": result.get("full_sequence", {}),
-            "metadata_path": result.get("metadata_path"),
-        }
-    
-    # 7. Prepare output information
-    output_info = {
-        "csv_files": [],
-        "metadata_path": trace_results.get("metadata_path"),
-        "target_tokens": [],
-        "all_generated_tokens": trace_results.get("all_generated_tokens", []),
-        "full_sequence": trace_results.get("full_sequence", {}),
-        "analysis_time": time.time() - start_time,
-        "image_path": image_path,
-        "tracing_mode": tracing_mode
-    }
-    
-    # Extract CSV paths from results (skip for generate_only mode)
-    if not generate_only:
-        if "trace_results" in trace_results:
-            # Handle both single token and multiple token results
-            if isinstance(trace_results["trace_results"], dict):
-                # Process each token's results
-                for mode_key, mode_value in trace_results["trace_results"].items():
-                    # Check if this is a tracing mode results or a token results
-                    if isinstance(mode_value, dict) and "csv" in mode_value:
-                        # This is a tracing mode result
-                        output_info["csv_files"].append(mode_value["csv"])
-                    elif isinstance(mode_value, dict):
-                        # This is a token results with potentially multiple tracing modes
-                        for subkey, subvalue in mode_value.items():
-                            if isinstance(subvalue, dict) and "csv" in subvalue:
-                                output_info["csv_files"].append(subvalue["csv"])
-    
-    # Extract target token information
-    if "target_tokens" in trace_results:
-        output_info["target_tokens"] = trace_results["target_tokens"]
-    elif "target_token" in trace_results and trace_results["target_token"]:
-        output_info["target_tokens"] = [trace_results["target_token"]]
-    
-    # Save analysis summary
-    csv_dir = os.path.join(output_dir, "csv_data")
-    os.makedirs(csv_dir, exist_ok=True)
-    summary_path = os.path.join(csv_dir, "analysis_summary.json")
     try:
-        import json
-        with open(summary_path, 'w') as f:
-            # Create a JSON-serializable version of the output info
-            summary_info = {
-                "model_id": model_id,
-                "image_path": image_path,
-                "prompt": prompt,
-                "num_tokens": num_tokens,
-                "tracing_mode": tracing_mode,
-                "beta_target": beta_target,
-                "beta_layer": beta_layer,
-                "min_keep": min_keep,
-                "max_keep": max_keep,
-                "min_keep_layer": min_keep_layer,
-                "max_keep_layer": max_keep_layer,
-                "analyze_specific_indices": analyze_specific_indices,
-                "csv_files": output_info["csv_files"],
-                "metadata_path": output_info["metadata_path"],
-                "target_tokens": output_info["target_tokens"],
-                "all_generated_tokens": output_info.get("all_generated_tokens", []),
-                "full_sequence": output_info["full_sequence"],
-                "analysis_time": output_info["analysis_time"]
-            }
-            json.dump(summary_info, f, indent=2)
-        output_info["summary_path"] = summary_path
+        result = tracer.trace(
+            input_data=input_data,
+            num_tokens=num_tokens,
+            target_token_idx=target_token_idx,
+            analyze_specific_indices=analyze_specific_indices,
+            analyze_last_token=analyze_last_token,
+            tracing_mode=tracing_mode,
+            single_forward_pass=single_forward_pass
+        )
     except Exception as e:
-        print(f"Error saving analysis summary: {e}")
+        logger.error(f"Error during semantic tracing: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
     
-    print(f"\n=== Analysis Complete ===")
-    print(f"Analysis time: {output_info['analysis_time']:.2f} seconds")
-    print(f"CSV data saved to: {os.path.join(output_dir, 'csv_data')}")
+    # 8. Calculate and log elapsed time
+    elapsed_time = time.time() - start_time
+    logger.info(f"Semantic tracing completed in {elapsed_time:.2f} seconds")
     
-    if not generate_only:
-        print(f"Generated {len(output_info['csv_files'])} trace data files")
-    else:
-        print(f"Generated {len(output_info.get('all_generated_tokens', []))} tokens without analysis")
+    # 9. Add extra metadata to result
+    result["elapsed_time"] = elapsed_time
+    result["model_id"] = model_id
+    result["image_path"] = image_path
+    result["prompt_text"] = prompt_text
     
-    # Clean up memory
-    del model, processor, workflow, input_data, trace_results
-    gc.collect()
+    # 10. Clean up resources
+    del model, processor, tracer
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
-    return output_info
+    return result
