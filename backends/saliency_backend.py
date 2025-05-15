@@ -169,6 +169,11 @@ class SaliencyBackend(BaseBackend):
         Returns:
             Dictionary with saliency scores per layer
         """
+        if not hasattr(self, "_frozen"):
+            logger.info("Freezing model parameters to optimize memory usage")
+            for p in self.model.parameters():
+                p.requires_grad_(False)
+            self._frozen = True  # Only do this once
         self.clear_results()
         
         if not target_indices:
