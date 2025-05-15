@@ -14,7 +14,7 @@ from runtime.io import TraceIO
 from preprocess.input_builder import prepare_inputs
 from runtime.generation import GenerationMixin
 from runtime.selection import SelectionConfig
-from runtime.cache import TracingCache
+from runtime.cache import ActivationCache
 from backends.saliency_backend import SaliencyBackend
 from analysis.saliency_viz import visualize_information_flow
 

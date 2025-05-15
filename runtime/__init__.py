@@ -11,7 +11,6 @@ from runtime.hooks import register_hooks, remove_hooks
 
 __all__ = [
     "ActivationCache",
-    "TracingCache",
     "register_hooks",
     "remove_hooks",
     "TraceHookManager",
