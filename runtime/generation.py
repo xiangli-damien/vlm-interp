@@ -98,7 +98,9 @@ class GenerationMixin:
                 })
                 
                 # Update input IDs for next iteration
-                current_input_ids = torch.cat([current_input_ids, next_token_id.unsqueeze(0).unsqueeze(0)], dim=1)
+                current_input_ids = torch.cat(
+                    [current_input_ids, next_token_id.unsqueeze(1)], dim=1
+                )
                 inputs_copy["input_ids"] = current_input_ids
                 
                 # Update attention mask to ensure newly generated token is attended to
