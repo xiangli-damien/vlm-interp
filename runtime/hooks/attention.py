@@ -44,12 +44,16 @@ class SaveAttnHook:
         # For transformer layers, attention weights are typically the second output
         attn = out[1] if isinstance(out, tuple) and len(out) > 1 else out
         
+        # Check if this tensor has been wrapped by LightAttnFn
+        # and get the original tensor if available
+        attn_base = getattr(attn, "_base", attn)
+        
         # --- DEBUG LOG ---
         print(f"[DEBUG][SaveAttnHook] saving attention for layer {self.layer_idx}")
-        print(f"[DEBUG][SaveAttnHook] attn.shape={tuple(attn.shape)}")
+        print(f"[DEBUG][SaveAttnHook] attn.shape={tuple(attn_base.shape)}")
         
         # Store in cache
-        self.cache.set(self.layer_idx, "attn", attn)
+        self.cache.set(self.layer_idx, "attn", attn_base)
         
         # Return unmodified output (non-intrusive hook)
         return out

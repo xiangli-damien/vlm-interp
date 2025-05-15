@@ -83,17 +83,17 @@ class LogitBackend(BaseBackend):
             Dictionary mapping token indices to projection results
         """
         # Get hidden states from cache
-        hid = self.cache.get(layer_idx, "hidden", self.device)
+        hidden = self.cache.get(layer_idx, "hidden", self.device)
         
-        if hid is None:
+        if hidden is None:
             print(f"Warning: No hidden states found for layer {layer_idx}")
             return {}
         
         # Extract hidden states for requested tokens
-        if hid.dim() == 3:  # [batch, seq, dim]
-            slice = hid[:, token_idx_list]
+        if hidden.dim() == 3:  # [batch, seq, dim]
+            slice = hidden[:, token_idx_list]
         else:  # [seq, dim]
-            slice = hid[token_idx_list]
+            slice = hidden[token_idx_list]
         
         # Project through language model head
         logits = self.model.language_model.lm_head(slice).float()

@@ -24,7 +24,7 @@ class TracingCache:
         self.hidden: Dict[int, torch.Tensor] = {}
         self.attn: Dict[int, torch.Tensor] = {}
         self.grad: Dict[int, torch.Tensor] = {}
-        self.saliency: Dict[int, torch.Tensor] = {}  # Changed from 'sal' to 'saliency'
+        self.saliency: Dict[int, torch.Tensor] = {}  # Using standardized name "saliency"
         self.grad_missing: Dict[int, bool] = {}
         self.cpu_offload = cpu_offload
         
@@ -42,7 +42,7 @@ class TracingCache:
             detach: Whether to detach the tensor from the computation graph
         """
         # Validate kind parameter
-        if kind not in ['hidden', 'attn', 'grad', 'saliency']:  # Updated validation list
+        if kind not in ['hidden', 'attn', 'grad', 'saliency']:  # Using standardized name "saliency"
             raise ValueError(f"Invalid tensor kind: {kind}")
         
         # Process tensor (detach and convert to CPU if needed)
@@ -78,7 +78,7 @@ class TracingCache:
             The cached tensor, or None if not found
         """
         # Validate kind parameter
-        if kind not in ['hidden', 'attn', 'grad', 'saliency']:  # Updated validation list
+        if kind not in ['hidden', 'attn', 'grad', 'saliency']:  # Using standardized name "saliency"
             raise ValueError(f"Invalid tensor kind: {kind}")
         
         # Get tensor from appropriate dictionary
@@ -106,7 +106,7 @@ class TracingCache:
             True if the tensor exists, False otherwise
         """
         # Validate kind parameter
-        if kind not in ['hidden', 'attn', 'grad', 'saliency']:  # Updated validation list
+        if kind not in ['hidden', 'attn', 'grad', 'saliency']:  # Using standardized name "saliency"
             raise ValueError(f"Invalid tensor kind: {kind}")
         
         # Check appropriate dictionary
@@ -122,7 +122,7 @@ class TracingCache:
             kind: Tensor type ('hidden', 'attn', 'grad', or 'saliency')
         """
         # Validate kind parameter
-        if kind not in ['hidden', 'attn', 'grad', 'saliency']:  # Updated validation list
+        if kind not in ['hidden', 'attn', 'grad', 'saliency']:  # Using standardized name "saliency"
             raise ValueError(f"Invalid tensor kind: {kind}")
         
         # Remove from appropriate dictionary
@@ -148,11 +148,11 @@ class TracingCache:
             self.hidden.clear()
             self.attn.clear()
             self.grad.clear()
-            self.saliency.clear()  # Updated from 'sal' to 'saliency'
+            self.saliency.clear()  # Using standardized name "saliency"
             self.grad_missing.clear()
         else:
             # Validate kind parameter
-            if kind not in ['hidden', 'attn', 'grad', 'saliency']:  # Updated validation list
+            if kind not in ['hidden', 'attn', 'grad', 'saliency']:  # Using standardized name "saliency"
                 raise ValueError(f"Invalid tensor kind: {kind}")
             
             # Clear specific cache
@@ -174,22 +174,22 @@ class _GlobalSalCache:
         """Initialize the global saliency cache."""
         self._cache: Dict[int, torch.Tensor] = {}
     
-    def store(self, layer: int, sal: torch.Tensor) -> None:
+    def store(self, layer: int, saliency: torch.Tensor) -> None:  # Changed parameter name from sal to saliency
         """
         Store a saliency tensor for a specific layer.
         
         Args:
             layer: Layer index
-            sal: Saliency tensor (|attention * gradient|)
+            saliency: Saliency tensor (|attention * gradient|)
         """
         # Make sure we store a detached copy to avoid memory leaks
         # Use float32 for numerical stability
-        if sal.requires_grad:
-            sal = sal.detach()
+        if saliency.requires_grad:
+            saliency = saliency.detach()
             
         # Store with CPU offloading for memory efficiency
-        self._cache[layer] = sal.to(torch.float32).cpu()
-        print(f"[DEBUG][GlobalSalCache] Stored saliency for layer {layer}, shape: {tuple(sal.shape)}")
+        self._cache[layer] = saliency.to(torch.float32).cpu()
+        print(f"[DEBUG][GlobalSalCache] Stored saliency for layer {layer}, shape: {tuple(saliency.shape)}")
     
     def pop(self, layer: int) -> Optional[torch.Tensor]:
         """

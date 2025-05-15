@@ -32,9 +32,14 @@ class LightAttnFn(torch.autograd.Function):
         """
         ctx.save_for_backward(attn)
         ctx.layer_idx = layer_idx
+        
+        # Create wrapped tensor and add _base attribute
+        attn_wrapped = attn  # Reference to maintain computational graph
+        attn_wrapped._base = attn  # Add reference to original tensor
+        
         # Important: We need to ensure the same tensor is returned
         # to maintain the computational graph
-        return attn
+        return attn_wrapped
     
     @staticmethod
     def backward(ctx, grad_output):
@@ -86,31 +91,31 @@ class LightAttnFn(torch.autograd.Function):
         # Compute saliency score |attention * gradient|
         try:
             # Element-wise multiplication followed by absolute value
-            sal = (attn * grad_output).abs()
+            saliency = (attn * grad_output).abs()  # Changed variable name from sal to saliency
             
             # Average over batch and head dimensions if present
-            if sal.dim() == 4:  # [batch, head, seq, seq]
-                sal = sal.mean((0, 1))
-            elif sal.dim() == 3:  # [batch, seq, seq] or [head, seq, seq]
-                sal = sal.mean(0)
+            if saliency.dim() == 4:  # [batch, head, seq, seq]
+                saliency = saliency.mean((0, 1))
+            elif saliency.dim() == 3:  # [batch, seq, seq] or [head, seq, seq]
+                saliency = saliency.mean(0)
             
-            print(f"[DEBUG][LightAttnFn] computed saliency for layer {layer_idx}; sal.shape={tuple(sal.shape)}")
+            print(f"[DEBUG][LightAttnFn] computed saliency for layer {layer_idx}; saliency.shape={tuple(saliency.shape)}")
             
             # Validate saliency - ensure it's not all zeros or NaNs
-            if torch.isnan(sal).any():
+            if torch.isnan(saliency).any():
                 print(f"[WARNING][LightAttnFn] NaN values detected in saliency map for layer {layer_idx}")
-                sal = torch.where(torch.isnan(sal), torch.zeros_like(sal), sal)
+                saliency = torch.where(torch.isnan(saliency), torch.zeros_like(saliency), saliency)
                 
-            if sal.abs().sum().item() < 1e-10:
+            if saliency.abs().sum().item() < 1e-10:
                 print(f"[WARNING][LightAttnFn] Near-zero saliency map for layer {layer_idx}")
                 # Add small epsilon to ensure non-zero values
-                sal = sal + torch.ones_like(sal) * 1e-10
+                saliency = saliency + torch.ones_like(saliency) * 1e-10
                 
             # Store in global cache
             if layer_idx != -1:
-                print(f"[DEBUG][LightAttnFn] storing saliency for layer {layer_idx}; sal.shape={tuple(sal.shape)}")
+                print(f"[DEBUG][LightAttnFn] storing saliency for layer {layer_idx}; saliency.shape={tuple(saliency.shape)}")
                 # Store the saliency map in global cache
-                global_sal_cache.store(layer_idx, sal)
+                global_sal_cache.store(layer_idx, saliency)
         except Exception as e:
             print(f"[ERROR][LightAttnFn] Error computing saliency: {e}")
         

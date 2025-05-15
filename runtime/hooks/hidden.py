@@ -31,13 +31,13 @@ class HiddenHook:
         """
         Forward hook
         """
-        hid = out[0] if isinstance(out, tuple) else out
+        hidden = out[0] if isinstance(out, tuple) else out
 
-        cached = hid.detach()
+        cached = hidden.detach()
         self.cache.set(self.layer_idx, "hidden",
                        cached.cpu() if self.cache.cpu_offload else cached)
 
         # return a detached view to free GPU mem
         if isinstance(out, tuple):
-            return (hid.detach(),) + out[1:]
-        return hid.detach()
+            return (hidden.detach(),) + out[1:]
+        return hidden.detach()

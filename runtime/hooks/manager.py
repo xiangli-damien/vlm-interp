@@ -44,7 +44,7 @@ class TraceHookManager:
         self.device = next(model.parameters()).device
     
     def add_layer(self, layer_name: str, capture: Tuple[str, ...] = ("attention",), 
-                  layer_idx: int = 0) -> None:
+              layer_idx: int = 0) -> None:
         """
         Register hooks for a specific layer.
         
@@ -64,8 +64,13 @@ class TraceHookManager:
         if layer_name not in self.layer_hooks:
             self.layer_hooks[layer_name] = {}
         
-        # Register appropriate hooks based on capture types
-        for cap_type in capture:
+        # Sort capture types to ensure 'grad' comes before 'attention'
+        # This is critical for proper saliency computation
+        sorted_capture = sorted(capture, key=lambda x: 0 if x == "grad" else (1 if x == "attention" else 2))
+        print(f"[DEBUG][TraceHookManager] Original capture order: {capture}, sorted order: {sorted_capture}")
+        
+        # Register appropriate hooks based on capture types (in sorted order)
+        for cap_type in sorted_capture:
             # Skip if already registered
             if cap_type in self.layer_hooks[layer_name]:
                 continue
@@ -77,6 +82,7 @@ class TraceHookManager:
                 handle = module.register_forward_hook(hook)
                 self.hooks.append(handle)
                 self.layer_hooks[layer_name][cap_type] = True
+                print(f"[DEBUG][TraceHookManager] Registered attention hook for layer {layer_idx}")
             
             elif cap_type == "grad":
                 # For capturing gradients, use GradAttnHook
@@ -95,6 +101,7 @@ class TraceHookManager:
                 self.hooks.append(b_handle)
                 
                 self.layer_hooks[layer_name][cap_type] = True
+                print(f"[DEBUG][TraceHookManager] Registered gradient hook for layer {layer_idx}")
                 
             elif cap_type == "hidden":
                 # For hidden state capture, use HiddenHook
@@ -102,6 +109,7 @@ class TraceHookManager:
                 handle = module.register_forward_hook(hook)
                 self.hooks.append(handle)
                 self.layer_hooks[layer_name][cap_type] = True
+                print(f"[DEBUG][TraceHookManager] Registered hidden state hook for layer {layer_idx}")
     
     def install(self) -> int:
         """
@@ -165,10 +173,10 @@ class TraceHookManager:
                 # and transfer them to the main cache
                 print(f"[DEBUG][TraceHookManager] global_sal_cache keys before pop: {list(global_sal_cache._cache.keys())}")    
                 for layer_idx in list(global_sal_cache._cache.keys()):
-                    sal = global_sal_cache.pop(layer_idx)
-                    print(f"[DEBUG][TraceHookManager] popped saliency for layer {layer_idx}; sal.shape={None if sal is None else tuple(sal.shape)}")
-                    if sal is not None:
-                        self.cache.set(layer_idx, "saliency", sal)
+                    saliency = global_sal_cache.pop(layer_idx)  # Changed variable name from sal to saliency
+                    print(f"[DEBUG][TraceHookManager] popped saliency for layer {layer_idx}; saliency.shape={None if saliency is None else tuple(saliency.shape)}")
+                    if saliency is not None:
+                        self.cache.set(layer_idx, "saliency", saliency)
                         print(f"[DEBUG][TraceHookManager] saved saliency to cache for layer {layer_idx}")
                 print(f"[DEBUG][TraceHookManager] global_sal_cache keys after pop: {list(global_sal_cache._cache.keys())}")
         

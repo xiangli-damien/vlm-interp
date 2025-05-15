@@ -68,7 +68,7 @@ class SaliencyBackend(BaseBackend):
         )
         
         # Filter to valid targets (position > 0) for loss computation
-        valid_targets = [t for t in target_indices if t > 0]
+        valid_targets = target_indices
         
         # Define loss function for backward pass
         def loss_fn(outputs):
@@ -89,13 +89,15 @@ class SaliencyBackend(BaseBackend):
             # Create a dummy tensor for the case where no valid targets contribute
             dummy_tensor = torch.zeros(1, device=logits.device, dtype=logits.dtype, requires_grad=True)
             
+            # Use all target indices directly (no filtering for position > 0)
+            valid_targets = target_indices
+            
             if valid_targets:
-                # Compute loss for valid target tokens
-                loss = sum(-log_probs[0, t-1, ids[t]] for t in valid_targets)
+                # Compute loss for all target tokens (use t directly, not t-1)
+                loss = sum(-log_probs[0, t, ids[t]] for t in valid_targets)
             else:
-                # If no valid targets (e.g., only position 0), 
-                # use the dummy tensor to ensure backward pass still works
-                print(f"[WARNING][SaliencyBackend] No valid targets (t > 0) found. Using dummy loss.")
+                # If no valid targets, use the dummy tensor
+                print(f"[WARNING][SaliencyBackend] No valid targets found. Using dummy loss.")
                 loss = dummy_tensor
             
             print(f"[DEBUG][SaliencyBackend] loss created with gradient tracking: {loss.requires_grad}")
@@ -122,24 +124,24 @@ class SaliencyBackend(BaseBackend):
             print(f"[DEBUG][SaliencyBackend] Running fallback A×grad computation for layer {layer_idx}")
             
             # Get attention and gradient tensors
-            att = self.cache.get(layer_idx, "attn", self.device)
+            attn = self.cache.get(layer_idx, "attn", self.device)
             grad = self.cache.get(layer_idx, "grad", self.device)
             
-            if att is not None and grad is not None:
+            if attn is not None and grad is not None:
                 # Make sure shapes match
-                if att.shape == grad.shape:
+                if attn.shape == grad.shape:
                     # Compute saliency |attention * gradient|
-                    sal = (att * grad).abs()
+                    saliency = (attn * grad).abs()  # Changed variable name from sal to saliency
                     
                     # Average over batch and heads if needed
-                    if sal.dim() == 4:  # [batch, head, seq, seq]
-                        sal = sal.mean((0, 1))
-                    elif sal.dim() == 3:  # [batch, seq, seq] or [head, seq, seq]
-                        sal = sal.mean(0)
+                    if saliency.dim() == 4:  # [batch, head, seq, seq]
+                        saliency = saliency.mean((0, 1))
+                    elif saliency.dim() == 3:  # [batch, seq, seq] or [head, seq, seq]
+                        saliency = saliency.mean(0)
                     
                     # Cache result
-                    print(f"[DEBUG][SaliencyBackend] Computed fallback saliency for layer {layer_idx}, shape: {tuple(sal.shape)}")
-                    self.cache.set(layer_idx, "saliency", sal)
+                    print(f"[DEBUG][SaliencyBackend] Computed fallback saliency for layer {layer_idx}, shape: {tuple(saliency.shape)}")
+                    self.cache.set(layer_idx, "saliency", saliency)
                 else:
                     print(f"[ERROR] Shape mismatch: attention {tuple(att.shape)} vs gradient {tuple(grad.shape)}")
             else:
@@ -183,22 +185,22 @@ class SaliencyBackend(BaseBackend):
             self._compute_single_layer(layer_idx, list(compute_targets.keys()))
         
         # Get saliency scores from cache
-        sal = self.cache.get(layer_idx, "saliency", self.device)
-        print(f"[DEBUG][SaliencyBackend.trace_layer] saliency map for layer {layer_idx}: {'found' if sal is not None else 'None'}")
-        
-        if sal is None:
-            print(f"Warning: Failed to compute saliency for layer {layer_idx}")
+        saliency = self.cache.get(layer_idx, "saliency", self.device)
+        print(f"[DEBUG][SaliencyBackend.trace_layer] saliency map for layer {layer_idx}: {'found' if saliency is not None else 'None'}")
+
+        if saliency is None:
+            print(f"[WARNING][SaliencyBackend.trace_layer] Failed to compute saliency for layer {layer_idx}")
             return []
-        
+
         # Process EACH target token - including index 0 targets
         # This follows the original implementation which processed all targets
         results = []
-        
+
         for tgt, w in all_targets.items():
             # Get saliency vector for this target (causal: only consider past tokens)
-            if tgt < sal.shape[0]:
+            if tgt < saliency.shape[0]:
                 # For token 0, there are no previous tokens (empty saliency vector)
-                vec = sal[tgt, :tgt]
+                vec = saliency[tgt, :tgt]
                 
                 # Skip if empty (e.g., first token)
                 if vec.numel() == 0:
