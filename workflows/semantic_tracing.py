@@ -834,8 +834,9 @@ class SemanticTracer(GenerationMixin):
 
             accumulated_records: List[Dict[str, Any]] = []
             for mode_dict in analysis_result.values():
-                for layer_dict in mode_dict.values():
-                    accumulated_records.extend(layer_dict.pop("_records", []))  # when present
+                for layer_result in mode_dict.values():
+                    if isinstance(layer_result, dict):
+                        accumulated_records.extend(layer_result.pop("_records", []))
 
             if accumulated_records:
                 csv_path = self.io.write_trace_data(

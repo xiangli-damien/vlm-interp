@@ -27,7 +27,7 @@ def run_semantic_tracing_pipeline(
     target_token_idx: Optional[int] = None,
     analyze_specific_indices: Optional[List[int]] = None,
     analyze_last_token: bool = False,
-    load_in_4bit: bool = True,
+    load_in_4bit: bool = False,
     tracing_mode: str = "saliency",
     single_forward_pass: bool = False,
     selection_config: Optional[Dict[str, Any]] = None,
