@@ -19,7 +19,15 @@ class SaliencyBackend(BaseBackend):
     Captures attention weights and their gradients during model execution.
     """
     
-    def __init__(self, model, device=None, cpu_offload=True, epsilon=1e-7, batch_size=2):
+    def __init__(
+        self,
+        model,
+        device=None,
+        cpu_offload=True,
+        epsilon=1e-7,
+        batch_size=2,
+        stream_offload: bool = False      # ← NEW parameter for immediate offloading
+    ):
         """
         Initialize the saliency backend.
         
@@ -29,16 +37,37 @@ class SaliencyBackend(BaseBackend):
             cpu_offload: Whether to offload tensors to CPU when possible
             epsilon: Small value for numerical stability
             batch_size: Number of layers to process in a batch
+            stream_offload: Whether to immediately offload tensors to CPU during
+                           forward/backward passes to minimize memory usage
         """
         super().__init__(model, device, cpu_offload)
         self.epsilon = epsilon
         self.batch_size = batch_size
+        self.stream_offload = stream_offload   # ← NEW
+
         self.attention_weights = {}
         self.attention_grads = {}
         self.hooks = []
         self.tensor_hooks = {}
         self.hooked_layers = set()
         self.saliency_scores = {}
+    
+    @staticmethod
+    def _to_cpu_and_clear(t: torch.Tensor) -> torch.Tensor:
+        """
+        Move tensor to CPU (non-blocking) and free GPU storage by swapping data pointer.
+        Returns the *CPU copy* (detached).
+        
+        Args:
+            t: Tensor to move to CPU and clear from GPU
+            
+        Returns:
+            CPU copy of the tensor
+        """
+        cpu_t = t.detach().cpu()
+        # Replace the original tensor with an empty one to free GPU memory
+        t.data = torch.empty(0, device=t.device)
+        return cpu_t
     
     def setup(self, layer_names: List[str]) -> None:
         """
@@ -76,20 +105,37 @@ class SaliencyBackend(BaseBackend):
                     attn_weights = outputs[2]
             
             if attn_weights is not None:
+                # Ensure we can get gradients
+                attn_weights.retain_grad()
+                
                 # Check if gradients are enabled
                 if not attn_weights.requires_grad:
                     logger.warning(f"Attention weights for layer '{layer_name}' do not require grad. Gradient capture may fail.")
                 
-                # Store the weights tensor
-                self.attention_weights[layer_name] = attn_weights
+                # Stream offload if enabled, otherwise store as-is
+                if self.stream_offload:
+                    self.attention_weights[layer_name] = self._to_cpu_and_clear(attn_weights)
+                    
+                    # Register tensor hook to capture gradients immediately
+                    def _capture_grad(grad):
+                        self.attention_grads[layer_name] = self._to_cpu_and_clear(grad)
+                    
+                    if layer_name not in self.tensor_hooks:
+                        handle = attn_weights.register_hook(_capture_grad)
+                        self.tensor_hooks[layer_name] = handle
+                else:
+                    self.attention_weights[layer_name] = attn_weights
         
         return hook
     
     def _create_backward_hook(self, layer_name: str):
-        """Create a backward hook for capturing attention gradients."""
+        """
+        Create a backward hook for capturing attention gradients.
+        When stream_offload=True, this is supplementary to the tensor hooks.
+        """
         def hook(module, grad_input, grad_output):
-            # Check if we captured weights for this layer in the forward pass
-            if layer_name in self.attention_weights:
+            # When using stream_offload, gradients are captured via tensor hooks in forward pass
+            if not self.stream_offload and layer_name in self.attention_weights:
                 attn_weights_tensor = self.attention_weights[layer_name]
                 
                 # Ensure tensor requires gradients
@@ -151,14 +197,14 @@ class SaliencyBackend(BaseBackend):
             self.model.zero_grad(set_to_none=True)
             with torch.enable_grad():
                 outputs = self.model(**{k: v for k, v in inputs.items() if k != "token_type_ids"},
-                                    output_attentions=True,
-                                    use_cache=False)
+                                     output_attentions=True,
+                                     use_cache=False)
                 
                 loss = compute_loss(outputs, target_indices)
                 
                 if loss.requires_grad:
                     loss.backward()
-                    # ★ NEW: Free memory immediately after backward pass
+                    # Free memory immediately after backward pass
                     del outputs, loss
                     torch.cuda.empty_cache()
                 else:
@@ -184,14 +230,14 @@ class SaliencyBackend(BaseBackend):
                 self.model.zero_grad(set_to_none=True)
                 with torch.enable_grad():
                     outputs = self.model(**{k: v for k, v in inputs.items() if k != "token_type_ids"},
-                                        output_attentions=True,
-                                        use_cache=False)
+                                         output_attentions=True,
+                                         use_cache=False)
                     
                     loss = compute_loss(outputs, target_indices)
                     
                     if loss.requires_grad:
                         loss.backward()
-                        # ★ NEW: Free memory immediately after backward pass
+                        # Free memory immediately after backward pass
                         del outputs, loss
                         torch.cuda.empty_cache()
                     else:
@@ -219,40 +265,47 @@ class SaliencyBackend(BaseBackend):
             Dictionary mapping layer names to saliency tensors
         """
         scores = {}
-        captured_grad_layers = list(self.attention_grads.keys())
+        captured_layers = list(self.attention_weights.keys())
         
-        for layer_name in captured_grad_layers:
-            if layer_name in self.attention_weights:
-                attn_weights = self.attention_weights[layer_name]
-                grad = self.attention_grads[layer_name]
+        for layer_name in captured_layers:
+            if layer_name not in self.attention_grads:
+                logger.warning(f"No gradient captured for layer '{layer_name}'. Skipping.")
+                continue
                 
-                # Ensure tensors are compatible
-                if attn_weights.shape != grad.shape:
-                    logger.warning(f"Shape mismatch for layer '{layer_name}'. Skipping.")
-                    continue
-                
-                if attn_weights.device != grad.device:
-                    try:
-                        grad = grad.to(attn_weights.device)
-                    except Exception as e:
-                        logger.warning(f"Error moving gradient for layer '{layer_name}': {e}. Skipping.")
-                        continue
-                
-                # Compute saliency: |Attention * Gradient|
-                saliency = torch.abs(attn_weights.float() * grad.float())
-                
-                # Store the result, optionally offloading to CPU
-                if self.cpu_offload:
-                    scores[layer_name] = saliency.detach().cpu()
-                else:
-                    scores[layer_name] = saliency.detach()
-                
-                # Cleanup
-                del self.attention_weights[layer_name]
-                del self.attention_grads[layer_name]
+            attn_weights = self.attention_weights[layer_name]
+            grad = self.attention_grads[layer_name]
             
+            # Ensure tensors are on the same device
+            if attn_weights.device != grad.device:
+                # In stream_offload mode, both will likely be on CPU
+                try:
+                    grad = grad.to(attn_weights.device)
+                except Exception as e:
+                    logger.warning(f"Error moving gradient for layer '{layer_name}': {e}. Skipping.")
+                    continue
+            
+            # Ensure tensors are compatible
+            if attn_weights.shape != grad.shape:
+                logger.warning(f"Shape mismatch for layer '{layer_name}'. Skipping.")
+                continue
+            
+            # Compute saliency: |Attention * Gradient|
+            saliency = torch.abs(attn_weights.float() * grad.float())
+            
+            # Store the result, optionally offloading to CPU
+            if self.cpu_offload:
+                scores[layer_name] = saliency.cpu()
             else:
-                logger.warning(f"Gradient found for layer '{layer_name}', but no weights were captured.")
+                scores[layer_name] = saliency
+            
+            # Cleanup to free memory
+            del self.attention_weights[layer_name]
+            del self.attention_grads[layer_name]
+            
+            # Free memory aggressively
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         # Update the instance's scores
         self.saliency_scores.update(scores)

@@ -70,8 +70,8 @@ def run_semantic_tracing_pipeline(
         load_in_4bit=load_in_4bit,
         enable_gradients=True  # Required for saliency analysis
     )
-
-    # disable kv cache
+    
+    # Disable KV-cache to reduce memory usage
     logger.info("Disabling KV-cache to reduce memory usage")
     model.config.use_cache = False
     
@@ -101,8 +101,8 @@ def run_semantic_tracing_pipeline(
     else:
         sel_config = None
     
-    # 6. Create tracer
-    logger.info("Initializing semantic tracer")
+    # 6. Create tracer with stream_offload enabled
+    logger.info("Initializing semantic tracer with memory optimization")
     tracer = SemanticTracer(
         model=model,
         processor=processor,
@@ -110,14 +110,20 @@ def run_semantic_tracing_pipeline(
         selection_config=sel_config,
         logit_lens_concepts=logit_lens_concepts,
         cpu_offload=cpu_offload,
-        debug=debug
+        debug=debug,
+        saliency_backend_kwargs={"stream_offload": True}  # Enable stream offload for memory efficiency
     )
-    
+
     # 7. Run tracing
     logger.info(f"Running semantic tracing with mode: {tracing_mode}")
     start_time = time.time()
     
     try:
+        # Monitor memory usage if in debug mode
+        if debug and torch.cuda.is_available():
+            gpu_mem_before = torch.cuda.memory_allocated() / (1024**3)
+            logger.info(f"GPU memory before tracing: {gpu_mem_before:.2f} GB")
+        
         result = tracer.trace(
             input_data=input_data,
             num_tokens=num_tokens,
@@ -127,6 +133,12 @@ def run_semantic_tracing_pipeline(
             tracing_mode=tracing_mode,
             single_forward_pass=single_forward_pass
         )
+        
+        # Monitor memory usage if in debug mode
+        if debug and torch.cuda.is_available():
+            gpu_mem_after = torch.cuda.memory_allocated() / (1024**3)
+            logger.info(f"GPU memory after tracing: {gpu_mem_after:.2f} GB")
+    
     except Exception as e:
         logger.error(f"Error during semantic tracing: {e}")
         import traceback

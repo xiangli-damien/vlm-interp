@@ -51,7 +51,8 @@ class SemanticTracer(GenerationMixin):
         layer_batch_size: int = 2,
         normalize_weights: bool = True,
         debug: bool = False,
-        epsilon: float = 1e-7
+        epsilon: float = 1e-7,
+        saliency_backend_kwargs: Optional[Dict[str, Any]] = None  # NEW parameter
     ):
         """
         Initialize the semantic tracer with model and configuration.
@@ -68,6 +69,8 @@ class SemanticTracer(GenerationMixin):
             normalize_weights: Whether to normalize token importance weights
             debug: Whether to print additional debug information
             epsilon: Small value for numerical stability
+            saliency_backend_kwargs: Additional keyword arguments for SaliencyBackend,
+                                    including stream_offload for memory optimization
         """
         self.model = model
         self.processor = processor
@@ -98,12 +101,16 @@ class SemanticTracer(GenerationMixin):
         self.token_decoder = TokenDecoder(processor.tokenizer)
         self._activation_cache = {}
         
+        # Get saliency backend kwargs (including stream_offload if specified)
+        saliency_kwargs = saliency_backend_kwargs or {}
+        
         # Initialize backends
         self.saliency_backend = SaliencyBackend(
             model=model,
             device=self.device,
             cpu_offload=cpu_offload,
-            batch_size=layer_batch_size
+            batch_size=layer_batch_size,
+            **saliency_kwargs  # Pass additional kwargs like stream_offload
         )
         
         self.attention_backend = AttentionBackend(
@@ -112,7 +119,6 @@ class SemanticTracer(GenerationMixin):
             cpu_offload=cpu_offload
         )
         
-        # workflows/semantic_tracing.py (continued)
         self.logit_backend = LogitLensBackend(
             model=model,
             device=self.device,
