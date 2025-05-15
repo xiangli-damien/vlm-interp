@@ -7,14 +7,13 @@ from runtime.io import *
 from runtime.model_utils import *
 from runtime.selection import *
 from runtime.decode import TokenDecoder
-from runtime.hooks import register_hooks, register_forward_hooks, register_backward_hooks
+from runtime.hooks import register_hooks, remove_hooks
 
 __all__ = [
     "ActivationCache",
     "TracingCache",
     "register_hooks",
-    "register_forward_hooks",
-    "register_backward_hooks",
+    "remove_hooks",
     "TraceHookManager",
     "TraceIO",
     "load_model",

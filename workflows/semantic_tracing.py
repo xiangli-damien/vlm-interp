@@ -621,19 +621,25 @@ class SemanticTracer(GenerationMixin):
     ) -> Dict[str, Any]:
         """
         Core token analysis function that implements the semantic tracing process.
-        Supports multiple tracing modes.
+        
+        This function handles the complete tracing workflow:
+        1. Sets up appropriate backends based on the tracing mode
+        2. Processes token information flow layer by layer
+        3. Enriches the trace with logit lens projections
+        4. Optimizes memory usage through batching and sharing computations
         
         Args:
-            inputs: Model inputs
-            text_indices: Indices of text tokens
-            image_indices: Indices of image tokens
+            inputs: Model inputs dictionary
+            text_indices: Indices of text tokens in the sequence
+            image_indices: Indices of image tokens in the sequence
             target_token_idx: Index of token to analyze
             tracing_mode: "saliency", "attention", or "both"
-            single_forward_pass: Use one forward pass for all layers
+            single_forward_pass: Whether to use a single forward/backward pass for all layers
+                                to optimize memory usage at the cost of more GPU memory
             trace_id: Optional identifier for the trace
             
         Returns:
-            Dictionary with trace results
+            Dictionary with trace results organized by analysis mode and layer
         """
         analysis_result = {}
         
@@ -641,6 +647,12 @@ class SemanticTracer(GenerationMixin):
         if trace_id is None:
             self.trace_id_counter += 1
             trace_id = str(self.trace_id_counter)
+        
+        # FIX: Enable single_forward_pass by adjusting batch size
+        if single_forward_pass and tracing_mode in ["saliency", "both"]:
+            # Increase batch size to include all layers in one pass
+            self.saliency_backend.batch_size = self.num_layers
+            logger.info(f"Using single forward pass mode with batch size {self.num_layers}")
         
         # Setup analysis backends
         if tracing_mode in ["saliency", "both"]:
@@ -681,6 +693,11 @@ class SemanticTracer(GenerationMixin):
         
         if tracing_mode in ["attention", "both"]:
             logger.info(f"Running attention-based tracing for token at position {target_token_idx}")
+            # FIX: Pass single_forward_pass parameter to attention backend
+            if single_forward_pass:
+                logger.info("Using single forward pass for attention analysis")
+                self.attention_backend.use_single_pass = True
+                
             attention_result = self.attention_backend.compute(inputs, [target_token_idx])
             analysis_result["attention"] = self._process_attention_results(
                 attention_result,
@@ -696,7 +713,13 @@ class SemanticTracer(GenerationMixin):
         token_indices_to_analyze = self._get_all_traced_tokens(analysis_result)
         
         if token_indices_to_analyze:
-            logit_result = self.logit_backend.compute(inputs, token_indices_to_analyze)
+            logit_result = self.logit_backend.compute(
+                inputs, 
+                token_indices_to_analyze,
+                # FIX: Add concept tracking
+                concept_ids={concept: self.processor.tokenizer.encode(concept, add_special_tokens=False) 
+                            for concept in self.logit_lens_concepts}
+            )
             self._enrich_trace_with_logit_lens(
                 analysis_result,
                 logit_result,
@@ -708,6 +731,10 @@ class SemanticTracer(GenerationMixin):
         self.saliency_backend.cleanup()
         self.attention_backend.cleanup()
         self.logit_backend.cleanup()
+        
+        # Reset batch size after analysis
+        if single_forward_pass and tracing_mode in ["saliency", "both"]:
+            self.saliency_backend.batch_size = self.layer_batch_size
         
         return analysis_result
     
@@ -723,16 +750,20 @@ class SemanticTracer(GenerationMixin):
         """
         Process saliency results into an information flow graph.
         
+        Combines gradient-based attention saliency scores with token metadata to create
+        a complete information flow diagram between layers. Uses coverage-based selection
+        to identify the most important source tokens at each layer.
+        
         Args:
-            saliency_result: Raw saliency backend results
-            target_token_idx: The target token position
-            all_token_ids: List of all token IDs
-            all_token_texts: List of all token texts
-            token_type_map: Mapping from token index to token type
+            saliency_result: Raw saliency backend results with saliency scores
+            target_token_idx: The target token position to analyze
+            all_token_ids: List of all token IDs in the sequence
+            all_token_texts: List of all token texts in the sequence
+            token_type_map: Mapping from token index to token type (0=generated, 1=text, 2=image)
             trace_id: Unique identifier for the trace
             
         Returns:
-            Dictionary with processed saliency results
+            Dictionary with processed saliency results organized by layer
         """
         if not saliency_result.get("saliency_scores"):
             logger.warning("No saliency scores found in result")
@@ -844,18 +875,19 @@ class SemanticTracer(GenerationMixin):
                         # Create a copy to avoid modifying the original
                         aggregated_sources[idx] = source.copy()
             
-            # Convert to list for pruning
+            # Convert to list for pruning - FIX: Convert to expected tuple format
             unique_sources = list(aggregated_sources.values())
+            tuple_sources = [(s["index"], s["scaled_weight"]) for s in unique_sources]
             
             # Apply layer-level pruning
-            if unique_sources:
-                pruned_sources = SelectionStrategy.prune_layer(
-                    unique_sources,
+            if tuple_sources:
+                pruned = SelectionStrategy.prune_layer(
+                    tuple_sources,
                     self.selection_config
                 )
                 
-                # Create a set of remaining source indices after pruning
-                remaining_indices = set(s["index"] for s in pruned_sources)
+                # FIX: Create a set of remaining indices after pruning
+                remaining_indices = set(idx for idx, _ in pruned)
                 
                 # Update target_to_sources to only include remaining sources
                 for target_idx in target_to_sources:
@@ -879,6 +911,7 @@ class SemanticTracer(GenerationMixin):
             
             # Normalize weights for new targets
             if new_targets:
+                # FIX: Ensure we normalize weights after pruning
                 current_targets = SelectionStrategy.renormalize(new_targets)
             else:
                 logger.warning(f"No valid sources found for layer {layer_idx}.")
@@ -892,13 +925,14 @@ class SemanticTracer(GenerationMixin):
                 layer_idx, 
                 layer_results,
                 trace_id,
-                tracing_mode="saliency"
+                tracing_mode="saliency",
+                all_token_ids=all_token_ids,  # FIX: Pass through token info
+                all_token_texts=all_token_texts
             )
             trace_records.extend(this_layer_records)
         
         # Save trace records to CSV
         if trace_records:
-            df = pd.DataFrame(trace_records)
             csv_path = self.io.write_trace_data(
                 trace_id=f"saliency_{trace_id}",
                 records=trace_records,
@@ -1229,16 +1263,24 @@ class SemanticTracer(GenerationMixin):
         layer_idx: int,
         layer_results: Dict[str, Any],
         trace_id: str,
-        tracing_mode: str = "saliency"
+        tracing_mode: str = "saliency",
+        all_token_ids: List[int] = None,
+        all_token_texts: List[str] = None
     ) -> List[Dict[str, Any]]:
         """
-        Create trace records for CSV output.
+        Create trace records for CSV output and visualization.
+        
+        Transforms the layer-specific analysis results into a flat format suitable for
+        CSV output and visualization. Each token involved in the trace at this layer
+        gets a separate record with all its attributes.
         
         Args:
             layer_idx: Layer index
             layer_results: Results for this layer
             trace_id: Unique identifier for the trace
             tracing_mode: "saliency" or "attention"
+            all_token_ids: List of all token IDs in the sequence
+            all_token_texts: List of all token texts in the sequence
             
         Returns:
             List of record dictionaries for this layer
@@ -1285,12 +1327,16 @@ class SemanticTracer(GenerationMixin):
                     top_pred_text = top_pred.get("token_text", "")
                     top_pred_prob = top_pred.get("probability", 0.0)
             
+            # FIX: Use all_token_texts and all_token_ids for proper token information
+            token_text = all_token_texts[token_idx] if all_token_texts and token_idx < len(all_token_texts) else "UNKNOWN"
+            token_id = all_token_ids[token_idx] if all_token_ids and token_idx < len(all_token_ids) else -1
+            
             # Create base record
             record = {
                 "layer": layer_idx,
                 "token_index": token_idx,
-                "token_text": target_info["text"] if target_info else "UNKNOWN",
-                "token_id": target_info["id"] if target_info else -1,
+                "token_text": token_text,
+                "token_id": token_id,
                 "token_type": target_info["type"] if target_info else 0,
                 "is_target": is_target,
                 "source_for_targets": ",".join(map(str, source_targets)),

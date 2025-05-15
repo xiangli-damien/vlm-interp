@@ -2,7 +2,10 @@
 class TokenDecoder:
     """
     Utility class for robust token decoding with special token handling.
-    Ensures special tokens and invisible characters are properly displayed.
+    
+    Ensures special tokens, whitespace, and control characters are properly displayed
+    in visualizations and CSV exports. Handles edge cases where tokens might appear
+    empty or meaningless in standard decoding.
     """
     
     def __init__(self, tokenizer, special_tokens_map=None):
@@ -29,8 +32,22 @@ class TokenDecoder:
             160: "\\xa0",  # Non-breaking space
         }
         
-        # Update with user-provided mappings
+        # FIX: Add back the original SPECIAL_TEXT mapping from the old implementation
+        self.old_special_text = {
+            13: "\\n",     # Newline token
+            28705: "_",    # Underscore token
+            220: "▁",      # Leading space in many tokenizers
+            50118: "<im_start>", # Image start token
+            50119: "<im_end>",   # Image end token
+            32000: "<image>",    # Generic image token
+            4: "<eot>",     # End of text
+        }
+        
+        # Merge all special token mappings
         self.special_tokens = dict(self.default_special_tokens)
+        self.special_tokens.update(self.old_special_text)
+        
+        # Update with user-provided mappings
         if special_tokens_map:
             self.special_tokens.update(special_tokens_map)
             
@@ -38,7 +55,12 @@ class TokenDecoder:
         self._detect_model_special_tokens()
     
     def _detect_model_special_tokens(self):
-        """Detect model-specific special tokens using multiple methods."""
+        """
+        Detect model-specific special tokens using multiple methods.
+        
+        Tries various approaches to identify special tokens in the tokenizer,
+        ensuring we have proper representations for visualization.
+        """
         try:
             # Method 1: Check for special_tokens_map attribute
             if hasattr(self.tokenizer, "special_tokens_map"):
@@ -96,6 +118,9 @@ class TokenDecoder:
     def decode_token(self, token_id: int) -> str:
         """
         Decode a single token ID with special token handling.
+        
+        Provides a robust way to get a human-readable representation for any token,
+        handling special tokens, whitespace, and ensuring no empty results.
         
         Args:
             token_id: The token ID to decode

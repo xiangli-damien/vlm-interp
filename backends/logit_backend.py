@@ -85,20 +85,25 @@ class LogitLensBackend(BaseBackend):
         
         return hook
         
-    def compute(self, inputs: Dict[str, torch.Tensor], target_indices: List[int]) -> Dict[str, Any]:
+    def compute(self, inputs: Dict[str, torch.Tensor], token_indices: List[int], concept_ids: Dict[str, List[int]] = None) -> Dict[str, Any]:
         """
         Compute logit lens projections for the given inputs and target indices.
         
+        Projects hidden states through the LM head to examine what tokens would
+        be predicted at each layer, which helps understand how representations
+        evolve throughout the model.
+        
         Args:
             inputs: Model inputs
-            target_indices: Indices of token positions to analyze
+            token_indices: Indices of token positions to analyze
+            concept_ids: Optional dict mapping concept names to token IDs to track
             
         Returns:
             Dictionary with logit lens projections per layer and token
         """
         self.clear_results()
         
-        if not target_indices:
+        if not token_indices:
             logger.warning("No target indices provided. Cannot compute logit lens projections.")
             return {}
         
@@ -108,19 +113,23 @@ class LogitLensBackend(BaseBackend):
         # Forward pass to capture hidden states for all layers
         with torch.no_grad():
             _ = self.model(**{k: v for k, v in inputs.items() if k != "token_type_ids"},
-                          output_hidden_states=True)
+                        output_hidden_states=True)
         
         # Compute projections for each token position in each layer
-        self.projections = self._compute_projections(target_indices)
+        self.projections = self._compute_projections(token_indices, concept_ids)
         
         return {"projections": self.projections}
-    
-    def _compute_projections(self, token_indices: List[int]) -> Dict[str, Dict[int, Dict[str, Any]]]:
+
+    def _compute_projections(self, token_indices: List[int], concept_ids: Dict[str, List[int]] = None) -> Dict[str, Dict[int, Dict[str, Any]]]:
         """
         Project hidden states through LM head for specific token positions.
         
+        This computes what tokens would be predicted at each layer, allowing us to
+        see how token representations evolve through the model.
+        
         Args:
             token_indices: Indices of token positions to analyze
+            concept_ids: Optional dict mapping concept names to token IDs to track
             
         Returns:
             Nested dict: {layer_name: {token_idx: {projection_data}}}
@@ -156,13 +165,38 @@ class LogitLensBackend(BaseBackend):
                     k = 5  # Number of top predictions to track
                     top_probs, top_indices = torch.topk(token_probs[0, 0], k)
                     
+                    # FIX: Process concept tracking if provided
+                    concept_predictions = {}
+                    if concept_ids:
+                        for concept_name, ids in concept_ids.items():
+                            if not ids:
+                                continue
+                                
+                            # Convert IDs to tensor if needed
+                            if not isinstance(ids, torch.Tensor):
+                                ids_tensor = torch.tensor(ids, device=token_probs.device)
+                            else:
+                                ids_tensor = ids.to(token_probs.device)
+                                
+                            # Get probabilities for this concept's tokens
+                            concept_probs = token_probs[0, 0, ids_tensor]
+                            max_prob_idx = torch.argmax(concept_probs).item()
+                            max_prob = concept_probs[max_prob_idx].item()
+                            max_id = ids[max_prob_idx] if max_prob_idx < len(ids) else ids[0]
+                            
+                            concept_predictions[concept_name] = {
+                                "probability": max_prob,
+                                "token_id": max_id
+                            }
+                    
                     # Store results for this token
                     token_projections = {
                         "logits": token_logits[0, 0].detach().cpu() if self.cpu_offload else token_logits[0, 0].detach(),
                         "top_k": {
                             "indices": top_indices.cpu().tolist() if self.cpu_offload else top_indices.tolist(),
                             "probs": top_probs.cpu().tolist() if self.cpu_offload else top_probs.tolist()
-                        }
+                        },
+                        "concept_predictions": concept_predictions
                     }
                     
                     layer_projections[token_idx] = token_projections
