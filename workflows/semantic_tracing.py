@@ -96,6 +96,7 @@ class SemanticTracer(GenerationMixin):
         
         # Initialize token decoder
         self.token_decoder = TokenDecoder(processor.tokenizer)
+        self._activation_cache = {}
         
         # Initialize backends
         self.saliency_backend = SaliencyBackend(
@@ -626,7 +627,7 @@ class SemanticTracer(GenerationMixin):
         1. Sets up appropriate backends based on the tracing mode
         2. Processes token information flow layer by layer
         3. Enriches the trace with logit lens projections
-        4. Optimizes memory usage through batching and sharing computations
+        4. Optimizes memory usage through batching and caching
         
         Args:
             inputs: Model inputs dictionary
@@ -635,7 +636,7 @@ class SemanticTracer(GenerationMixin):
             target_token_idx: Index of token to analyze
             tracing_mode: "saliency", "attention", or "both"
             single_forward_pass: Whether to use a single forward/backward pass for all layers
-                                to optimize memory usage at the cost of more GPU memory
+                            to optimize memory usage at the cost of more GPU memory
             trace_id: Optional identifier for the trace
             
         Returns:
@@ -648,13 +649,22 @@ class SemanticTracer(GenerationMixin):
             self.trace_id_counter += 1
             trace_id = str(self.trace_id_counter)
         
-        # FIX: Enable single_forward_pass by adjusting batch size
+        # FIX: Check if we have cached results for these inputs
+        cache_key = self._generate_cache_key(inputs)
+        cache_hit = cache_key in self._activation_cache
+        
+        # Enable single_forward_pass by adjusting batch size
         if single_forward_pass and tracing_mode in ["saliency", "both"]:
             # Increase batch size to include all layers in one pass
             self.saliency_backend.batch_size = self.num_layers
             logger.info(f"Using single forward pass mode with batch size {self.num_layers}")
         
-        # Setup analysis backends
+        # Pass single_forward_pass to attention backend
+        if single_forward_pass and tracing_mode in ["attention", "both"]:
+            logger.info("Using single forward pass for attention analysis")
+            self.attention_backend.use_single_pass = True
+        
+        # Setup analysis backends if needed
         if tracing_mode in ["saliency", "both"]:
             self.saliency_backend.setup(self.attention_layer_names)
         
@@ -678,48 +688,141 @@ class SemanticTracer(GenerationMixin):
         all_token_ids = inputs["input_ids"][0].tolist()
         all_token_texts = [self.token_decoder.decode_token(tid) for tid in all_token_ids]
         
-        # Run appropriate analyses based on the tracing mode
-        if tracing_mode in ["saliency", "both"]:
-            logger.info(f"Running saliency-based tracing for token at position {target_token_idx}")
-            saliency_result = self.saliency_backend.compute(inputs, [target_token_idx])
-            analysis_result["saliency"] = self._process_saliency_results(
-                saliency_result,
-                target_token_idx,
-                all_token_ids,
-                all_token_texts,
-                token_type_map,
-                trace_id
-            )
-        
-        if tracing_mode in ["attention", "both"]:
-            logger.info(f"Running attention-based tracing for token at position {target_token_idx}")
-            # FIX: Pass single_forward_pass parameter to attention backend
-            if single_forward_pass:
-                logger.info("Using single forward pass for attention analysis")
-                self.attention_backend.use_single_pass = True
-                
-            attention_result = self.attention_backend.compute(inputs, [target_token_idx])
-            analysis_result["attention"] = self._process_attention_results(
-                attention_result,
-                target_token_idx,
-                all_token_ids,
-                all_token_texts,
-                token_type_map,
-                trace_id
-            )
+        # FIX: Use cached results if available to avoid recomputation
+        if cache_hit:
+            logger.info(f"Using cached computation results for input sequence")
+            cached_data = self._activation_cache[cache_key]
+            
+            # Run appropriate analyses based on the tracing mode, using cached data where possible
+            if tracing_mode in ["saliency", "both"] and "saliency_scores" in cached_data:
+                logger.info(f"Using cached saliency scores for token at position {target_token_idx}")
+                saliency_result = {"saliency_scores": cached_data["saliency_scores"]}
+                analysis_result["saliency"] = self._process_saliency_results(
+                    saliency_result,
+                    target_token_idx,
+                    all_token_ids,
+                    all_token_texts,
+                    token_type_map,
+                    trace_id
+                )
+            elif tracing_mode in ["saliency", "both"]:
+                # Compute if not in cache
+                logger.info(f"Computing saliency scores for token at position {target_token_idx}")
+                saliency_result = self.saliency_backend.compute(inputs, [target_token_idx])
+                analysis_result["saliency"] = self._process_saliency_results(
+                    saliency_result,
+                    target_token_idx,
+                    all_token_ids,
+                    all_token_texts,
+                    token_type_map,
+                    trace_id
+                )
+                # Cache the results
+                if "saliency_scores" in saliency_result:
+                    if cache_key not in self._activation_cache:
+                        self._activation_cache[cache_key] = {}
+                    self._activation_cache[cache_key]["saliency_scores"] = saliency_result["saliency_scores"]
+            
+            if tracing_mode in ["attention", "both"] and "attention_maps" in cached_data:
+                logger.info(f"Using cached attention maps for token at position {target_token_idx}")
+                attention_result = {"attention_maps": cached_data["attention_maps"]}
+                analysis_result["attention"] = self._process_attention_results(
+                    attention_result,
+                    target_token_idx,
+                    all_token_ids,
+                    all_token_texts,
+                    token_type_map,
+                    trace_id
+                )
+            elif tracing_mode in ["attention", "both"]:
+                # Compute if not in cache
+                logger.info(f"Computing attention maps for token at position {target_token_idx}")
+                attention_result = self.attention_backend.compute(inputs, [target_token_idx])
+                analysis_result["attention"] = self._process_attention_results(
+                    attention_result,
+                    target_token_idx,
+                    all_token_ids,
+                    all_token_texts,
+                    token_type_map,
+                    trace_id
+                )
+                # Cache the results
+                if "attention_maps" in attention_result:
+                    if cache_key not in self._activation_cache:
+                        self._activation_cache[cache_key] = {}
+                    self._activation_cache[cache_key]["attention_maps"] = attention_result["attention_maps"]
+        else:
+            # No cache hit, compute everything
+            # Run appropriate analyses based on the tracing mode
+            if tracing_mode in ["saliency", "both"]:
+                logger.info(f"Computing saliency scores for token at position {target_token_idx}")
+                saliency_result = self.saliency_backend.compute(inputs, [target_token_idx])
+                analysis_result["saliency"] = self._process_saliency_results(
+                    saliency_result,
+                    target_token_idx,
+                    all_token_ids,
+                    all_token_texts,
+                    token_type_map,
+                    trace_id
+                )
+                # Cache the results
+                if "saliency_scores" in saliency_result:
+                    if cache_key not in self._activation_cache:
+                        self._activation_cache[cache_key] = {}
+                    self._activation_cache[cache_key]["saliency_scores"] = saliency_result["saliency_scores"]
+            
+            if tracing_mode in ["attention", "both"]:
+                logger.info(f"Computing attention maps for token at position {target_token_idx}")
+                attention_result = self.attention_backend.compute(inputs, [target_token_idx])
+                analysis_result["attention"] = self._process_attention_results(
+                    attention_result,
+                    target_token_idx,
+                    all_token_ids,
+                    all_token_texts,
+                    token_type_map,
+                    trace_id
+                )
+                # Cache the results
+                if "attention_maps" in attention_result:
+                    if cache_key not in self._activation_cache:
+                        self._activation_cache[cache_key] = {}
+                    self._activation_cache[cache_key]["attention_maps"] = attention_result["attention_maps"]
         
         # Run logit lens analysis for all tokens involved in the trace
+        # We always need to run this part since it's token-specific
         logger.info("Running logit lens analysis for all tokens involved in the trace")
         token_indices_to_analyze = self._get_all_traced_tokens(analysis_result)
         
         if token_indices_to_analyze:
-            logit_result = self.logit_backend.compute(
-                inputs, 
-                token_indices_to_analyze,
-                # FIX: Add concept tracking
-                concept_ids={concept: self.processor.tokenizer.encode(concept, add_special_tokens=False) 
-                            for concept in self.logit_lens_concepts}
-            )
+            # Check for cached projections
+            use_cached_projections = False
+            if cache_hit and "projections" in self._activation_cache[cache_key]:
+                # Only use cached projections if they cover ALL needed tokens
+                cached_tokens = set(
+                    token_idx for layer_proj in self._activation_cache[cache_key]["projections"].values() 
+                    for token_idx in layer_proj.keys()
+                )
+                if all(idx in cached_tokens for idx in token_indices_to_analyze):
+                    logger.info(f"Using cached logit lens projections for {len(token_indices_to_analyze)} tokens")
+                    logit_result = {"projections": self._activation_cache[cache_key]["projections"]}
+                    use_cached_projections = True
+            
+            if not use_cached_projections:
+                # Compute projections for tokens not in cache
+                logger.info(f"Computing logit lens projections for {len(token_indices_to_analyze)} tokens")
+                logit_result = self.logit_backend.compute(
+                    inputs, 
+                    token_indices_to_analyze,
+                    # Add concept tracking
+                    concept_ids={concept: self.processor.tokenizer.encode(concept, add_special_tokens=False) 
+                                for concept in self.logit_lens_concepts}
+                )
+                # Cache the results
+                if "projections" in logit_result:
+                    if cache_key not in self._activation_cache:
+                        self._activation_cache[cache_key] = {}
+                    self._activation_cache[cache_key]["projections"] = logit_result["projections"]
+            
             self._enrich_trace_with_logit_lens(
                 analysis_result,
                 logit_result,
@@ -735,6 +838,10 @@ class SemanticTracer(GenerationMixin):
         # Reset batch size after analysis
         if single_forward_pass and tracing_mode in ["saliency", "both"]:
             self.saliency_backend.batch_size = self.layer_batch_size
+        
+        # Reset attention backend use_single_pass
+        if single_forward_pass and tracing_mode in ["attention", "both"]:
+            self.attention_backend.use_single_pass = False
         
         return analysis_result
     
@@ -954,16 +1061,20 @@ class SemanticTracer(GenerationMixin):
         """
         Process attention results into an information flow graph.
         
+        Transforms raw attention weights into a structured information flow that tracks
+        how attention propagates from generated tokens back through the model layers.
+        Uses coverage-based selection to identify the most important connections.
+        
         Args:
-            attention_result: Raw attention backend results
-            target_token_idx: The target token position
-            all_token_ids: List of all token IDs
-            all_token_texts: List of all token texts
-            token_type_map: Mapping from token index to token type
+            attention_result: Raw attention backend results containing attention maps
+            target_token_idx: The target token position to analyze
+            all_token_ids: List of all token IDs in the sequence
+            all_token_texts: List of all token texts in the sequence
+            token_type_map: Mapping from token index to token type (0=generated, 1=text, 2=image)
             trace_id: Unique identifier for the trace
             
         Returns:
-            Dictionary with processed attention results
+            Dictionary with processed attention results organized by layer
         """
         if not attention_result.get("attention_maps"):
             logger.warning("No attention maps found in result")
@@ -1078,18 +1189,19 @@ class SemanticTracer(GenerationMixin):
                         # Create a copy to avoid modifying the original
                         aggregated_sources[idx] = source.copy()
             
-            # Convert to list for pruning
+            # Convert to list for pruning - FIX: Convert to expected tuple format
             unique_sources = list(aggregated_sources.values())
+            tuple_sources = [(s["index"], s["scaled_weight"]) for s in unique_sources]
             
             # Apply layer-level pruning
-            if unique_sources:
-                pruned_sources = SelectionStrategy.prune_layer(
-                    unique_sources,
+            if tuple_sources:
+                pruned = SelectionStrategy.prune_layer(
+                    tuple_sources,
                     self.selection_config
                 )
                 
-                # Create a set of remaining source indices after pruning
-                remaining_indices = set(s["index"] for s in pruned_sources)
+                # FIX: Create a set of remaining indices after pruning
+                remaining_indices = set(idx for idx, _ in pruned)
                 
                 # Update target_to_sources to only include remaining sources
                 for target_idx in target_to_sources:
@@ -1113,6 +1225,7 @@ class SemanticTracer(GenerationMixin):
             
             # Normalize weights for new targets
             if new_targets:
+                # FIX: Ensure we normalize weights after pruning
                 current_targets = SelectionStrategy.renormalize(new_targets)
             else:
                 logger.warning(f"No valid sources found for layer {layer_idx}.")
@@ -1126,13 +1239,14 @@ class SemanticTracer(GenerationMixin):
                 layer_idx, 
                 layer_results,
                 trace_id,
-                tracing_mode="attention"
+                tracing_mode="attention",
+                all_token_ids=all_token_ids,  # FIX: Pass through token info
+                all_token_texts=all_token_texts
             )
             trace_records.extend(this_layer_records)
         
         # Save trace records to CSV
         if trace_records:
-            df = pd.DataFrame(trace_records)
             csv_path = self.io.write_trace_data(
                 trace_id=f"attention_{trace_id}",
                 records=trace_records,
@@ -1141,7 +1255,7 @@ class SemanticTracer(GenerationMixin):
             trace_results["trace_data_path"] = csv_path
         
         return trace_results
-    
+        
     def _get_all_traced_tokens(self, analysis_result: Dict[str, Any]) -> List[int]:
         """
         Extract all token indices involved in the trace for logit lens analysis.
@@ -1178,6 +1292,10 @@ class SemanticTracer(GenerationMixin):
     ) -> None:
         """
         Add logit lens projections to the trace results.
+        
+        Enriches the trace with token prediction information at each layer,
+        helping to visualize how token representations evolve through the model.
+        Also adds concept probability tracking for specific concepts of interest.
         
         Args:
             analysis_result: Results from saliency or attention analysis
@@ -1220,6 +1338,9 @@ class SemanticTracer(GenerationMixin):
                             top_indices = token_projections["top_k"]["indices"]
                             top_probs = token_projections["top_k"]["probs"]
                             
+                            # FIX: Extract concept predictions if available
+                            concept_predictions = token_projections.get("concept_predictions", {})
+                            
                             # Format projections for better readability
                             top_predictions = []
                             for i, (idx, prob) in enumerate(zip(top_indices, top_probs)):
@@ -1230,15 +1351,20 @@ class SemanticTracer(GenerationMixin):
                                     "probability": prob
                                 })
                             
-                            # Add to result
+                            # Add to result with concept predictions
                             layer_result["logit_lens_projections"][token_idx] = {
-                                "top_predictions": top_predictions
+                                "top_predictions": top_predictions,
+                                "concept_predictions": concept_predictions  # FIX: Include concept predictions
                             }
                             
                             # Add logit lens info to target
                             if top_predictions:
                                 target["predicted_top_token"] = top_predictions[0]["token_text"]
                                 target["predicted_top_prob"] = top_predictions[0]["probability"]
+                                
+                            # FIX: Add concept probabilities to target
+                            for concept, data in concept_predictions.items():
+                                target[f"concept_{concept}_prob"] = data.get("probability", 0.0)
                     
                     # Process source tokens
                     for target in layer_result.get("target_tokens", []):
@@ -1253,10 +1379,17 @@ class SemanticTracer(GenerationMixin):
                                 top_indices = token_projections["top_k"]["indices"]
                                 top_probs = token_projections["top_k"]["probs"]
                                 
+                                # FIX: Extract concept predictions
+                                concept_predictions = token_projections.get("concept_predictions", {})
+                                
                                 if top_indices and top_probs:
                                     # Add logit lens info to source
                                     source["predicted_top_token"] = self.token_decoder.decode_token(top_indices[0])
                                     source["predicted_top_prob"] = top_probs[0]
+                                    
+                                    # FIX: Add concept probabilities to source
+                                    for concept, data in concept_predictions.items():
+                                        source[f"concept_{concept}_prob"] = data.get("probability", 0.0)
     
     def _create_trace_records(
         self,
@@ -1272,7 +1405,7 @@ class SemanticTracer(GenerationMixin):
         
         Transforms the layer-specific analysis results into a flat format suitable for
         CSV output and visualization. Each token involved in the trace at this layer
-        gets a separate record with all its attributes.
+        gets a separate record with all its attributes including concept probabilities.
         
         Args:
             layer_idx: Layer index
@@ -1320,12 +1453,20 @@ class SemanticTracer(GenerationMixin):
             top_pred_text = ""
             top_pred_prob = 0.0
             
+            # FIX: Get concept probabilities if available
+            concept_probs = {}
+            
             if "logit_lens_projections" in layer_results and token_idx in layer_results["logit_lens_projections"]:
                 projections = layer_results["logit_lens_projections"][token_idx]
                 if projections.get("top_predictions"):
                     top_pred = projections["top_predictions"][0]
                     top_pred_text = top_pred.get("token_text", "")
                     top_pred_prob = top_pred.get("probability", 0.0)
+                    
+                # FIX: Extract concept predictions
+                if "concept_predictions" in projections:
+                    for concept, data in projections["concept_predictions"].items():
+                        concept_probs[concept] = data.get("probability", 0.0)
             
             # FIX: Use all_token_texts and all_token_ids for proper token information
             token_text = all_token_texts[token_idx] if all_token_texts and token_idx < len(all_token_texts) else "UNKNOWN"
@@ -1337,7 +1478,9 @@ class SemanticTracer(GenerationMixin):
                 "token_index": token_idx,
                 "token_text": token_text,
                 "token_id": token_id,
-                "token_type": target_info["type"] if target_info else 0,
+                "token_type": target_info["type"] if target_info else (
+                    token_type_map.get(token_idx, 0) if "token_type_map" in locals() else 0
+                ),
                 "is_target": is_target,
                 "source_for_targets": ",".join(map(str, source_targets)),
                 "predicted_top_token": top_pred_text,
@@ -1345,6 +1488,10 @@ class SemanticTracer(GenerationMixin):
                 "trace_id": trace_id,
                 "mode": tracing_mode
             }
+            
+            # FIX: Add concept probabilities to the record
+            for concept, prob in concept_probs.items():
+                record[f"concept_{concept}_prob"] = prob
             
             # Add source-target relationships if target
             if is_target and target_info:
@@ -1406,3 +1553,24 @@ class SemanticTracer(GenerationMixin):
             json.dump(metadata, f, indent=2)
         
         return metadata_path
+    
+    def _generate_cache_key(self, inputs: Dict[str, torch.Tensor]) -> str:
+        """
+        Generate a unique key for identifying inputs for caching.
+        
+        This allows reusing computation results across multiple token analyses
+        with the same input sequence.
+        
+        Args:
+            inputs: Model input tensors
+            
+        Returns:
+            A unique string key for the inputs
+        """
+        # Use input IDs shape and a hash of the content
+        input_ids = inputs["input_ids"]
+        # Convert to numpy for hashing
+        as_numpy = input_ids.detach().cpu().numpy()
+        # Simple hash based on sequence length and content
+        content_hash = hash(as_numpy.tobytes())
+        return f"seq_len_{input_ids.shape[1]}_{content_hash}"

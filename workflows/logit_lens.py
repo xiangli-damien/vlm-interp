@@ -13,9 +13,9 @@ from PIL import Image
 from runtime.io import TraceIO
 from preprocess.input_builder import prepare_inputs
 from runtime.generation import GenerationMixin
-from backends.logit_backend import LogitBackend
+from backends.logit_backend import LogitLensBackend
 from runtime.selection import SelectionConfig
-from runtime.cache import TracingCache
+from runtime.cache import ActivationCache
 from preprocess.mapper import VisionMapper
 from analysis.logit_viz import create_composite_image, visualize_token_probabilities
 
@@ -83,7 +83,7 @@ class LogitLensWorkflow(GenerationMixin):
         logger.info(f"Detected {self.num_layers} model layers")
         
         # Initialize backend
-        self.backend = LogitBackend(model, self.cache, self.device)
+        self.backend = LogitLensBackend(model, self.cache, self.device)
     
     def prepare_inputs(self, image: Image.Image, prompt: str) -> Dict[str, Any]:
         """

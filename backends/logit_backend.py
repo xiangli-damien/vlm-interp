@@ -97,6 +97,7 @@ class LogitLensBackend(BaseBackend):
             inputs: Model inputs
             token_indices: Indices of token positions to analyze
             concept_ids: Optional dict mapping concept names to token IDs to track
+                for concept probability analysis
             
         Returns:
             Dictionary with logit lens projections per layer and token
@@ -125,7 +126,8 @@ class LogitLensBackend(BaseBackend):
         Project hidden states through LM head for specific token positions.
         
         This computes what tokens would be predicted at each layer, allowing us to
-        see how token representations evolve through the model.
+        see how token representations evolve through the model. Optionally tracks
+        probabilities for specific concepts (words/phrases) of interest.
         
         Args:
             token_indices: Indices of token positions to analyze
@@ -179,15 +181,19 @@ class LogitLensBackend(BaseBackend):
                                 ids_tensor = ids.to(token_probs.device)
                                 
                             # Get probabilities for this concept's tokens
-                            concept_probs = token_probs[0, 0, ids_tensor]
-                            max_prob_idx = torch.argmax(concept_probs).item()
-                            max_prob = concept_probs[max_prob_idx].item()
-                            max_id = ids[max_prob_idx] if max_prob_idx < len(ids) else ids[0]
-                            
-                            concept_predictions[concept_name] = {
-                                "probability": max_prob,
-                                "token_id": max_id
-                            }
+                            if len(ids_tensor) > 0:
+                                try:
+                                    concept_probs = token_probs[0, 0, ids_tensor]
+                                    max_prob_idx = torch.argmax(concept_probs).item()
+                                    max_prob = concept_probs[max_prob_idx].item()
+                                    max_id = ids[max_prob_idx] if max_prob_idx < len(ids) else ids[0]
+                                    
+                                    concept_predictions[concept_name] = {
+                                        "probability": max_prob,
+                                        "token_id": max_id
+                                    }
+                                except Exception as e:
+                                    logger.warning(f"Error processing concept '{concept_name}': {e}")
                     
                     # Store results for this token
                     token_projections = {
@@ -196,7 +202,7 @@ class LogitLensBackend(BaseBackend):
                             "indices": top_indices.cpu().tolist() if self.cpu_offload else top_indices.tolist(),
                             "probs": top_probs.cpu().tolist() if self.cpu_offload else top_probs.tolist()
                         },
-                        "concept_predictions": concept_predictions
+                        "concept_predictions": concept_predictions  # FIX: Include concept predictions
                     }
                     
                     layer_projections[token_idx] = token_projections
