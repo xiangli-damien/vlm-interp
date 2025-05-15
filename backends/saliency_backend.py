@@ -89,7 +89,7 @@ class SaliencyBackend(BaseBackend):
         )
         
         self.hooks.extend(hooks)
-        logger.info(f"Registered hooks for {len(self.hooks)} layers}")
+        logger.info(f"Registered hooks for {len(self.hooks)} layers")
     
     def _create_forward_hook(self, layer_name: str):
         """Create a forward hook for capturing attention weights."""
