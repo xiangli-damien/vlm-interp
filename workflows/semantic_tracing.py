@@ -643,6 +643,8 @@ class SemanticTracer(GenerationMixin):
             Dictionary with trace results organized by analysis mode and layer
         """
         analysis_result = {}
+
+        accumulated_records: List[Dict[str, Any]] = []
         
         # Increment trace ID counter for unique identification
         if trace_id is None:
@@ -829,6 +831,20 @@ class SemanticTracer(GenerationMixin):
                 all_token_ids,
                 all_token_texts
             )
+
+            accumulated_records: List[Dict[str, Any]] = []
+            for mode_dict in analysis_result.values():
+                for layer_dict in mode_dict.values():
+                    accumulated_records.extend(layer_dict.pop("_records", []))  # when present
+
+            if accumulated_records:
+                csv_path = self.io.write_trace_data(
+                    trace_id=f"{tracing_mode}_{trace_id}",
+                    records=accumulated_records,
+                    metadata={"mode": tracing_mode},
+                )
+                # Store the path so caller can find it later
+                analysis_result["trace_data_path"] = csv_path
         
         # Clean up backends
         self.saliency_backend.cleanup()
@@ -1033,19 +1049,14 @@ class SemanticTracer(GenerationMixin):
                 layer_results,
                 trace_id,
                 tracing_mode="saliency",
-                all_token_ids=all_token_ids,  # FIX: Pass through token info
+                token_type_map=token_type_map,
+                all_token_ids=all_token_ids,
                 all_token_texts=all_token_texts
             )
             trace_records.extend(this_layer_records)
         
         # Save trace records to CSV
-        if trace_records:
-            csv_path = self.io.write_trace_data(
-                trace_id=f"saliency_{trace_id}",
-                records=trace_records,
-                metadata={"mode": "saliency"}
-            )
-            trace_results["trace_data_path"] = csv_path
+        trace_results["_records"] = trace_records
         
         return trace_results
     
@@ -1240,19 +1251,14 @@ class SemanticTracer(GenerationMixin):
                 layer_results,
                 trace_id,
                 tracing_mode="attention",
-                all_token_ids=all_token_ids,  # FIX: Pass through token info
+                token_type_map=token_type_map,
+                all_token_ids=all_token_ids,
                 all_token_texts=all_token_texts
             )
             trace_records.extend(this_layer_records)
         
         # Save trace records to CSV
-        if trace_records:
-            csv_path = self.io.write_trace_data(
-                trace_id=f"attention_{trace_id}",
-                records=trace_records,
-                metadata={"mode": "attention"}
-            )
-            trace_results["trace_data_path"] = csv_path
+        trace_results["_records"] = trace_records
         
         return trace_results
         
@@ -1396,118 +1402,104 @@ class SemanticTracer(GenerationMixin):
         layer_idx: int,
         layer_results: Dict[str, Any],
         trace_id: str,
-        tracing_mode: str = "saliency",
-        all_token_ids: List[int] = None,
-        all_token_texts: List[str] = None
+        tracing_mode: str,
+        token_type_map: Dict[int, int],        # ★ NEW – required
+        all_token_ids: List[int],
+        all_token_texts: List[str],
     ) -> List[Dict[str, Any]]:
         """
-        Create trace records for CSV output and visualization.
-        
-        Transforms the layer-specific analysis results into a flat format suitable for
-        CSV output and visualization. Each token involved in the trace at this layer
-        gets a separate record with all its attributes including concept probabilities.
-        
-        Args:
-            layer_idx: Layer index
-            layer_results: Results for this layer
-            trace_id: Unique identifier for the trace
-            tracing_mode: "saliency" or "attention"
-            all_token_ids: List of all token IDs in the sequence
-            all_token_texts: List of all token texts in the sequence
-            
-        Returns:
-            List of record dictionaries for this layer
+        Build a *flat* list of dictionaries, one per token that appears in this
+        layer's information-flow graph (either as a target or a source).
+
+        Parameters
+        ----------
+        layer_idx : int
+            Index of the transformer layer (0-based).
+        layer_results : Dict[str, Any]
+            Graph produced by _process_saliency_results / _process_attention_results.
+        trace_id : str
+            Unique identifier to disambiguate concurrent traces.
+        tracing_mode : str
+            Either 'saliency' or 'attention'.
+        token_type_map : Dict[int, int]
+            Map {token_position : token_type}, where type is
+            0 = generated, 1 = text, 2 = image.
+        all_token_ids / all_token_texts
+            Parallel arrays for the *entire* sequence; used to decode tokens
+            without querying the tokenizer again.
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            Ready to be written as rows in a CSV file.
         """
-        records = []
-        
-        # Process all tokens involved in this layer
-        all_token_indices = set()
-        
-        # First, collect all token indices
-        for target_info in layer_results.get("target_tokens", []):
-            all_token_indices.add(target_info["index"])
-            for source in target_info.get("sources", []):
-                all_token_indices.add(source["index"])
-        
-        # Then create records for each token
-        for token_idx in all_token_indices:
-            # Find if this token is a target
-            is_target = any(t["index"] == token_idx for t in layer_results.get("target_tokens", []))
-            
-            # Find all targets this token is a source for
-            source_targets = []
-            for t in layer_results.get("target_tokens", []):
-                for s in t.get("sources", []):
-                    if s["index"] == token_idx:
-                        source_targets.append(t["index"])
-            
-            # Get target token info if target
-            target_info = None
-            if is_target:
-                for t in layer_results.get("target_tokens", []):
-                    if t["index"] == token_idx:
-                        target_info = t
-                        break
-            
-            # Get token projection data if available
-            top_pred_text = ""
-            top_pred_prob = 0.0
-            
-            # FIX: Get concept probabilities if available
-            concept_probs = {}
-            
-            if "logit_lens_projections" in layer_results and token_idx in layer_results["logit_lens_projections"]:
-                projections = layer_results["logit_lens_projections"][token_idx]
-                if projections.get("top_predictions"):
-                    top_pred = projections["top_predictions"][0]
-                    top_pred_text = top_pred.get("token_text", "")
-                    top_pred_prob = top_pred.get("probability", 0.0)
-                    
-                # FIX: Extract concept predictions
-                if "concept_predictions" in projections:
-                    for concept, data in projections["concept_predictions"].items():
-                        concept_probs[concept] = data.get("probability", 0.0)
-            
-            # FIX: Use all_token_texts and all_token_ids for proper token information
-            token_text = all_token_texts[token_idx] if all_token_texts and token_idx < len(all_token_texts) else "UNKNOWN"
-            token_id = all_token_ids[token_idx] if all_token_ids and token_idx < len(all_token_ids) else -1
-            
-            # Create base record
-            record = {
+        records: List[Dict[str, Any]] = []
+        involved: Set[int] = set()
+
+        # 1. Collect every token index that is part of this layer
+        for tgt in layer_results.get("target_tokens", []):
+            involved.add(tgt["index"])
+            for src in tgt.get("sources", []):
+                involved.add(src["index"])
+
+        # 2. Create a row for each token
+        for idx in involved:
+            # Helper: is this token a *target* on this layer?
+            tgt_info = next(
+                (t for t in layer_results["target_tokens"] if t["index"] == idx),
+                None,
+            )
+            is_target = tgt_info is not None
+
+            # Helper: which targets list *idx* as a source?
+            as_source_for = [
+                t["index"]
+                for t in layer_results["target_tokens"]
+                if any(s["index"] == idx for s in t.get("sources", []))
+            ]
+
+            # Optional: logit-lens data (may not exist yet – added later)
+            top_token, top_prob = "", 0.0
+            concept_probs: Dict[str, float] = {}
+            if (
+                "logit_lens_projections" in layer_results
+                and idx in layer_results["logit_lens_projections"]
+            ):
+                proj = layer_results["logit_lens_projections"][idx]
+                if proj["top_predictions"]:
+                    top_token = proj["top_predictions"][0]["token_text"]
+                    top_prob = proj["top_predictions"][0]["probability"]
+                for concept, data in proj.get("concept_predictions", {}).items():
+                    concept_probs[concept] = data.get("probability", 0.0)
+
+            # Assemble the CSV row
+            row = {
                 "layer": layer_idx,
-                "token_index": token_idx,
-                "token_text": token_text,
-                "token_id": token_id,
-                "token_type": target_info["type"] if target_info else (
-                    token_type_map.get(token_idx, 0) if "token_type_map" in locals() else 0
-                ),
+                "token_index": idx,
+                "token_text": all_token_texts[idx],
+                "token_id": all_token_ids[idx],
+                "token_type": token_type_map.get(idx, 0),      # ★ now correct
                 "is_target": is_target,
-                "source_for_targets": ",".join(map(str, source_targets)),
-                "predicted_top_token": top_pred_text,
-                "predicted_top_prob": top_pred_prob,
+                "source_for_targets": ",".join(map(str, as_source_for)),
+                "predicted_top_token": top_token,
+                "predicted_top_prob": top_prob,
                 "trace_id": trace_id,
-                "mode": tracing_mode
+                "mode": tracing_mode,
             }
-            
-            # FIX: Add concept probabilities to the record
+
+            # Add per-concept probabilities (if any)
             for concept, prob in concept_probs.items():
-                record[f"concept_{concept}_prob"] = prob
-            
-            # Add source-target relationships if target
-            if is_target and target_info:
-                sources_indices = []
-                sources_weights = []
-                
-                for source in target_info.get("sources", []):
-                    sources_indices.append(source["index"])
-                    sources_weights.append(source["scaled_weight"])
-                
-                # Store as comma-separated lists
-                record["sources_indices"] = ",".join(map(str, sources_indices))
-                record["sources_weights"] = ",".join(map(str, sources_weights))
-            
-            records.append(record)
-        
+                row[f"concept_{concept}_prob"] = prob
+
+            # If this is a *target*, also record its sources for visualisation
+            if is_target:
+                src_idx = [s["index"] for s in tgt_info["sources"]]
+                src_wt  = [s["scaled_weight"] for s in tgt_info["sources"]]
+                row["sources_indices"] = ",".join(map(str, src_idx))
+                row["sources_weights"] = ",".join(map(str, src_wt))
+
+            records.append(row)
+
         return records
     
     def _save_trace_results(self, result: Dict[str, Any]) -> str:

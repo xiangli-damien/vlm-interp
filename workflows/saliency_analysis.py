@@ -66,7 +66,7 @@ class SaliencyWorkflow(GenerationMixin):
         self.io = TraceIO(output_dir)
         
         # Initialize cache with CPU offload to save GPU memory
-        self.cache = TracingCache(cpu_offload=True)
+        self.cache = ActivationCache(cpu_offload=True)
         
         # Get attention layer names
         try:
