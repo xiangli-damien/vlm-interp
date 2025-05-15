@@ -73,7 +73,7 @@ def run_semantic_tracing_pipeline(
     
     # 3. Load image
     logger.info(f"Loading image: {image_path}")
-    image = load_image(image_path, resize_to=image_size)
+    image = load_image(image_path, resize_to=[336, 336])
     
     # 4. Prepare inputs
     logger.info("Preparing inputs")

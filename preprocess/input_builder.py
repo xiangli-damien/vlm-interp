@@ -48,8 +48,8 @@ def llavanext_build_conversation(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
                     {"type": "image"},
+                    {"type": "text", "text": prompt},
                 ],
             }
         ]
@@ -210,9 +210,7 @@ def prepare_inputs(
     # 2. Format prompt
     if hasattr(processor, "apply_chat_template"):
         # Modern HF processors use chat templates
-        conversation = [
-            {"role": "user", "content": prompt}
-        ]
+        conversation = llavanext_build_conversation(prompt)
         formatted_prompt = processor.apply_chat_template(
             conversation, 
             add_generation_prompt=True,

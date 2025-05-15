@@ -68,7 +68,7 @@ class LogitLensWorkflow(GenerationMixin):
         self.io = TraceIO(output_dir)
         
         # Initialize cache with CPU offload to save GPU memory
-        self.cache = TracingCache(cpu_offload=True)
+        self.cache = ActivationCache(cpu_offload=True)
         
         # Get number of layers from config
         self.num_layers = getattr(model.config, "num_hidden_layers", None)
