@@ -122,12 +122,8 @@ class SaliencyBackend(BaseBackend):
                     
                     # Register tensor hook to capture gradients safely
                     def _capture_grad(grad):
-                        # First make a CPU copy
-                        cpu_grad = grad.detach().cpu()
-                        # Now it's safe to clear the original gradient tensor
-                        grad.data = torch.empty(0, device=grad.device)
-                        # Store the CPU copy
-                        self.attention_grads[layer_name] = cpu_grad
+                        self.attention_grads[layer_name] = grad.detach().cpu()
+                        return grad
                     
                     if layer_name not in self.tensor_hooks:
                         handle = attn_weights.register_hook(_capture_grad)
@@ -214,20 +210,18 @@ class SaliencyBackend(BaseBackend):
                 
                 if loss.requires_grad:
                     loss.backward()
-                    # Free memory immediately after backward pass
+                    if self.stream_offload:
+                        for t in self.original_tensors.values():
+                            t.data  = torch.empty(0, device=t.device)
+                            if t.grad is not None:
+                                t.grad.data = torch.empty(0, device=t.grad.device)
+                        self.original_tensors.clear()
+                        torch.cuda.empty_cache()
                     del outputs, loss
                     torch.cuda.empty_cache()
                 else:
                     logger.warning("Loss doesn't require gradients. Check model setup.")
                     return {}
-            
-            # Free original tensors after backward pass
-            if self.stream_offload:
-                for layer_name, tensor in self.original_tensors.items():
-                    # Now it's safe to clear original tensors since backward is done
-                    tensor.data = torch.empty(0, device=tensor.device)
-                self.original_tensors.clear()
-                torch.cuda.empty_cache()
             
             # Compute saliency scores
             self._compute_saliency_scores()
@@ -255,20 +249,18 @@ class SaliencyBackend(BaseBackend):
                     
                     if loss.requires_grad:
                         loss.backward()
-                        # Free memory immediately after backward pass
+                        if self.stream_offload:
+                            for t in self.original_tensors.values():
+                                t.data  = torch.empty(0, device=t.device)
+                                if t.grad is not None:
+                                    t.grad.data = torch.empty(0, device=t.grad.device)
+                            self.original_tensors.clear()
+                            torch.cuda.empty_cache()
                         del outputs, loss
                         torch.cuda.empty_cache()
                     else:
                         logger.warning("Loss doesn't require gradients for batch.")
                         continue
-                
-                # Free original tensors after backward pass
-                if self.stream_offload:
-                    for layer_name, tensor in self.original_tensors.items():
-                        # Now it's safe to clear original tensors since backward is done
-                        tensor.data = torch.empty(0, device=tensor.device)
-                    self.original_tensors.clear()
-                    torch.cuda.empty_cache()
                 
                 # Compute saliency scores for this batch
                 batch_scores = self._compute_saliency_scores()
