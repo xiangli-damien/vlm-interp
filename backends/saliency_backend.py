@@ -151,13 +151,16 @@ class SaliencyBackend(BaseBackend):
             self.model.zero_grad(set_to_none=True)
             with torch.enable_grad():
                 outputs = self.model(**{k: v for k, v in inputs.items() if k != "token_type_ids"},
-                                     output_attentions=True,
-                                     use_cache=False)
+                                    output_attentions=True,
+                                    use_cache=False)
                 
                 loss = compute_loss(outputs, target_indices)
                 
                 if loss.requires_grad:
                     loss.backward()
+                    # ★ NEW: Free memory immediately after backward pass
+                    del outputs, loss
+                    torch.cuda.empty_cache()
                 else:
                     logger.warning("Loss doesn't require gradients. Check model setup.")
                     return {}
@@ -181,13 +184,16 @@ class SaliencyBackend(BaseBackend):
                 self.model.zero_grad(set_to_none=True)
                 with torch.enable_grad():
                     outputs = self.model(**{k: v for k, v in inputs.items() if k != "token_type_ids"},
-                                         output_attentions=True,
-                                         use_cache=False)
+                                        output_attentions=True,
+                                        use_cache=False)
                     
                     loss = compute_loss(outputs, target_indices)
                     
                     if loss.requires_grad:
                         loss.backward()
+                        # ★ NEW: Free memory immediately after backward pass
+                        del outputs, loss
+                        torch.cuda.empty_cache()
                     else:
                         logger.warning("Loss doesn't require gradients for batch.")
                         continue

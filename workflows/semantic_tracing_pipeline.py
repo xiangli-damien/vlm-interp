@@ -70,6 +70,10 @@ def run_semantic_tracing_pipeline(
         load_in_4bit=load_in_4bit,
         enable_gradients=True  # Required for saliency analysis
     )
+
+    # disable kv cache
+    logger.info("Disabling KV-cache to reduce memory usage")
+    model.config.use_cache = False
     
     # 3. Load image
     logger.info(f"Loading image: {image_path}")
