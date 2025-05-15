@@ -206,8 +206,6 @@ class SemanticTracingWorkflow(GenerationMixin):
         for idx in input_data.get("image_indices", []):
             token_types[int(idx.item()) if isinstance(idx, torch.Tensor) else idx] = 2
 
-        # workflows/semantic_tracing.py (partial code for the trace method)
-
         for layer in reversed(range(len(self.layer_names))):
             if not current:
                 if self.debug:
@@ -222,7 +220,7 @@ class SemanticTracingWorkflow(GenerationMixin):
             for s in srcs:
                 records.append({"layer": layer, **s})
 
-            # Collect unique token indices for this specific layer
+            # Collect unique token indices for this layer
             layer_unique_indices = set()
             for r in records:
                 if r["layer"] == layer:
@@ -230,7 +228,7 @@ class SemanticTracingWorkflow(GenerationMixin):
                     if "target" in r:
                         layer_unique_indices.add(r["target"])
             
-            # Run logit lens projection for this layer specifically
+            # Run logit lens for this layer specifically
             if layer_unique_indices:
                 try:
                     logit_backend = self._get_backend("logit")
@@ -253,7 +251,7 @@ class SemanticTracingWorkflow(GenerationMixin):
                             for concept, data in concepts.items():
                                 r[f"concept_{concept}_prob"] = data.get("probability", 0.0)
                 except Exception as e:
-                    print(f"Warning: Failed to compute logit lens projections for layer {layer}: {e}")
+                    print(f"[WARNING] Failed to compute logit lens projections for layer {layer}: {e}")
 
             # Prepare next layer's targets
             next_dict = {s["index"]: s["weight"] for s in srcs}
@@ -264,12 +262,12 @@ class SemanticTracingWorkflow(GenerationMixin):
             current = SelectionStrategy.renormalize(
                 next_dict, self.sel_cfg, apply_layer_prune=True
             )
-    
-    # === Add token type, text, id to each record ===
-    for record in records:
-        idx = record["index"]
-        if 0 <= idx < len(token_types):
-            record["token_type"] = token_types[idx]
+
+        # === Add token type, text, id to each record ===
+        for record in records:
+            idx = record["index"]
+            if 0 <= idx < len(token_types):
+                record["token_type"] = token_types[idx]
                 record_type_map = {0: "generated", 1: "text", 2: "image"}
                 record["type"] = record_type_map.get(token_types[idx], "generated")
             if "text" not in record and idx < len(all_token_texts):
@@ -284,29 +282,6 @@ class SemanticTracingWorkflow(GenerationMixin):
             all_unique_indices.add(r["index"])
             if "target" in r:
                 all_unique_indices.add(r["target"])
-
-        # === Logit lens projection (optional enrichment) ===
-        logit_backend = self._get_backend("logit")
-        logit_backend.ensure_hidden(input_data["inputs"])
-
-        if all_unique_indices:
-            try:
-                projections = logit_backend.project_tokens(
-                    layer,
-                    list(all_unique_indices),
-                    self.processor.tokenizer
-                )
-                for r in records:
-                    if r["index"] in projections:
-                        predictions = projections[r["index"]].get("predictions", [])
-                        if predictions:
-                            r["predicted_top_token"] = self._sanitize_text_for_display(predictions[0]["token"])
-                            r["predicted_top_prob"] = predictions[0]["prob"]
-                        concepts = projections[r["index"]].get("concept_predictions", {})
-                        for concept, data in concepts.items():
-                            r[f"concept_{concept}_prob"] = data.get("probability", 0.0)
-            except Exception as e:
-                print(f"Warning: Failed to compute logit lens projections: {e}")
 
         # === 3-B Fix: Build reverse index from target → source records ===
         target_to_sources = {}
