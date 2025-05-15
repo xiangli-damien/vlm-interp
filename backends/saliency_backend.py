@@ -51,23 +51,24 @@ class SaliencyBackend(BaseBackend):
         self.tensor_hooks = {}
         self.hooked_layers = set()
         self.saliency_scores = {}
+        
+        # Track original tensors to safely free memory after backward pass
+        self.original_tensors = {}
     
     @staticmethod
-    def _to_cpu_and_clear(t: torch.Tensor) -> torch.Tensor:
+    def _to_cpu(t: torch.Tensor) -> torch.Tensor:
         """
-        Move tensor to CPU (non-blocking) and free GPU storage by swapping data pointer.
-        Returns the *CPU copy* (detached).
+        Move tensor to CPU (non-blocking) but preserve the original tensor.
         
         Args:
-            t: Tensor to move to CPU and clear from GPU
+            t: Tensor to copy to CPU
             
         Returns:
             CPU copy of the tensor
         """
-        cpu_t = t.detach().cpu()
-        # Replace the original tensor with an empty one to free GPU memory
-        t.data = torch.empty(0, device=t.device)
-        return cpu_t
+        # Just copy to CPU, don't clear the original tensor
+        # This allows autograd to still write gradients correctly
+        return t.detach().cpu()
     
     def setup(self, layer_names: List[str]) -> None:
         """
@@ -88,7 +89,7 @@ class SaliencyBackend(BaseBackend):
         )
         
         self.hooks.extend(hooks)
-        logger.info(f"Registered hooks for {len(self.hooks)} layers")
+        logger.info(f"Registered hooks for {len(self.hooks)} layers}")
     
     def _create_forward_hook(self, layer_name: str):
         """Create a forward hook for capturing attention weights."""
@@ -114,16 +115,25 @@ class SaliencyBackend(BaseBackend):
                 
                 # Stream offload if enabled, otherwise store as-is
                 if self.stream_offload:
-                    self.attention_weights[layer_name] = self._to_cpu_and_clear(attn_weights)
+                    # Copy to CPU but keep original for autograd
+                    self.attention_weights[layer_name] = self._to_cpu(attn_weights)
+                    # Save original tensor reference to safely clear after backward pass
+                    self.original_tensors[layer_name] = attn_weights
                     
-                    # Register tensor hook to capture gradients immediately
+                    # Register tensor hook to capture gradients safely
                     def _capture_grad(grad):
-                        self.attention_grads[layer_name] = self._to_cpu_and_clear(grad)
+                        # First make a CPU copy
+                        cpu_grad = grad.detach().cpu()
+                        # Now it's safe to clear the original gradient tensor
+                        grad.data = torch.empty(0, device=grad.device)
+                        # Store the CPU copy
+                        self.attention_grads[layer_name] = cpu_grad
                     
                     if layer_name not in self.tensor_hooks:
                         handle = attn_weights.register_hook(_capture_grad)
                         self.tensor_hooks[layer_name] = handle
                 else:
+                    # Standard behavior - just store the tensor
                     self.attention_weights[layer_name] = attn_weights
         
         return hook
@@ -211,6 +221,14 @@ class SaliencyBackend(BaseBackend):
                     logger.warning("Loss doesn't require gradients. Check model setup.")
                     return {}
             
+            # Free original tensors after backward pass
+            if self.stream_offload:
+                for layer_name, tensor in self.original_tensors.items():
+                    # Now it's safe to clear original tensors since backward is done
+                    tensor.data = torch.empty(0, device=tensor.device)
+                self.original_tensors.clear()
+                torch.cuda.empty_cache()
+            
             # Compute saliency scores
             self._compute_saliency_scores()
             
@@ -243,6 +261,14 @@ class SaliencyBackend(BaseBackend):
                     else:
                         logger.warning("Loss doesn't require gradients for batch.")
                         continue
+                
+                # Free original tensors after backward pass
+                if self.stream_offload:
+                    for layer_name, tensor in self.original_tensors.items():
+                        # Now it's safe to clear original tensors since backward is done
+                        tensor.data = torch.empty(0, device=tensor.device)
+                    self.original_tensors.clear()
+                    torch.cuda.empty_cache()
                 
                 # Compute saliency scores for this batch
                 batch_scores = self._compute_saliency_scores()
@@ -286,7 +312,7 @@ class SaliencyBackend(BaseBackend):
             
             # Ensure tensors are compatible
             if attn_weights.shape != grad.shape:
-                logger.warning(f"Shape mismatch for layer '{layer_name}'. Skipping.")
+                logger.warning(f"Shape mismatch for layer '{layer_name}'. Weights shape: {attn_weights.shape}, grad shape: {grad.shape}. Skipping.")
                 continue
             
             # Compute saliency: |Attention * Gradient|
@@ -324,6 +350,7 @@ class SaliencyBackend(BaseBackend):
         self.attention_weights.clear()
         self.attention_grads.clear()
         self.saliency_scores.clear()
+        self.original_tensors.clear()
     
     def cleanup(self) -> None:
         """Remove all hooks and free resources."""
