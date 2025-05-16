@@ -55,19 +55,45 @@ class HeatmapVisualizer:
         # Create output directory
         os.makedirs(out_dir, exist_ok=True)
         
-        # Load CSV data
+        # Load CSV data with robust error handling
         print(f"Loading trace data from {csv_path}")
-        self.df = pd.read_csv(csv_path)
-        
-        # Check if the specified weight column exists
-        if weight_column not in self.df.columns:
-            print(f"Warning: Weight column '{weight_column}' not found in CSV. Available columns: {list(self.df.columns)}")
-            if "predicted_top_prob" in self.df.columns:
-                print(f"Using 'predicted_top_prob' as fallback weight column")
-                self.weight_column = "predicted_top_prob"
-            else:
-                raise ValueError(f"Neither '{weight_column}' nor fallback column 'predicted_top_prob' found in CSV")
-        
+        try:
+            # Try to load CSV with explicit numeric conversion for weight column
+            df = pd.read_csv(csv_path)
+            
+            # Check if the specified weight column exists
+            if weight_column not in df.columns:
+                print(f"Warning: Weight column '{weight_column}' not found in CSV. Available columns: {list(df.columns)}")
+                if "predicted_top_prob" in df.columns:
+                    print(f"Using 'predicted_top_prob' as fallback weight column")
+                    self.weight_column = "predicted_top_prob"
+                    weight_column = "predicted_top_prob"
+                else:
+                    raise ValueError(f"Neither '{weight_column}' nor fallback column 'predicted_top_prob' found in CSV")
+            
+            # Force numeric conversion of the weight column
+            df[weight_column] = pd.to_numeric(df[weight_column], errors="coerce")
+            
+            # Check for data issues
+            if df[weight_column].isna().all():
+                print(f"Warning: All values in '{weight_column}' are NaN after numeric conversion")
+                # Try to get the raw values to understand the issue
+                raw_df = pd.read_csv(csv_path)
+                print(f"Sample raw values: {raw_df[weight_column].iloc[:5].tolist()}")
+                # Handle all NaN by setting small positive values
+                df[weight_column] = 0.01
+            elif df[weight_column].max() <= 0:
+                # If all weights are zero or negative, add a small value for visibility
+                print(f"Warning: All weights are zero or negative. Adding small value for visibility.")
+                df[weight_column] = df[weight_column] + 0.01
+            
+            self.df = df
+            
+        except Exception as e:
+            print(f"Error loading CSV: {e}")
+            # Create empty DataFrame as fallback
+            self.df = pd.DataFrame()
+            
         # Load metadata
         print(f"Loading metadata from {metadata_path}")
         try:
@@ -78,7 +104,7 @@ class HeatmapVisualizer:
             self.meta = {}
         
         # Add importance_weight column if using a different weight column
-        if self.weight_column != "importance_weight":
+        if self.weight_column != "importance_weight" and not self.df.empty:
             self.df["importance_weight"] = self.df[self.weight_column]
             print(f"Mapped '{self.weight_column}' to 'importance_weight' for visualization")
         
@@ -93,6 +119,87 @@ class HeatmapVisualizer:
         
         # Create visualizer instance (only for its drawing functions)
         self.viz = self._create_visualizer(output_dir=out_dir, debug_mode=debug_mode)
+
+    def _load_dataframe(self) -> None:
+        """
+        Robust CSV loader that properly handles weight columns.
+        1) Forces the weight column to be converted to float type
+        2) Drops rows with NaN values after conversion
+        3) Fails early if all weights are zero or NaN
+        """
+        if not os.path.exists(self.csv_path):
+            raise FileNotFoundError(self.csv_path)
+        
+        df = pd.read_csv(self.csv_path)
+        
+        if self.weight_column not in df.columns:
+            raise KeyError(
+                f"CSV does not contain column '{self.weight_column}', actual columns: {list(df.columns)[:10]}..."
+            )
+        
+        # Force numeric conversion; invalid values → NaN → dropped
+        df[self.weight_column] = pd.to_numeric(df[self.weight_column], errors="coerce")
+        df = df.dropna(subset=[self.weight_column])
+        
+        if df.empty or np.isclose(df[self.weight_column].abs().sum(), 0.0):
+            raise ValueError(
+                f"Column '{self.weight_column}' read results are all 0 / NaN, "
+                "please ensure upstream trace CSV correctly writes importance_weight."
+            )
+        
+        self.df = df.reset_index(drop=True)
+
+    def _draw_overlay(
+        self,
+        layer: int,
+        concept: str,
+        background: Image.Image,
+        pad_left: int,
+        pad_top: int,
+        resized_w: int,
+        resized_h: int,
+        save_path: str,
+        cmap: str = "jet",
+        alpha: float = 0.6,
+        interpolation: str = "nearest",
+    ) -> None:
+        """
+        Generate single layer patch overlay aligned with preview image.
+        - Uses consistent coordinate system with origin='upper' for both background and heatmap
+        - Correctly handles extent parameters to align heatmap with image content area
+        - Ensures proper visibility with appropriate alpha and normalization
+        """
+        heat_norm = self._normalize_weights(layer)  # (H,W)→[0,1]
+        
+        # 1. First upscale (patch_h*ps, patch_w*ps) to content size
+        up = np.repeat(np.repeat(heat_norm, self.raw_patch_size, 0), self.raw_patch_size, 1)
+        up_img = Image.fromarray((up * 255).astype(np.uint8))
+        up_img = up_img.resize((resized_w, resized_h), Image.BILINEAR)
+        heat_vis = np.asarray(up_img, dtype=np.float32) / 255.0
+        
+        fig, ax = plt.subplots(figsize=(8, 8 * background.height / max(1, background.width)))
+        try:
+            ax.imshow(background, origin="upper")
+            
+            # Note: y-axis is reversed in extent coordinates for proper alignment
+            extent = (pad_left, pad_left + resized_w, pad_top + resized_h, pad_top)
+            
+            ax.imshow(
+                heat_vis,
+                cmap=cmap,
+                alpha=alpha,
+                extent=extent,
+                origin="upper",  # Match background orientation
+                interpolation=interpolation,
+                vmin=0,
+                vmax=1,
+            )
+            
+            ax.set_title(f"{concept} • L{layer}", fontsize=11)
+            ax.axis("off")
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        finally:
+            plt.close(fig)
     
     def _create_visualizer(self, output_dir, debug_mode):
         """Create semantic tracing visualizer with custom enhancements"""

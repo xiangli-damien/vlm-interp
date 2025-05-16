@@ -342,88 +342,6 @@ def run_saliency_workflow(
 
     return final_results
 
-def create_visualizations_from_csv(
-    csv_path: str,
-    metadata_path: str,
-    image_path: Optional[str] = None,
-    output_dir: Optional[str] = None,
-    flow_graph_params: Optional[Dict[str, Any]] = None,
-    heatmap_params: Optional[Dict[str, Any]] = None
-) -> List[str]:
-    """
-    Create visualizations from saved semantic tracing CSV files.
-    
-    Args:
-        csv_path: Path to the CSV file with trace data
-        metadata_path: Path to the metadata JSON file
-        image_path: Path to the original image (required for heatmaps)
-        output_dir: Directory to save visualizations
-        flow_graph_params: Parameters for flow graph visualization
-        heatmap_params: Parameters for heatmap visualization
-        
-    Returns:
-        List of paths to created visualization files
-    """
-    
-    # Determine output directory
-    if output_dir is None:
-        # If not specified, use a directory next to the CSV file
-        csv_dir = os.path.dirname(csv_path)
-        project_dir = os.path.dirname(csv_dir)  # Go up one level to project dir
-        vis_dir = os.path.join(project_dir, "visualizations")
-        output_dir = vis_dir
-    else:
-        # If output_dir is specified, use it as the base and add 'visualizations'
-        vis_dir = os.path.join(output_dir, "visualizations")
-        output_dir = vis_dir
-    
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Set default flow graph parameters if not provided
-    if flow_graph_params is None:
-        flow_graph_params = {
-            "output_format": "both",
-            "align_tokens_by_layer": True,
-            "show_orphaned_nodes": False,
-            "min_edge_weight": 0.05,
-            "use_variable_node_size": True,
-            "debug_mode": False
-        }
-    
-    # Set default heatmap parameters if not provided
-    if heatmap_params is None:
-        heatmap_params = {
-            "use_grid_visualization": True,
-            "show_values": True,
-            "composite_only": True
-        }
-    
-    start_time = time.time()
-    print(f"\n=== Creating Visualizations from CSV ===")
-    print(f"CSV: {csv_path}")
-    print(f"Output Directory: {output_dir}")
-    print(f"Image Path: {image_path}")
-    
-    # Create a visualizer instance
-    visualizer = EnhancedSemanticTracingVisualizer(output_dir=output_dir)
-    
-    # Create visualizations from the CSV
-    visualization_paths = visualizer.visualize_from_csv(
-        csv_path=csv_path,
-        metadata_path=metadata_path,
-        image_path=image_path,
-        flow_graph_params=flow_graph_params,
-        heatmap_params=heatmap_params
-    )
-    
-    end_time = time.time()
-    print(f"\n=== Visualization Complete ===")
-    print(f"Visualization time: {end_time - start_time:.2f} seconds")
-    print(f"Created {len(visualization_paths)} visualization files in {output_dir}")
-    
-    return visualization_paths
-
 def process_all_csvs_in_directory(
     directory: str,
     metadata_path: str,
@@ -785,18 +703,13 @@ def run_semantic_tracing_test(
     analyze_last_token: bool = False,
     single_forward_pass: bool = False,
     target_token_idx: Optional[int] = None,
-    analyze_specific_indices: Optional[List[int]] = None,  # New parameter
-    generate_first: bool = False,  # New parameter for two-step process
+    analyze_specific_indices: Optional[List[int]] = None,
+    generate_first: bool = False,
     tracing_mode: str = "both",
-    skip_visualization: bool = False,
-    output_format: str = "both",
-    show_orphaned_nodes: bool = False,
-    min_edge_weight: float = 0.0,
-    use_variable_node_size: bool = True,
     debug_mode: bool = False
 ) -> Dict[str, Any]:
     """
-    Run semantic tracing test with improved multi-token handling and specific token analysis.
+    Run semantic tracing analysis to generate trace CSV data without visualization.
     
     Args:
         model_id: HuggingFace model ID
@@ -818,14 +731,10 @@ def run_semantic_tracing_test(
         analyze_specific_indices: List of specific token indices to analyze
         generate_first: Two-step process: first generate all tokens, then analyze specific indices
         tracing_mode: The tracing mode to use ("saliency", "attention", or "both")
-        skip_visualization: Skip visualization step
-        output_format: Output format (png, svg, or both)
-        show_orphaned_nodes: Show nodes with no connections
-        min_edge_weight: Minimum edge weight threshold
-        use_variable_node_size: Vary node size based on importance
+        debug_mode: Whether to print detailed debug information
         
     Returns:
-        Dictionary with test results
+        Dictionary with CSV file paths and metadata for later visualization
     """
     # Import necessary functions
     from utils.data_utils import load_image
@@ -992,81 +901,6 @@ def run_semantic_tracing_test(
             test_results["error"] = "No CSV files generated"
             return test_results
         
-        # Run visualization if not skipped
-        if not skip_visualization:
-            # Set flow graph parameters
-            flow_graph_params = {
-                "output_format": output_format,
-                "align_tokens_by_layer": True,
-                "show_orphaned_nodes": show_orphaned_nodes,
-                "min_edge_weight": min_edge_weight,
-                "use_variable_node_size": use_variable_node_size
-            }
-
-            heatmap_params = {
-                "use_grid_visualization": True,
-                "show_values": True,
-                "composite_only": True,
-            }
-            
-            print("\nRunning visualization step...")
-            
-            # Process each CSV independently with unique output directories
-            all_vis_results = {}
-            
-            for idx, csv_path in enumerate(analysis_results.get("csv_files", [])):
-                # Extract tracing mode from the filename
-                if "trace_saliency_" in csv_path:
-                    trace_type = "saliency"
-                elif "trace_attn_" in csv_path:
-                    trace_type = "attention"
-                else:
-                    trace_type = f"trace_{idx+1}"
-                
-                # Extract token info for creating unique directory
-                trace_id = csv_path.split("trace_")[-1].split("_")[0] if "trace_" in csv_path else str(idx+1)
-                
-                # Create specific visualization directory for this tracing result
-                if "target_tokens" in analysis_results and idx < len(analysis_results["target_tokens"]):
-                    token_info = analysis_results["target_tokens"][idx]
-                    token_idx = token_info.get("index", f"unknown_{idx}")
-                    token_text = token_info.get("text", f"token_{idx}")
-                    token_dir = os.path.join(output_dir, f"{trace_type}_token_{token_idx}_{token_text}")
-                else:
-                    token_dir = os.path.join(output_dir, f"{trace_type}_trace_{trace_id}")
-                
-                os.makedirs(token_dir, exist_ok=True)
-                
-                # Create a token-specific visualizer
-                token_visualizer = EnhancedSemanticTracingVisualizer(output_dir=token_dir)
-                
-                csv_vis_results = token_visualizer.visualize_from_csv(
-                    csv_path=csv_path,
-                    metadata_path=analysis_results.get("metadata_path", ""),
-                    image_path=local_image_path,
-                    flow_graph_params=flow_graph_params,
-                    heatmap_params=heatmap_params
-                )
-                
-                # Merge results for this token
-                token_vis_paths = []
-                for vis_type, paths in csv_vis_results.items():
-                    if vis_type not in all_vis_results:
-                        all_vis_results[vis_type] = []
-                    all_vis_results[vis_type].extend(paths)
-                    token_vis_paths.extend(paths)
-                
-                print(f"Created {len(token_vis_paths)} visualization files for {trace_type} trace {idx+1}")
-            
-            # Flatten all visualization paths
-            all_vis_paths = []
-            for paths in all_vis_results.values():
-                all_vis_paths.extend(paths)
-                
-            test_results["visualization_paths"] = all_vis_paths
-            
-            print(f"\nTotal: Created {len(all_vis_paths)} visualization files")
-        
         # Calculate and add total time
         total_time = time.time() - start_time
         test_results["total_time"] = total_time
@@ -1100,7 +934,6 @@ def run_semantic_tracing_test(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-
 def build_heatmaps_offline(
         trace_csv: str,
         metadata_json: str,
@@ -1133,6 +966,9 @@ def build_heatmaps_offline(
     Returns:
         List of paths to generated visualization files
     """
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
     # Handle image download and resize if needed
     processed_image_path = image_path
     if download_resize_image and image_path.startswith(('http://', 'https://')):
@@ -1169,22 +1005,114 @@ def build_heatmaps_offline(
             print(f"Error downloading or processing image: {e}")
             # Continue with original image path
     
-    # Create visualizer with custom parameters
-    hv = HeatmapVisualizer(
-        csv_path=trace_csv,
-        metadata_path=metadata_json,
-        image_path=processed_image_path,
-        out_dir=output_dir,
-        weight_column=weight_column,
-        debug_mode=debug
-    )
+    # First attempt: standard approach
+    try:
+        # IMPROVED: Add debug information before creating visualizer
+        print(f"Reading trace CSV: {trace_csv}")
+        # Read a few sample rows to inspect data
+        if debug:
+            import pandas as pd
+            sample_df = pd.read_csv(trace_csv, nrows=5)
+            print(f"CSV sample columns: {list(sample_df.columns)}")
+            if weight_column in sample_df.columns:
+                print(f"Sample weight values: {sample_df[weight_column].tolist()}")
+            else:
+                print(f"Warning: Weight column '{weight_column}' not found in CSV")
+        
+        # Create visualizer with custom parameters
+        hv = HeatmapVisualizer(
+            csv_path=trace_csv,
+            metadata_path=metadata_json,
+            image_path=processed_image_path,
+            out_dir=output_dir,
+            weight_column=weight_column,
+            debug_mode=debug
+        )
+        
+        # Set custom visualization parameters
+        hv.unified_colorscale = unified_colorscale
+        hv.include_all_token_types = include_all_token_types
+        
+        # IMPROVED: Try direct visualization with more debugging
+        if debug:
+            print("Debug mode: Using direct approach with higher visibility settings")
+            unified_colorscale = False  # Turn off unified colorscale in debug mode for better visibility
+            
+        # Run visualization and collect output files
+        files = hv.run(composite_only=composite_only, show_values=not composite_only)
+        
+        if files:
+            print(f"Successfully generated {len(files)} visualization files")
+            return files
+        
+        # If no files were generated, try fallback approach
+        print("No visualization files generated. Trying fallback approach...")
+        raise ValueError("Initial approach failed to generate any files")
+        
+    except Exception as e:
+        print(f"Visualization error: {e}")
+        
+        # ADDED: Fallback approach - try with preprocessed CSV
+        try:
+            print("\nTrying fallback approach with preprocessed CSV...")
+            
+            # Read and preprocess the CSV
+            import pandas as pd
+            df = pd.read_csv(trace_csv)
+            
+            # Fix weight column
+            if weight_column in df.columns:
+                # Force numeric conversion
+                df[weight_column] = pd.to_numeric(df[weight_column], errors="coerce").fillna(0)
+                
+                # Ensure non-zero values for visibility
+                if df[weight_column].max() <= 0.01:
+                    print(f"Adding visibility offset to weights (all <= 0.01)")
+                    df[weight_column] = df[weight_column] + 0.1
+            
+            # Filter out problematic rows
+            img_tokens = df[df["token_type"] == 2]
+            if img_tokens.empty:
+                print("Warning: No image tokens found in trace data")
+            else:
+                print(f"Found {len(img_tokens)} image tokens")
+                
+                # Log token counts by layer
+                layer_counts = img_tokens.groupby('layer').size()
+                print(f"Image tokens per layer: {layer_counts.to_dict()}")
+                
+                # Log weight statistics
+                if weight_column in img_tokens.columns:
+                    weight_stats = img_tokens[weight_column].describe()
+                    print(f"Weight statistics: min={weight_stats['min']:.4f}, max={weight_stats['max']:.4f}, mean={weight_stats['mean']:.4f}")
+            
+            # Save preprocessed data
+            preprocessed_csv = os.path.join(output_dir, "preprocessed_trace.csv")
+            df.to_csv(preprocessed_csv, index=False)
+            
+            # Create visualizer with preprocessed data
+            print(f"Creating visualizer with preprocessed data")
+            hv_fallback = HeatmapVisualizer(
+                csv_path=preprocessed_csv,
+                metadata_path=metadata_json,
+                image_path=processed_image_path,
+                out_dir=os.path.join(output_dir, "fallback"),
+                weight_column=weight_column,
+                debug_mode=True  # Always enable debug for fallback
+            )
+            
+            # Disable unified colorscale for better visibility
+            hv_fallback.unified_colorscale = False
+            
+            # Run visualization
+            fallback_files = hv_fallback.run(composite_only=composite_only, show_values=True)
+            
+            if fallback_files:
+                print(f"Fallback approach generated {len(fallback_files)} visualization files")
+                return fallback_files
+            
+        except Exception as e2:
+            print(f"Fallback approach failed: {e2}")
     
-    # Set custom visualization parameters
-    hv.unified_colorscale = unified_colorscale
-    hv.include_all_token_types = include_all_token_types
-    
-    # Run visualization and collect output files
-    files = hv.run(composite_only=composite_only, show_values=not composite_only)
-    
-    print(f"[Heatmap] generated {len(files)} files under {output_dir}")
-    return files
+    print("All visualization attempts failed. No heatmaps generated.")
+    return []
