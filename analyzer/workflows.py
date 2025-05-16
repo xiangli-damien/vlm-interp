@@ -1161,23 +1161,18 @@ def build_heatmaps_offline(
     print("All visualization attempts failed. No heatmaps generated.")
     return []
 
-
-def run_token_analysis_workflow(
+def analyze_token_thresholds(
     model: torch.nn.Module,
     processor: Any,
     image_source: Union[str, Image.Image],
     prompt_text: str,
     trace_data_path: Optional[str] = None,
     metadata_path: Optional[str] = None,
-    output_dir: str = "token_analysis_results",
-    identify_critical_tokens: bool = True,
-    visualize_results: bool = True,
-    run_ablation_tests: bool = False,
+    output_dir: str = "token_threshold_analysis",
     debug_mode: bool = False
 ) -> Dict[str, Any]:
     """
-    Performs token role analysis on semantic tracing data to identify critical tokens
-    in the model's reasoning process.
+    Analyzes threshold statistics to determine appropriate parameters for token role identification.
     
     Args:
         model: The loaded VLM model instance
@@ -1187,15 +1182,12 @@ def run_token_analysis_workflow(
         trace_data_path: Path to pre-existing trace CSV (if None, new trace will be run)
         metadata_path: Path to trace metadata JSON (if None, metadata from trace will be used)
         output_dir: Directory path to save analysis outputs
-        identify_critical_tokens: Whether to identify and rank critical tokens
-        visualize_results: Whether to create visualizations
-        run_ablation_tests: Whether to perform ablation tests on critical tokens
         debug_mode: Whether to print detailed debug information
         
     Returns:
-        Dict containing analysis results
+        Dict containing threshold statistics and recommendations
     """
-    print("\n--- Starting Token Analysis Workflow ---")
+    print("\n--- Starting Token Threshold Analysis ---")
     print(f"  Output directory: {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
     results = {}
@@ -1250,22 +1242,150 @@ def run_token_analysis_workflow(
             print(f"Using provided trace data: {trace_data_path}")
         
         # 2. Initialize token analyzer
+        analyzer = OptimizedTokenAnalyzer(
+            output_dir=output_dir,
+            debug_mode=debug_mode
+        )
+        
+        # 3. Analyze threshold statistics
+        threshold_stats = analyzer.analyze_threshold_statistics(
+            csv_path=trace_data_path,
+            metadata_path=metadata_path
+        )
+        
+        # Store threshold statistics
+        results["threshold_stats"] = threshold_stats
+        
+        # 4. Print recommended thresholds
+        if "recommended_thresholds" in threshold_stats:
+            rec = threshold_stats["recommended_thresholds"]
+            print("\nRecommended Parameter Values:")
+            print(f"  receptivity_threshold = {rec['receptivity_threshold']:.4f}")
+            print(f"  emission_threshold = {rec['emission_threshold']:.4f}")
+            print(f"  preservation_threshold = {rec['preservation_threshold']:.4f}")
+        
+        print(f"\n--- Token Threshold Analysis Complete ---")
+        return results
+
+    except Exception as e:
+        print(f"Error during token threshold analysis: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
+
+def run_token_analysis(
+    model: torch.nn.Module,
+    processor: Any,
+    image_source: Union[str, Image.Image],
+    prompt_text: str,
+    trace_data_path: Optional[str] = None,
+    metadata_path: Optional[str] = None,
+    output_dir: str = "token_analysis_results",
+    receptivity_threshold: float = 0.7,
+    emission_threshold: float = 0.7,
+    preservation_threshold: float = 0.5,
+    importance_window: int = 3,
+    identify_critical_tokens: bool = True,
+    debug_mode: bool = False
+) -> Dict[str, Any]:
+    """
+    Performs token role analysis on semantic tracing data to identify critical tokens.
+    Optimized version without network metrics and visualizations.
+    
+    Args:
+        model: The loaded VLM model instance
+        processor: The corresponding processor instance
+        image_source: PIL image, URL string, or local file path
+        prompt_text: The text prompt for the model
+        trace_data_path: Path to pre-existing trace CSV (if None, new trace will be run)
+        metadata_path: Path to trace metadata JSON (if None, metadata from trace will be used)
+        output_dir: Directory path to save analysis outputs
+        receptivity_threshold: Threshold for identifying reception nodes
+        emission_threshold: Threshold for identifying emission nodes
+        preservation_threshold: Threshold for identifying preservation nodes
+        importance_window: Number of layers to consider for importance
+        identify_critical_tokens: Whether to identify and rank critical tokens
+        debug_mode: Whether to print detailed debug information
+        
+    Returns:
+        Dict containing analysis results
+    """
+    print("\n--- Starting Token Analysis ---")
+    print(f"  Output directory: {output_dir}")
+    os.makedirs(output_dir, exist_ok=True)
+    results = {}
+
+    try:
+        # 1. Check if we need to run semantic tracing or use provided data
+        if trace_data_path is None or not os.path.exists(trace_data_path):
+            print("No trace data provided. Running semantic tracing...")
+            
+            # Import semantic tracing components
+            from analyzer.semantic_tracing import EnhancedSemanticTracer
+            
+            # Run semantic tracing
+            tracer = EnhancedSemanticTracer(
+                model=model,
+                processor=processor,
+                output_dir=output_dir,
+                debug=debug_mode
+            )
+            
+            # Prepare inputs
+            input_data = tracer.prepare_inputs(image_source, prompt_text)
+            
+            # Run tracing
+            trace_results = tracer.generate_and_analyze(
+                input_data=input_data,
+                num_tokens=1,  # Just analyze the first generated token
+                tracing_mode="saliency"  # Use saliency tracing
+            )
+            
+            # Get paths to trace data
+            if "trace_results" in trace_results:
+                if "saliency" in trace_results["trace_results"]:
+                    trace_data_path = trace_results["trace_results"]["saliency"].get("trace_data_path")
+                elif "attention" in trace_results["trace_results"]:
+                    trace_data_path = trace_results["trace_results"]["attention"].get("trace_data_path")
+            
+            # Get metadata path
+            metadata_path = trace_results.get("metadata_path")
+            
+            # Store original trace results
+            results["trace_results"] = trace_results
+            
+            # Ensure we have trace data
+            if trace_data_path is None or not os.path.exists(trace_data_path):
+                print("Error: Trace data not generated correctly")
+                return {"error": "Trace data not generated correctly"}
+            
+            print(f"Generated trace data: {trace_data_path}")
+            
+        else:
+            print(f"Using provided trace data: {trace_data_path}")
+        
+        # 2. Initialize token analyzer with specified thresholds
         analyzer = TokenAnalyzer(
             output_dir=output_dir,
+            receptivity_threshold=receptivity_threshold,
+            emission_threshold=emission_threshold,
+            preservation_threshold=preservation_threshold,
+            importance_window=importance_window,
             debug_mode=debug_mode
         )
         
         # 3. Analyze trace data
         analysis_results = analyzer.analyze_trace_data(
             csv_path=trace_data_path,
-            metadata_path=metadata_path
+            metadata_path=metadata_path,
+            analyze_thresholds_first=False  # Already using provided thresholds
         )
         
         # Store token analysis results
         results["token_analysis"] = analysis_results
         
         # 4. Identify critical tokens if requested
-        if identify_critical_tokens:
+        if identify_critical_tokens and "combined_metrics" in analysis_results:
             print("\nIdentifying critical tokens...")
             critical_tokens = analyzer.identify_critical_tokens(
                 combined_metrics=analysis_results["combined_metrics"],
@@ -1276,152 +1396,147 @@ def run_token_analysis_workflow(
             results["critical_tokens"] = critical_tokens
             
             # Print critical tokens
-            print("\nTop 10 Critical Tokens:")
+            print("\nTop Critical Tokens:")
             for i, token in enumerate(critical_tokens):
                 print(f"  {i+1}. Token {token['token_index']} ('{token['token_text']}'): "
                       f"Importance={token['importance']:.3f}, "
                       f"Roles={token['global_roles']}")
+                
+                # Print layer predictions
+                if "layer_predictions" in token and token["layer_predictions"]:
+                    print("    Layer predictions:")
+                    for layer, pred in token["layer_predictions"].items():
+                        print(f"      {layer}: '{pred['text']}' (p={pred['probability']:.3f})")
+                
+                # Print layer roles from summary
+                if ("summary" in analysis_results and 
+                    "target_token_analysis" in analysis_results["summary"]):
+                    for target in analysis_results["summary"]["target_token_analysis"]:
+                        if target["token_index"] == token["token_index"]:
+                            for layer, layer_info in target.get("layers", {}).items():
+                                roles = layer_info.get("roles", [])
+                                if roles:
+                                    print(f"      {layer} roles: {roles}")
         
-        # 5. Create visualizations if requested
-        if visualize_results:
-            print("\nCreating visualizations...")
-            
-            # Create token metrics visualization
-            metrics_viz = analyzer.visualize_token_metrics(
-                combined_metrics=analysis_results["combined_metrics"]
-            )
-            
-            # Create token roles visualization
-            roles_viz = analyzer.visualize_token_roles(
-                combined_metrics=analysis_results["combined_metrics"]
-            )
-            
-            # Create token graph visualization for a few key layers
-            # Select a subset of layers to visualize
-            trace_df = pd.read_csv(trace_data_path)
-            all_layers = sorted(trace_df["layer"].unique())
-            
-            # Choose first, middle, and last layer
-            if len(all_layers) >= 3:
-                layers_to_viz = [all_layers[0], all_layers[len(all_layers)//2], all_layers[-1]]
-            else:
-                layers_to_viz = all_layers
-            
-            graph_viz_paths = []
-            for layer in layers_to_viz:
-                # Highlight critical tokens if available
-                highlight_tokens = None
-                if identify_critical_tokens:
-                    highlight_tokens = [t["token_index"] for t in critical_tokens[:5]]
-                
-                graph_path = analyzer.visualize_token_graph(
-                    trace_df=trace_df,
-                    layer=layer,
-                    highlight_tokens=highlight_tokens
-                )
-                if graph_path:
-                    graph_viz_paths.append(graph_path)
-            
-            # Store visualization paths
-            results["visualizations"] = {
-                "metrics_visualization": metrics_viz,
-                "roles_visualization": roles_viz,
-                "graph_visualizations": graph_viz_paths
-            }
-        
-        # 6. Run ablation tests if requested
-        if run_ablation_tests and identify_critical_tokens:
-            print("\nRunning ablation tests on critical tokens...")
-            
-            # Get top 5 critical tokens for ablation
-            tokens_to_block = [t["token_index"] for t in critical_tokens[:5]]
-            
-            # First run normal inference as reference
-            input_data = tracer.prepare_inputs(image_source, prompt_text)
-            inputs = input_data["inputs"]
-            
-            with torch.no_grad():
-                reference_outputs = model(**{k: v for k, v in inputs.items() if k != "token_type_ids"})
-                
-                # Get reference output token
-                reference_logits = reference_outputs.logits[:, -1, :]
-                reference_ids = torch.argmax(reference_logits, dim=-1).unsqueeze(0)
-                reference_text = processor.tokenizer.decode(reference_ids[0].tolist())
-                
-                reference_result = {
-                    "output_ids": reference_ids,
-                    "output_text": reference_text,
-                    "logits": reference_logits
-                }
-            
-            # Run ablation tests
-            ablation_results = {}
-            
-            # Test each critical token individually
-            for token_idx in tokens_to_block:
-                print(f"Testing ablation of token {token_idx}...")
-                
-                # Run simulation with token blocking
-                sim_result = analyzer.simulate_token_blocking(
-                    model=model,
-                    processor=processor,
-                    input_data=input_data,
-                    tokens_to_block=[token_idx],
-                    method="zero_out",
-                    reference_output=reference_result
-                )
-                
-                ablation_results[f"token_{token_idx}"] = sim_result
-            
-            # Test all critical tokens together
-            print(f"Testing ablation of all {len(tokens_to_block)} critical tokens together...")
-            
-            all_tokens_result = analyzer.simulate_token_blocking(
-                model=model,
-                processor=processor,
-                input_data=input_data,
-                tokens_to_block=tokens_to_block,
-                method="zero_out",
-                reference_output=reference_result
-            )
-            
-            ablation_results["all_critical_tokens"] = all_tokens_result
-            
-            # Store ablation results
-            results["ablation_results"] = {
-                "reference_output": reference_text,
-                "individual_ablations": ablation_results,
-                "all_critical_tokens_ablation": all_tokens_result
-            }
-            
-            # Print ablation impact summary
-            print("\nAblation Impact Summary:")
-            print(f"  Reference output: '{reference_text}'")
-            
-            for token_idx in tokens_to_block:
-                token_result = ablation_results[f"token_{token_idx}"]
-                impact = token_result.get("comparison", {}).get("impact_score", 0)
-                match = token_result.get("comparison", {}).get("token_match", False)
-                output = token_result.get("generated_text", "")
-                
-                print(f"  Token {token_idx}: Impact={impact:.3f}, "
-                      f"Output Match={match}, "
-                      f"Output='{output}'")
-            
-            # Print all-tokens ablation result
-            all_impact = all_tokens_result.get("comparison", {}).get("impact_score", 0)
-            all_match = all_tokens_result.get("comparison", {}).get("token_match", False)
-            all_output = all_tokens_result.get("generated_text", "")
-            
-            print(f"  All critical tokens: Impact={all_impact:.3f}, "
-                  f"Output Match={all_match}, "
-                  f"Output='{all_output}'")
-        
-        print(f"\n--- Token Analysis Workflow Complete ---")
+        print(f"\n--- Token Analysis Complete ---")
         return results
 
     except Exception as e:
-        print(f"Error during token analysis workflow: {e}")
+        print(f"Error during token analysis: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
+
+def run_ablation_experiments(
+    model: torch.nn.Module,
+    processor: Any,
+    image_source: Union[str, Image.Image],
+    prompt_text: str,
+    critical_tokens: Optional[List[Dict[str, Any]]] = None,
+    trace_data_path: Optional[str] = None,
+    metadata_path: Optional[str] = None,
+    output_dir: str = "token_ablation_results",
+    method: str = "zero_out",
+    include_individual_tests: bool = True,
+    debug_mode: bool = False
+) -> Dict[str, Any]:
+    """
+    Performs ablation experiments on critical tokens to measure their impact.
+    
+    Args:
+        model: The loaded VLM model instance
+        processor: The corresponding processor instance
+        image_source: PIL image, URL string, or local file path
+        prompt_text: The text prompt for the model
+        critical_tokens: List of critical tokens to block (if None, they will be automatically identified)
+        trace_data_path: Path to pre-existing trace CSV (if None and critical_tokens is None, 
+                        new trace will be run)
+        metadata_path: Path to trace metadata JSON
+        output_dir: Directory path to save analysis outputs
+        method: Blocking method ("zero_out", "average", or "noise")
+        include_individual_tests: Whether to test each token individually
+        debug_mode: Whether to print detailed debug information
+        
+    Returns:
+        Dict containing ablation experiment results
+    """
+    print("\n--- Starting Token Ablation Experiments ---")
+    print(f"  Output directory: {output_dir}")
+    os.makedirs(output_dir, exist_ok=True)
+    results = {}
+
+    try:
+        # If no critical tokens provided, we need to identify them first
+        if critical_tokens is None:
+            print("No critical tokens provided. Running token analysis first...")
+            
+            # Run token analysis to identify critical tokens
+            analysis_results = run_token_analysis(
+                model=model,
+                processor=processor,
+                image_source=image_source,
+                prompt_text=prompt_text,
+                trace_data_path=trace_data_path,
+                metadata_path=metadata_path,
+                output_dir=output_dir,
+                identify_critical_tokens=True,
+                debug_mode=debug_mode
+            )
+            
+            if "critical_tokens" not in analysis_results:
+                print("Error: Failed to identify critical tokens")
+                return {"error": "Failed to identify critical tokens"}
+            
+            critical_tokens = analysis_results["critical_tokens"]
+            results["token_analysis"] = analysis_results
+        
+        # Prepare input data
+        from analyzer.semantic_tracing import EnhancedSemanticTracer
+        
+        tracer = EnhancedSemanticTracer(
+            model=model,
+            processor=processor,
+            output_dir=output_dir,
+            debug=debug_mode
+        )
+        
+        input_data = tracer.prepare_inputs(image_source, prompt_text)
+        
+        # Initialize token analyzer for ablation
+        analyzer = OptimizedTokenAnalyzer(
+            output_dir=output_dir,
+            debug_mode=debug_mode
+        )
+        
+        # Run ablation tests
+        ablation_results = analyzer.run_ablation_tests(
+            model=model,
+            processor=processor,
+            input_data=input_data,
+            critical_tokens=critical_tokens,
+            method=method,
+            include_individual_tests=include_individual_tests
+        )
+        
+        # Store ablation results
+        results["ablation_results"] = ablation_results
+        
+        # Save results to file
+        ablation_path = os.path.join(output_dir, "ablation_results.json")
+        try:
+            with open(ablation_path, 'w') as f:
+                # Convert to serializable format
+                serializable_results = analyzer._make_serializable(ablation_results)
+                json.dump(serializable_results, f, indent=2)
+            print(f"Saved ablation results to: {ablation_path}")
+        except Exception as e:
+            print(f"Error saving ablation results: {e}")
+        
+        print(f"\n--- Token Ablation Experiments Complete ---")
+        return results
+
+    except Exception as e:
+        print(f"Error during ablation experiments: {e}")
         import traceback
         traceback.print_exc()
         return {"error": str(e)}

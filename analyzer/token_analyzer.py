@@ -1,35 +1,27 @@
 # analyzer/token_analyzer.py
 """
-Token analyzer for identifying and measuring the roles of different tokens in VLM reasoning.
-
-This module provides analysis of token roles in the semantic tracing process, identifying:
-- Information reception nodes: Tokens that gather information from many other tokens
-- Reasoning nodes: Tokens that transform received information
-- Emission nodes: Tokens that propagate information to many other tokens
-- Preservation nodes: Tokens that maintain consistent information across layers
-
-Also supports ablation studies to measure token importance by blocking specific tokens.
+Token analyzer focusing on role identification without network metrics
+and unnecessary visualizations.
 """
 
 import torch
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import networkx as nx
 import os
 import json
 from collections import defaultdict
-from typing import Dict, List, Tuple, Set, Any, Optional, Union
+from typing import Dict, List, Tuple, Any, Optional, Union
 
 class TokenAnalyzer:
     """
     Analyzes token roles and importance in semantic tracing across model layers.
+    Focused version without network metrics and visualizations.
     
     This class provides methods to:
-    1. Identify roles of tokens in information flow (receptors, processors, emitters)
-    2. Measure token importance through network analysis
-    3. Perform ablation studies by blocking specific tokens
-    4. Visualize token roles and metrics
+    1. Analyze threshold statistics to determine appropriate parameters
+    2. Identify roles of tokens in information flow
+    3. Measure token importance 
+    4. Perform ablation studies in a separate workflow
     """
     
     def __init__(
@@ -42,7 +34,7 @@ class TokenAnalyzer:
         debug_mode: bool = False
     ):
         """
-        Initialize the token analyzer.
+        Initialize the optimized token analyzer.
         
         Args:
             output_dir: Directory to save analysis results
@@ -65,7 +57,7 @@ class TokenAnalyzer:
         # Storage for token analysis results
         self.token_metrics = {}
         self.token_roles = {}
-        self.network_metrics = {}
+        self.threshold_stats = {}
         self.ablation_results = {}
         
         # Token type descriptions
@@ -75,11 +67,257 @@ class TokenAnalyzer:
             2: "Image"
         }
     
-    def analyze_trace_data(
+    def analyze_threshold_statistics(
         self, 
         csv_path: str, 
         metadata_path: Optional[str] = None,
         importance_column: str = "importance_weight"
+    ) -> Dict[str, Any]:
+        """
+        Analyze the trace data to determine appropriate threshold values.
+        
+        Args:
+            csv_path: Path to the trace data CSV
+            metadata_path: Optional path to metadata JSON
+            importance_column: Column to use for importance values
+            
+        Returns:
+            Dictionary with threshold statistics
+        """
+        print(f"Analyzing threshold statistics from: {csv_path}")
+        
+        # Load trace data
+        try:
+            trace_df = pd.read_csv(csv_path)
+            if trace_df.empty:
+                print("Error: Trace data is empty")
+                return {"error": "Empty trace data"}
+        except Exception as e:
+            print(f"Error loading CSV: {e}")
+            return {"error": f"Failed to load CSV: {e}"}
+        
+        # Initialize statistics
+        stats = {
+            "receptivity": {"values": [], "percentiles": {}},
+            "emission": {"values": [], "percentiles": {}},
+            "transformation": {"values": [], "percentiles": {}},
+            "importance": {"values": [], "percentiles": {}},
+            "preservation": {"values": [], "percentiles": {}},
+            "by_layer": {},
+            "by_token_type": {}
+        }
+        
+        # Calculate basic metrics for each token and layer
+        tokens = trace_df["token_index"].unique()
+        layers = sorted(trace_df["layer"].unique())
+        
+        # Initialize by-layer statistics
+        for layer in layers:
+            stats["by_layer"][layer] = {
+                "receptivity": [],
+                "emission": [],
+                "transformation": []
+            }
+        
+        # Initialize by-token-type statistics
+        for token_type in [0, 1, 2]:  # Generated, Text, Image
+            stats["by_token_type"][token_type] = {
+                "receptivity": [],
+                "emission": [],
+                "transformation": []
+            }
+        
+        # Process each token to calculate metrics
+        for token_idx in tokens:
+            # Get token data across layers
+            token_df = trace_df[trace_df["token_index"] == token_idx]
+            
+            # Skip if token only appears in one layer
+            if len(token_df) <= 1:
+                continue
+            
+            # Get token type
+            token_type = token_df["token_type"].iloc[0]
+            
+            # Calculate layer-specific metrics
+            layer_metrics = {}
+            for layer in sorted(token_df["layer"].unique()):
+                layer_row = token_df[token_df["layer"] == layer].iloc[0]
+                
+                # Get importance weight
+                importance = layer_row[importance_column] if importance_column in layer_row else 0
+                
+                # Get source tokens (tokens flowing into this token)
+                sources_indices = []
+                sources_weights = []
+                
+                if "sources_indices" in layer_row and pd.notna(layer_row["sources_indices"]):
+                    sources_indices = [int(idx) for idx in layer_row["sources_indices"].split(",") if idx]
+                    
+                if "sources_weights" in layer_row and pd.notna(layer_row["sources_weights"]):
+                    sources_weights = [float(w) for w in layer_row["sources_weights"].split(",") if w]
+                
+                # Count incoming and outgoing connections
+                incoming_count = len(sources_indices)
+                
+                # Find tokens in this layer that have this token as a source
+                outgoing_indices = []
+                outgoing_weights = []
+                if "sources_indices" in trace_df.columns:
+                    # Check other tokens in the same layer that have this token as source
+                    for _, row in trace_df[(trace_df["layer"] == layer) & 
+                                          (trace_df["token_index"] != token_idx)].iterrows():
+                        if "sources_indices" in row and pd.notna(row["sources_indices"]):
+                            source_indices = [int(idx) for idx in str(row["sources_indices"]).split(",") if idx]
+                            source_weights = []
+                            
+                            if "sources_weights" in row and pd.notna(row["sources_weights"]):
+                                source_weights = [float(w) for w in str(row["sources_weights"]).split(",") if w]
+                            
+                            # Check if this token is a source
+                            if token_idx in source_indices:
+                                idx = source_indices.index(token_idx)
+                                weight = source_weights[idx] if idx < len(source_weights) else 0
+                                outgoing_indices.append(row["token_index"])
+                                outgoing_weights.append(weight)
+                
+                outgoing_count = len(outgoing_indices)
+                
+                # Calculate metrics
+                source_diversity = len(set(sources_indices))
+                target_diversity = len(set(outgoing_indices))
+                
+                receptivity = sum(sources_weights) if sources_weights else 0
+                emission = sum(outgoing_weights) if outgoing_weights else 0
+                throughput = min(receptivity, emission)
+                
+                # Calculate transformation (difference between input and output information)
+                transformation = abs(emission - receptivity) / (max(emission, receptivity) + 1e-8)
+                
+                # Store metrics for this layer
+                layer_metrics[layer] = {
+                    "importance": importance,
+                    "receptivity": receptivity,
+                    "emission": emission,
+                    "transformation": transformation,
+                    "throughput": throughput,
+                    "source_diversity": source_diversity,
+                    "target_diversity": target_diversity,
+                    "incoming_count": incoming_count,
+                    "outgoing_count": outgoing_count
+                }
+                
+                # Add to layer statistics
+                stats["by_layer"][layer]["receptivity"].append(receptivity)
+                stats["by_layer"][layer]["emission"].append(emission)
+                stats["by_layer"][layer]["transformation"].append(transformation)
+                
+                # Add to token type statistics
+                stats["by_token_type"][token_type]["receptivity"].append(receptivity)
+                stats["by_token_type"][token_type]["emission"].append(emission)
+                stats["by_token_type"][token_type]["transformation"].append(transformation)
+                
+                # Add to global statistics
+                stats["receptivity"]["values"].append(receptivity)
+                stats["emission"]["values"].append(emission)
+                stats["transformation"]["values"].append(transformation)
+                stats["importance"]["values"].append(importance)
+            
+            # Calculate preservation score
+            importance_values = [m["importance"] for m in layer_metrics.values()]
+            connectivity_values = [m["incoming_count"] + m["outgoing_count"] for m in layer_metrics.values()]
+            
+            importance_variation = np.std(importance_values)
+            connectivity_variation = np.std(connectivity_values)
+            
+            avg_importance = np.mean(importance_values)
+            avg_connectivity = np.mean(connectivity_values)
+            
+            rel_importance_var = importance_variation / (avg_importance + 1e-8)
+            rel_connectivity_var = connectivity_variation / (avg_connectivity + 1e-8)
+            
+            preservation_score = 1.0 - 0.5 * (rel_importance_var + rel_connectivity_var)
+            preservation_score = max(0, min(1, preservation_score))
+            
+            stats["preservation"]["values"].append(preservation_score)
+        
+        # Calculate percentiles for each metric
+        percentiles = [10, 25, 50, 75, 90, 95, 99]
+        
+        for metric in ["receptivity", "emission", "transformation", "importance", "preservation"]:
+            values = np.array(stats[metric]["values"])
+            for p in percentiles:
+                stats[metric]["percentiles"][f"p{p}"] = float(np.percentile(values, p))
+            
+            stats[metric]["mean"] = float(np.mean(values))
+            stats[metric]["median"] = float(np.median(values))
+            stats[metric]["max"] = float(np.max(values))
+            stats[metric]["min"] = float(np.min(values))
+        
+        # Calculate layer-specific percentiles
+        for layer in layers:
+            for metric in ["receptivity", "emission", "transformation"]:
+                values = np.array(stats["by_layer"][layer][metric])
+                if len(values) > 0:
+                    stats["by_layer"][layer][f"{metric}_p75"] = float(np.percentile(values, 75))
+                    stats["by_layer"][layer][f"{metric}_p90"] = float(np.percentile(values, 90))
+                    stats["by_layer"][layer][f"{metric}_mean"] = float(np.mean(values))
+        
+        # Calculate token-type specific percentiles
+        for token_type in [0, 1, 2]:
+            for metric in ["receptivity", "emission", "transformation"]:
+                values = np.array(stats["by_token_type"][token_type][metric])
+                if len(values) > 0:
+                    stats["by_token_type"][token_type][f"{metric}_p75"] = float(np.percentile(values, 75))
+                    stats["by_token_type"][token_type][f"{metric}_p90"] = float(np.percentile(values, 90))
+                    stats["by_token_type"][token_type][f"{metric}_mean"] = float(np.mean(values))
+        
+        # Recommended thresholds based on statistics
+        recommendations = {
+            "receptivity_threshold": stats["receptivity"]["percentiles"]["p75"],
+            "emission_threshold": stats["emission"]["percentiles"]["p75"],
+            "preservation_threshold": stats["preservation"]["percentiles"]["p50"],
+        }
+        
+        stats["recommended_thresholds"] = recommendations
+        
+        # Save statistics
+        stats_path = os.path.join(self.output_dir, "threshold_statistics.json")
+        try:
+            with open(stats_path, 'w') as f:
+                # Convert to serializable format
+                serializable_stats = self._make_serializable(stats)
+                json.dump(serializable_stats, f, indent=2)
+            print(f"Saved threshold statistics to: {stats_path}")
+        except Exception as e:
+            print(f"Error saving threshold statistics: {e}")
+        
+        # Store statistics for later use
+        self.threshold_stats = stats
+        
+        # Print key statistics and recommendations
+        print("\nKey Threshold Statistics:")
+        print(f"  Receptivity:   median={stats['receptivity']['median']:.4f}, "
+              f"p75={stats['receptivity']['percentiles']['p75']:.4f}, "
+              f"p90={stats['receptivity']['percentiles']['p90']:.4f}")
+        print(f"  Emission:      median={stats['emission']['median']:.4f}, "
+              f"p75={stats['emission']['percentiles']['p75']:.4f}, "
+              f"p90={stats['emission']['percentiles']['p90']:.4f}")
+        print(f"  Preservation:  median={stats['preservation']['median']:.4f}, "
+              f"p75={stats['preservation']['percentiles']['p75']:.4f}")
+        print("\nRecommended Thresholds:")
+        print(f"  receptivity_threshold = {recommendations['receptivity_threshold']:.4f}")
+        print(f"  emission_threshold = {recommendations['emission_threshold']:.4f}")
+        print(f"  preservation_threshold = {recommendations['preservation_threshold']:.4f}")
+        
+        return stats
+    
+    def analyze_trace_data(
+        self, 
+        csv_path: str, 
+        metadata_path: Optional[str] = None,
+        importance_column: str = "importance_weight",
+        analyze_thresholds_first: bool = True
     ) -> Dict[str, Any]:
         """
         Analyze token roles and metrics from traced data CSV file.
@@ -88,6 +326,7 @@ class TokenAnalyzer:
             csv_path: Path to the trace data CSV
             metadata_path: Optional path to metadata JSON
             importance_column: Column to use for importance values
+            analyze_thresholds_first: Whether to analyze thresholds before token roles
             
         Returns:
             Dictionary with analysis results
@@ -120,6 +359,19 @@ class TokenAnalyzer:
         elif "target_token" in metadata:
             target_tokens = [metadata["target_token"]]
         
+        # Analyze thresholds first if requested
+        if analyze_thresholds_first and not self.threshold_stats:
+            print("Analyzing threshold statistics first...")
+            threshold_stats = self.analyze_threshold_statistics(csv_path, metadata_path, importance_column)
+            
+            # Optionally update thresholds based on statistics
+            if threshold_stats and "recommended_thresholds" in threshold_stats:
+                rec = threshold_stats["recommended_thresholds"]
+                self.receptivity_threshold = rec["receptivity_threshold"]
+                self.emission_threshold = rec["emission_threshold"]
+                self.preservation_threshold = rec["preservation_threshold"]
+                print("Updated thresholds based on statistics.")
+        
         # Analyze token metrics and roles
         token_metrics = self._calculate_token_metrics(trace_df, importance_column)
         self.token_metrics = token_metrics
@@ -128,12 +380,8 @@ class TokenAnalyzer:
         token_roles = self._identify_token_roles(trace_df, token_metrics)
         self.token_roles = token_roles
         
-        # Build token flow graph and calculate network metrics
-        network_metrics = self._calculate_network_metrics(trace_df)
-        self.network_metrics = network_metrics
-        
-        # Combine all metrics
-        combined_metrics = self._combine_metrics(token_metrics, token_roles, network_metrics)
+        # Combine metrics (without network metrics)
+        combined_metrics = self._combine_metrics(token_metrics, token_roles)
         
         # Generate summary statistics
         summary = self._generate_analysis_summary(combined_metrics, trace_df, target_tokens)
@@ -144,7 +392,6 @@ class TokenAnalyzer:
         return {
             "token_metrics": token_metrics,
             "token_roles": token_roles,
-            "network_metrics": network_metrics,
             "combined_metrics": combined_metrics,
             "summary": summary
         }
@@ -183,15 +430,30 @@ class TokenAnalyzer:
             # Get token type and text
             token_type = token_df["token_type"].iloc[0]
             token_text = token_df["token_text"].iloc[0]
+            token_id = token_df["token_id"].iloc[0]
+            
+            # Get top prediction information
+            top_predictions = {}
+            if "predicted_top_token" in token_df.columns and "predicted_top_prob" in token_df.columns:
+                for _, row in token_df.iterrows():
+                    layer = row["layer"]
+                    pred_text = row["predicted_top_token"]
+                    pred_prob = row["predicted_top_prob"]
+                    top_predictions[layer] = {
+                        "text": pred_text,
+                        "probability": pred_prob
+                    }
             
             # Initialize metrics for this token
             metrics = {
                 "token_index": token_idx,
                 "token_text": token_text,
+                "token_id": token_id,
                 "token_type": token_type,
                 "token_type_name": self.token_type_names.get(token_type, "Unknown"),
                 "layers_present": sorted(token_df["layer"].unique()),
                 "layer_metrics": {},
+                "top_predictions": top_predictions,
                 "global_metrics": {}
             }
             
@@ -221,8 +483,8 @@ class TokenAnalyzer:
                     outgoing_weights = []
                     
                     # Check other tokens in the same layer that have this token as source
-                    # Check other tokens in the same layer that have this token as source
-                    for _, row in trace_df[(trace_df["layer"] == layer) & (trace_df["token_index"] != token_idx)].iterrows():
+                    for _, row in trace_df[(trace_df["layer"] == layer) & 
+                                          (trace_df["token_index"] != token_idx)].iterrows():
                         if "sources_indices" in row and pd.notna(row["sources_indices"]):
                             source_indices = [int(idx) for idx in str(row["sources_indices"]).split(",") if idx]
                             source_weights = []
@@ -471,158 +733,18 @@ class TokenAnalyzer:
         
         return token_roles
     
-    def _calculate_network_metrics(self, trace_df: pd.DataFrame) -> Dict[int, Dict[str, Any]]:
-        """
-        Calculate network centrality metrics for tokens using graph analysis.
-        
-        Args:
-            trace_df: DataFrame with trace data
-            
-        Returns:
-            Dictionary with network metrics for each token
-        """
-        import networkx as nx
-        
-        # Get all layers
-        layers = sorted(trace_df["layer"].unique())
-        
-        # Initialize network metrics
-        network_metrics = {}
-        
-        # Create layer-specific graphs
-        layer_graphs = {}
-        for layer in layers:
-            # Get layer data
-            layer_df = trace_df[trace_df["layer"] == layer]
-            
-            # Create directed graph for this layer
-            G = nx.DiGraph()
-            
-            # Add all tokens as nodes
-            for _, row in layer_df.iterrows():
-                token_idx = row["token_index"]
-                token_text = row["token_text"]
-                token_type = row["token_type"]
-                G.add_node(token_idx, text=token_text, type=token_type)
-            
-            # Add edges based on source relationships
-            for _, row in layer_df.iterrows():
-                if "sources_indices" in row and pd.notna(row["sources_indices"]):
-                    # Get target token
-                    target_idx = row["token_index"]
-                    
-                    # Get source tokens and weights
-                    sources_indices = [int(idx) for idx in str(row["sources_indices"]).split(",") if idx]
-                    sources_weights = []
-                    
-                    if "sources_weights" in row and pd.notna(row["sources_weights"]):
-                        sources_weights = [float(w) for w in str(row["sources_weights"]).split(",") if w]
-                    else:
-                        sources_weights = [1.0] * len(sources_indices)
-                    
-                    # Add edges with weights
-                    for i, source_idx in enumerate(sources_indices):
-                        if i < len(sources_weights):
-                            weight = sources_weights[i]
-                            if source_idx in G and target_idx in G:  # Ensure nodes exist
-                                G.add_edge(source_idx, target_idx, weight=weight)
-            
-            # Store graph
-            layer_graphs[layer] = G
-        
-        # Calculate metrics for each token in each layer
-        for layer, G in layer_graphs.items():
-            # Skip if graph is empty
-            if len(G) == 0:
-                continue
-            
-            # Calculate centrality metrics
-            try:
-                # Degree centrality
-                in_degree = dict(G.in_degree(weight="weight"))
-                out_degree = dict(G.out_degree(weight="weight"))
-                
-                # Betweenness centrality (how often a node lies on shortest paths)
-                betweenness = nx.betweenness_centrality(G, weight="weight")
-                
-                # Eigenvector centrality (influence of a node)
-                try:
-                    eigenvector = nx.eigenvector_centrality(G, weight="weight", max_iter=1000)
-                except:
-                    # Fall back to unweighted if it fails
-                    try:
-                        eigenvector = nx.eigenvector_centrality(G, weight=None, max_iter=1000)
-                    except:
-                        eigenvector = {node: 0.0 for node in G.nodes()}
-                
-                # PageRank (importance of node based on incoming links)
-                pagerank = nx.pagerank(G, weight="weight")
-                
-                # Store metrics for each token
-                for token_idx in G.nodes():
-                    if token_idx not in network_metrics:
-                        network_metrics[token_idx] = {
-                            "token_index": token_idx,
-                            "layer_metrics": {},
-                            "global_metrics": {
-                                "avg_in_degree": 0,
-                                "avg_out_degree": 0,
-                                "avg_betweenness": 0,
-                                "avg_eigenvector": 0,
-                                "avg_pagerank": 0,
-                                "layer_count": 0
-                            }
-                        }
-                    
-                    # Store layer-specific metrics
-                    network_metrics[token_idx]["layer_metrics"][layer] = {
-                        "in_degree": in_degree.get(token_idx, 0),
-                        "out_degree": out_degree.get(token_idx, 0),
-                        "betweenness": betweenness.get(token_idx, 0),
-                        "eigenvector": eigenvector.get(token_idx, 0),
-                        "pagerank": pagerank.get(token_idx, 0)
-                    }
-                    
-                    # Update global metrics
-                    global_metrics = network_metrics[token_idx]["global_metrics"]
-                    global_metrics["avg_in_degree"] += in_degree.get(token_idx, 0)
-                    global_metrics["avg_out_degree"] += out_degree.get(token_idx, 0)
-                    global_metrics["avg_betweenness"] += betweenness.get(token_idx, 0)
-                    global_metrics["avg_eigenvector"] += eigenvector.get(token_idx, 0)
-                    global_metrics["avg_pagerank"] += pagerank.get(token_idx, 0)
-                    global_metrics["layer_count"] += 1
-            
-            except Exception as e:
-                print(f"Error calculating network metrics for layer {layer}: {e}")
-                continue
-        
-        # Calculate average metrics
-        for token_idx, metrics in network_metrics.items():
-            global_metrics = metrics["global_metrics"]
-            layer_count = global_metrics["layer_count"]
-            
-            if layer_count > 0:
-                global_metrics["avg_in_degree"] /= layer_count
-                global_metrics["avg_out_degree"] /= layer_count
-                global_metrics["avg_betweenness"] /= layer_count
-                global_metrics["avg_eigenvector"] /= layer_count
-                global_metrics["avg_pagerank"] /= layer_count
-        
-        return network_metrics
-    
     def _combine_metrics(
         self,
         token_metrics: Dict[int, Dict[str, Any]],
-        token_roles: Dict[int, Dict[str, Any]],
-        network_metrics: Dict[int, Dict[str, Any]]
+        token_roles: Dict[int, Dict[str, Any]]
     ) -> Dict[int, Dict[str, Any]]:
         """
-        Combine all metrics into a unified representation for each token.
+        Combine metrics into a unified representation for each token.
+        Simplified version without network metrics.
         
         Args:
             token_metrics: Dictionary with token metrics
             token_roles: Dictionary with token roles
-            network_metrics: Dictionary with network metrics
             
         Returns:
             Combined metrics dictionary
@@ -630,20 +752,20 @@ class TokenAnalyzer:
         combined_metrics = {}
         
         # Get all token indices
-        all_tokens = set(token_metrics.keys()) | set(token_roles.keys()) | set(network_metrics.keys())
+        all_tokens = set(token_metrics.keys()) | set(token_roles.keys())
         
         # Combine metrics for each token
         for token_idx in all_tokens:
             combined = {
                 "token_index": token_idx,
                 "metrics": {},
-                "roles": {},
-                "network": {}
+                "roles": {}
             }
             
             # Add basic info if available
             if token_idx in token_metrics:
                 combined["token_text"] = token_metrics[token_idx]["token_text"]
+                combined["token_id"] = token_metrics[token_idx].get("token_id", 0)
                 combined["token_type"] = token_metrics[token_idx]["token_type"]
                 combined["token_type_name"] = token_metrics[token_idx]["token_type_name"]
                 combined["metrics"] = token_metrics[token_idx]
@@ -651,10 +773,6 @@ class TokenAnalyzer:
             # Add roles if available
             if token_idx in token_roles:
                 combined["roles"] = token_roles[token_idx]
-            
-            # Add network metrics if available
-            if token_idx in network_metrics:
-                combined["network"] = network_metrics[token_idx]
             
             # Calculate overall importance score
             importance_score = 0.0
@@ -665,12 +783,7 @@ class TokenAnalyzer:
                 importance_score += token_metrics[token_idx]["global_metrics"].get("avg_importance", 0)
                 score_components += 1
             
-            # Component 2: PageRank from network metrics
-            if token_idx in network_metrics and "global_metrics" in network_metrics[token_idx]:
-                importance_score += network_metrics[token_idx]["global_metrics"].get("avg_pagerank", 0) * 5  # Scale up
-                score_components += 1
-            
-            # Component 3: Role-based importance
+            # Component 2: Role-based importance
             if token_idx in token_roles:
                 # More critical roles increase importance
                 global_roles = token_roles[token_idx].get("global_roles", [])
@@ -719,13 +832,13 @@ class TokenAnalyzer:
             "top_tokens": {
                 "by_importance": [],
                 "by_preservation": [],
-                "by_centrality": []
             },
             "token_roles": {
                 "global_roles": {},
                 "layer_roles": {}
             },
-            "target_token_analysis": []
+            "target_token_analysis": [],
+            "layer_top_tokens": {}
         }
         
         # Count tokens by type
@@ -790,27 +903,6 @@ class TokenAnalyzer:
             for token_idx, metrics in top_by_preservation
         ]
         
-        # Get top tokens by centrality (PageRank)
-        top_by_centrality = sorted(
-            [
-                (token_idx, metrics) for token_idx, metrics in combined_metrics.items()
-                if "network" in metrics and "global_metrics" in metrics["network"]
-            ],
-            key=lambda x: x[1]["network"]["global_metrics"].get("avg_pagerank", 0),
-            reverse=True
-        )[:10]
-        
-        summary["top_tokens"]["by_centrality"] = [
-            {
-                "token_index": token_idx,
-                "token_text": metrics.get("token_text", ""),
-                "token_type": metrics.get("token_type_name", ""),
-                "pagerank": metrics["network"]["global_metrics"].get("avg_pagerank", 0),
-                "global_roles": metrics.get("roles", {}).get("global_roles", [])
-            }
-            for token_idx, metrics in top_by_centrality
-        ]
-        
         # Count token global roles
         role_counts = {}
         for token_idx, metrics in combined_metrics.items():
@@ -838,6 +930,47 @@ class TokenAnalyzer:
         
         summary["token_roles"]["layer_roles"] = layer_role_counts
         
+        # Get top tokens per layer with their roles and predictions
+        layers = sorted(trace_df["layer"].unique())
+        for layer in layers:
+            layer_str = f"layer_{layer}"
+            summary["layer_top_tokens"][layer_str] = []
+            
+            # Get all tokens active in this layer
+            layer_tokens = []
+            for token_idx, metrics in combined_metrics.items():
+                if "metrics" in metrics and "layer_metrics" in metrics["metrics"]:
+                    if layer in metrics["metrics"]["layer_metrics"]:
+                        layer_tokens.append((token_idx, metrics))
+            
+            # Sort by importance in this layer
+            sorted_layer_tokens = sorted(
+                layer_tokens,
+                key=lambda x: x[1]["metrics"]["layer_metrics"].get(layer, {}).get("importance", 0),
+                reverse=True
+            )[:10]  # Top 10 tokens
+            
+            # Add to summary
+            for token_idx, metrics in sorted_layer_tokens:
+                token_info = {
+                    "token_index": token_idx,
+                    "token_text": metrics.get("token_text", ""),
+                    "token_type": metrics.get("token_type_name", ""),
+                    "importance": metrics["metrics"]["layer_metrics"].get(layer, {}).get("importance", 0),
+                    "roles": metrics.get("roles", {}).get("layer_roles", {}).get(layer, []),
+                }
+                
+                # Add top prediction if available
+                if "metrics" in metrics and "top_predictions" in metrics["metrics"]:
+                    if layer in metrics["metrics"]["top_predictions"]:
+                        pred = metrics["metrics"]["top_predictions"][layer]
+                        token_info["top_prediction"] = {
+                            "text": pred.get("text", ""),
+                            "probability": pred.get("probability", 0)
+                        }
+                
+                summary["layer_top_tokens"][layer_str].append(token_info)
+        
         # Analyze target tokens
         for target in target_tokens:
             target_idx = target.get("index")
@@ -851,11 +984,28 @@ class TokenAnalyzer:
                     "importance": target_metrics["overall_importance"],
                     "global_roles": target_metrics.get("roles", {}).get("global_roles", []),
                     "preservation_score": target_metrics.get("metrics", {}).get("global_metrics", {}).get("preservation_score", 0),
-                    "connectivity": {
-                        "avg_in_degree": target_metrics.get("network", {}).get("global_metrics", {}).get("avg_in_degree", 0),
-                        "avg_out_degree": target_metrics.get("network", {}).get("global_metrics", {}).get("avg_out_degree", 0)
-                    }
+                    "layers": {},
                 }
+                
+                # Add per-layer information for the target token
+                if "metrics" in target_metrics and "layer_metrics" in target_metrics["metrics"]:
+                    for layer, layer_metrics in target_metrics["metrics"]["layer_metrics"].items():
+                        layer_str = f"layer_{layer}"
+                        target_analysis["layers"][layer_str] = {
+                            "importance": layer_metrics.get("importance", 0),
+                            "incoming_count": layer_metrics.get("incoming_count", 0),
+                            "outgoing_count": layer_metrics.get("outgoing_count", 0),
+                            "roles": target_metrics.get("roles", {}).get("layer_roles", {}).get(layer, []),
+                        }
+                        
+                        # Add top prediction if available
+                        if "top_predictions" in target_metrics["metrics"]:
+                            if layer in target_metrics["metrics"]["top_predictions"]:
+                                pred = target_metrics["metrics"]["top_predictions"][layer]
+                                target_analysis["layers"][layer_str]["top_prediction"] = {
+                                    "text": pred.get("text", ""),
+                                    "probability": pred.get("probability", 0)
+                                }
                 
                 summary["target_token_analysis"].append(target_analysis)
         
@@ -908,6 +1058,209 @@ class TokenAnalyzer:
             return obj.tolist()
         else:
             return obj
+    
+    def identify_critical_tokens(
+        self,
+        combined_metrics: Dict[int, Dict[str, Any]],
+        top_k: int = 10,
+        method: str = "combined"
+    ) -> List[Dict[str, Any]]:
+        """
+        Identify the most critical tokens for the reasoning process.
+        Simplified version without network metrics.
+        
+        Args:
+            combined_metrics: Dictionary with combined token metrics
+            top_k: Number of critical tokens to return
+            method: Method to use ("importance", "roles", or "combined")
+            
+        Returns:
+            List of critical token information
+        """
+        # Different scoring methods for critical tokens
+        if method == "importance":
+            # Sort by overall importance
+            sorted_tokens = sorted(
+                combined_metrics.items(),
+                key=lambda x: x[1]["overall_importance"],
+                reverse=True
+            )
+            
+        elif method == "roles":
+            # Score based on critical global roles
+            critical_roles = ["key", "hub", "preservation", "gateway"]
+            
+            def role_score(metrics):
+                if "roles" not in metrics or "global_roles" not in metrics["roles"]:
+                    return 0
+                
+                global_roles = metrics["roles"]["global_roles"]
+                return sum(2 if role in critical_roles else 1 for role in global_roles)
+            
+            sorted_tokens = sorted(
+                combined_metrics.items(),
+                key=lambda x: role_score(x[1]),
+                reverse=True
+            )
+            
+        else:  # combined
+            # Combined scoring with multiple factors
+            def combined_score(metrics):
+                # Base score is importance
+                score = metrics.get("overall_importance", 0) * 0.5
+                
+                # Add role-based component
+                critical_roles = ["key", "hub", "preservation", "gateway"]
+                global_roles = metrics.get("roles", {}).get("global_roles", [])
+                role_bonus = sum(0.15 if role in critical_roles else 0.05 for role in global_roles)
+                score += role_bonus
+                
+                # Add preservation component
+                preservation = metrics.get("metrics", {}).get("global_metrics", {}).get("preservation_score", 0)
+                score += preservation * 0.2
+                
+                return score
+            
+            sorted_tokens = sorted(
+                combined_metrics.items(),
+                key=lambda x: combined_score(x[1]),
+                reverse=True
+            )
+        
+        # Get top-k critical tokens
+        critical_tokens = [
+            {
+                "token_index": token_idx,
+                "token_text": metrics.get("token_text", ""),
+                "token_type": metrics.get("token_type_name", ""),
+                "importance": metrics.get("overall_importance", 0),
+                "global_roles": metrics.get("roles", {}).get("global_roles", []),
+                "layers_present": metrics.get("metrics", {}).get("layers_present", []),
+                "layer_predictions": self._extract_token_predictions(metrics)
+            }
+            for token_idx, metrics in sorted_tokens[:top_k]
+        ]
+        
+        return critical_tokens
+    
+    def _extract_token_predictions(self, metrics):
+        """Extract top predictions for a token across layers."""
+        predictions = {}
+        if "metrics" in metrics and "top_predictions" in metrics["metrics"]:
+            for layer, pred in metrics["metrics"]["top_predictions"].items():
+                predictions[f"layer_{layer}"] = {
+                    "text": pred.get("text", ""),
+                    "probability": pred.get("probability", 0)
+                }
+        return predictions
+
+    def run_ablation_tests(
+        self,
+        model,
+        processor,
+        input_data: Dict[str, Any],
+        critical_tokens: List[Dict[str, Any]],
+        method: str = "zero_out",
+        include_individual_tests: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Run token ablation experiments to measure token importance.
+        Standalone function for ablation testing.
+        
+        Args:
+            model: Model to use for simulation
+            processor: Processor for the model
+            input_data: Prepared input data
+            critical_tokens: List of critical tokens to test
+            method: Blocking method ("zero_out", "average", or "noise")
+            include_individual_tests: Whether to test each token individually
+            
+        Returns:
+            Dictionary with ablation test results
+        """
+        print(f"\nRunning Token Ablation Tests on {len(critical_tokens)} critical tokens")
+        
+        # Extract token indices
+        token_indices = [token["token_index"] for token in critical_tokens]
+        
+        # First run normal inference as reference
+        inputs = input_data["inputs"]
+        
+        with torch.no_grad():
+            reference_outputs = model(**{k: v for k, v in inputs.items() if k != "token_type_ids"})
+            
+            # Get reference output token
+            reference_logits = reference_outputs.logits[:, -1, :]
+            reference_ids = torch.argmax(reference_logits, dim=-1).unsqueeze(0)
+            reference_text = processor.tokenizer.decode(reference_ids[0].tolist())
+            
+            reference_result = {
+                "output_ids": reference_ids,
+                "output_text": reference_text,
+                "logits": reference_logits
+            }
+        
+        # Initialize results
+        ablation_results = {
+            "reference_output": reference_text,
+            "individual_ablations": {},
+            "all_critical_tokens_ablation": {}
+        }
+        
+        # Run individual token tests if requested
+        if include_individual_tests:
+            for token in critical_tokens:
+                token_idx = token["token_index"]
+                token_text = token["token_text"]
+                print(f"Testing ablation of token {token_idx} ('{token_text}')...")
+                
+                sim_result = self.simulate_token_blocking(
+                    model=model,
+                    processor=processor,
+                    input_data=input_data,
+                    tokens_to_block=[token_idx],
+                    method=method,
+                    reference_output=reference_result
+                )
+                
+                ablation_results["individual_ablations"][f"token_{token_idx}"] = sim_result
+        
+        # Test all critical tokens together
+        print(f"Testing ablation of all {len(token_indices)} critical tokens together...")
+        
+        all_tokens_result = self.simulate_token_blocking(
+            model=model,
+            processor=processor,
+            input_data=input_data,
+            tokens_to_block=token_indices,
+            method=method,
+            reference_output=reference_result
+        )
+        
+        ablation_results["all_critical_tokens_ablation"] = all_tokens_result
+        
+        # Print summary
+        print("\nAblation Test Results:")
+        print(f"Reference output: '{reference_text}'")
+        
+        if include_individual_tests:
+            print("\nIndividual Token Ablation:")
+            for token in critical_tokens:
+                token_idx = token["token_index"]
+                result = ablation_results["individual_ablations"][f"token_{token_idx}"]
+                impact = result.get("comparison", {}).get("impact_score", 0)
+                match = result.get("comparison", {}).get("token_match", False)
+                output = result.get("generated_text", "")
+                
+                print(f"  Token {token_idx} ('{token['token_text']}'): Impact={impact:.3f}, "
+                      f"Match={match}, Output='{output}'")
+        
+        all_impact = all_tokens_result.get("comparison", {}).get("impact_score", 0)
+        all_match = all_tokens_result.get("comparison", {}).get("token_match", False)
+        all_output = all_tokens_result.get("generated_text", "")
+        print(f"\nAll tokens ablation: Impact={all_impact:.3f}, Match={all_match}, Output='{all_output}'")
+        
+        return ablation_results
     
     def simulate_token_blocking(
         self,
@@ -1038,509 +1391,3 @@ class TokenAnalyzer:
                 "method": method,
                 "tokens_blocked": tokens_to_block
             }
-    
-    def visualize_token_metrics(
-        self,
-        combined_metrics: Dict[int, Dict[str, Any]],
-        output_path: Optional[str] = None,
-        token_types_to_include: Optional[List[int]] = None
-    ) -> str:
-        """
-        Create visualization of token metrics as a bubble chart.
-        
-        Args:
-            combined_metrics: Dictionary with combined token metrics
-            output_path: Path to save the visualization (None = auto-generate)
-            token_types_to_include: List of token types to include (None = all)
-            
-        Returns:
-            Path to saved visualization
-        """
-        import matplotlib.pyplot as plt
-        import numpy as np
-        
-        # Use default output path if not provided
-        if output_path is None:
-            output_path = os.path.join(self.output_dir, "token_metrics_visualization.png")
-        
-        # Prepare data for visualization
-        token_data = []
-        for token_idx, metrics in combined_metrics.items():
-            # Skip if no metrics or network data
-            if "metrics" not in metrics or "network" not in metrics:
-                continue
-            
-            # Skip if token type filter is applied and token doesn't match
-            if (token_types_to_include is not None and 
-                metrics.get("token_type") not in token_types_to_include):
-                continue
-            
-            # Get token data
-            token_text = metrics.get("token_text", "")
-            token_type = metrics.get("token_type", -1)
-            token_type_name = metrics.get("token_type_name", "Unknown")
-            
-            # Get x and y values (connectivity and importance)
-            x_val = metrics["network"].get("global_metrics", {}).get("avg_pagerank", 0) * 100  # Scale up
-            y_val = metrics["metrics"].get("global_metrics", {}).get("avg_importance", 0)
-            
-            # Get bubble size (based on preservation score)
-            size = metrics["metrics"].get("global_metrics", {}).get("preservation_score", 0.1) * 100
-            size = max(20, size)  # Ensure minimum bubble size
-            
-            # Get color based on token type
-            if token_type == 0:  # Generated
-                color = 'green'
-            elif token_type == 1:  # Text
-                color = 'blue'
-            elif token_type == 2:  # Image
-                color = 'red'
-            else:
-                color = 'gray'
-            
-            # Get global roles
-            global_roles = metrics.get("roles", {}).get("global_roles", [])
-            
-            # Create token data
-            token_data.append({
-                "token_idx": token_idx,
-                "token_text": token_text,
-                "token_type": token_type,
-                "token_type_name": token_type_name,
-                "x": x_val,
-                "y": y_val,
-                "size": size,
-                "color": color,
-                "global_roles": global_roles,
-                "importance": metrics["overall_importance"]
-            })
-        
-        # Skip if no data
-        if not token_data:
-            print("No data for visualization")
-            return ""
-        
-        # Create figure
-        plt.figure(figsize=(12, 10))
-        
-        # Create scatter plot
-        for token in token_data:
-            plt.scatter(
-                token["x"], token["y"],
-                s=token["size"],
-                c=token["color"],
-                alpha=0.6,
-                edgecolors='black',
-                linewidths=1
-            )
-            
-            # Add label for important tokens
-            if token["importance"] > 0.5:
-                plt.annotate(
-                    token["token_text"],
-                    (token["x"], token["y"]),
-                    xytext=(5, 5),
-                    textcoords='offset points',
-                    fontsize=8,
-                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8)
-                )
-        
-        # Set axis labels
-        plt.xlabel("Centrality (PageRank × 100)")
-        plt.ylabel("Average Importance")
-        
-        # Add title
-        plt.title("Token Metrics Visualization\nBubble Size = Preservation Score")
-        
-        # Add legend for token types
-        from matplotlib.lines import Line2D
-        legend_elements = [
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='green', markersize=10, label='Generated'),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', markersize=10, label='Text'),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, label='Image')
-        ]
-        plt.legend(handles=legend_elements, loc='upper right')
-        
-        # Add grid
-        plt.grid(True, linestyle='--', alpha=0.7)
-        
-        # Set axis limits with padding
-        x_vals = [t["x"] for t in token_data]
-        y_vals = [t["y"] for t in token_data]
-        plt.xlim(min(0, min(x_vals) * 0.9), max(x_vals) * 1.1)
-        plt.ylim(min(0, min(y_vals) * 0.9), max(y_vals) * 1.1)
-        
-        # Save figure
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
-        plt.close()
-        
-        print(f"Saved token metrics visualization to: {output_path}")
-        
-        return output_path
-    
-    def visualize_token_roles(
-        self,
-        combined_metrics: Dict[int, Dict[str, Any]],
-        output_path: Optional[str] = None
-    ) -> str:
-        """
-        Create visualization of token roles across layers.
-        
-        Args:
-            combined_metrics: Dictionary with combined token metrics
-            output_path: Path to save the visualization (None = auto-generate)
-            
-        Returns:
-            Path to saved visualization
-        """
-        import matplotlib.pyplot as plt
-        import numpy as np
-        
-        # Use default output path if not provided
-        if output_path is None:
-            output_path = os.path.join(self.output_dir, "token_roles_visualization.png")
-        
-        # Get all layers and roles
-        all_layers = set()
-        all_roles = set()
-        
-        for token_idx, metrics in combined_metrics.items():
-            if "roles" in metrics and "layer_roles" in metrics["roles"]:
-                for layer, roles in metrics["roles"]["layer_roles"].items():
-                    all_layers.add(int(layer))
-                    all_roles.update(roles)
-        
-        all_layers = sorted(all_layers)
-        all_roles = sorted(all_roles)
-        
-        # Skip if no data
-        if not all_layers or not all_roles:
-            print("No role data for visualization")
-            return ""
-        
-        # Count roles per layer
-        role_counts = {layer: {role: 0 for role in all_roles} for layer in all_layers}
-        
-        for token_idx, metrics in combined_metrics.items():
-            if "roles" in metrics and "layer_roles" in metrics["roles"]:
-                for layer_str, roles in metrics["roles"]["layer_roles"].items():
-                    layer = int(layer_str)
-                    for role in roles:
-                        if role in all_roles:
-                            role_counts[layer][role] += 1
-        
-        # Create figure
-        plt.figure(figsize=(12, 8))
-        
-        # Convert to arrays for plotting
-        layers_array = np.array(all_layers)
-        roles_data = []
-        
-        for role in all_roles:
-            role_data = [role_counts[layer][role] for layer in all_layers]
-            roles_data.append(role_data)
-        
-        # Create stacked bar chart
-        bottom = np.zeros(len(all_layers))
-        for i, role_data in enumerate(roles_data):
-            plt.bar(
-                layers_array,
-                role_data,
-                bottom=bottom,
-                label=all_roles[i],
-                alpha=0.7
-            )
-            bottom += np.array(role_data)
-        
-        # Set axis labels
-        plt.xlabel("Layer")
-        plt.ylabel("Number of Tokens")
-        
-        # Add title
-        plt.title("Token Roles Across Layers")
-        
-        # Add legend
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        
-        # Set x-axis ticks
-        plt.xticks(layers_array)
-        
-        # Add grid
-        plt.grid(True, linestyle='--', alpha=0.7, axis='y')
-        
-        # Save figure
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
-        plt.close()
-        
-        print(f"Saved token roles visualization to: {output_path}")
-        
-        return output_path
-    
-    def visualize_token_graph(
-        self,
-        trace_df: pd.DataFrame,
-        layer: int,
-        output_path: Optional[str] = None,
-        min_edge_weight: float = 0.1,
-        highlight_tokens: Optional[List[int]] = None
-    ) -> str:
-        """
-        Create visualization of token graph for a specific layer.
-        
-        Args:
-            trace_df: DataFrame with trace data
-            layer: Layer to visualize
-            output_path: Path to save the visualization (None = auto-generate)
-            min_edge_weight: Minimum edge weight to include
-            highlight_tokens: List of token indices to highlight
-            
-        Returns:
-            Path to saved visualization
-        """
-        import matplotlib.pyplot as plt
-        import networkx as nx
-        
-        # Use default output path if not provided
-        if output_path is None:
-            output_path = os.path.join(self.output_dir, f"token_graph_layer_{layer}.png")
-        
-        # Filter data for this layer
-        layer_df = trace_df[trace_df["layer"] == layer]
-        
-        # Create directed graph
-        G = nx.DiGraph()
-        
-        # Add all tokens as nodes
-        for _, row in layer_df.iterrows():
-            token_idx = row["token_index"]
-            token_text = row["token_text"]
-            token_type = row["token_type"]
-            G.add_node(token_idx, text=token_text, type=token_type)
-        
-        # Add edges based on source relationships
-        for _, row in layer_df.iterrows():
-            if "sources_indices" in row and pd.notna(row["sources_indices"]):
-                # Get target token
-                target_idx = row["token_index"]
-                
-                # Get source tokens and weights
-                sources_indices = [int(idx) for idx in str(row["sources_indices"]).split(",") if idx]
-                sources_weights = []
-                
-                if "sources_weights" in row and pd.notna(row["sources_weights"]):
-                    sources_weights = [float(w) for w in str(row["sources_weights"]).split(",") if w]
-                else:
-                    sources_weights = [1.0] * len(sources_indices)
-                
-                # Add edges with weights, filtering by minimum weight
-                for i, source_idx in enumerate(sources_indices):
-                    if i < len(sources_weights):
-                        weight = sources_weights[i]
-                        if weight >= min_edge_weight:
-                            if source_idx in G and target_idx in G:  # Ensure nodes exist
-                                G.add_edge(source_idx, target_idx, weight=weight)
-        
-        # Skip if graph is empty
-        if len(G) == 0:
-            print(f"No graph data for layer {layer}")
-            return ""
-        
-        # Create figure
-        plt.figure(figsize=(14, 10))
-        
-        # Calculate node positions
-        try:
-            # Try force-directed layout
-            pos = nx.spring_layout(G, k=0.3, iterations=50)
-        except:
-            # Fall back to circular layout
-            pos = nx.circular_layout(G)
-        
-        # Define node colors based on token type
-        node_colors = []
-        for node in G.nodes():
-            token_type = G.nodes[node]["type"]
-            if token_type == 0:  # Generated
-                color = 'green'
-            elif token_type == 1:  # Text
-                color = 'blue'
-            elif token_type == 2:  # Image
-                color = 'red'
-            else:
-                color = 'gray'
-            node_colors.append(color)
-        
-        # Define node sizes based on degree
-        node_sizes = [300 + 50 * G.degree(node) for node in G.nodes()]
-        
-        # Draw nodes
-        nx.draw_networkx_nodes(
-            G, pos,
-            node_color=node_colors,
-            node_size=node_sizes,
-            alpha=0.8,
-            edgecolors='black',
-            linewidths=1
-        )
-        
-        # Draw edges with varying width and transparency based on weight
-        for u, v, data in G.edges(data=True):
-            weight = data["weight"]
-            width = max(1, weight * 5)
-            alpha = max(0.2, min(0.9, weight))
-            
-            nx.draw_networkx_edges(
-                G, pos,
-                edgelist=[(u, v)],
-                width=width,
-                alpha=alpha,
-                arrowsize=10,
-                edge_color='gray'
-            )
-        
-        # Draw node labels
-        nx.draw_networkx_labels(
-            G, pos,
-            labels={node: f"{node}: {G.nodes[node]['text']}" for node in G.nodes()},
-            font_size=8,
-            font_color='black',
-            bbox=dict(facecolor='white', edgecolor='none', alpha=0.7, pad=0.5)
-        )
-        
-        # Highlight specific tokens if requested
-        if highlight_tokens:
-            highlight_nodes = [node for node in G.nodes() if node in highlight_tokens]
-            if highlight_nodes:
-                nx.draw_networkx_nodes(
-                    G, pos,
-                    nodelist=highlight_nodes,
-                    node_color='yellow',
-                    node_size=[node_sizes[i] * 1.3 for i, node in enumerate(G.nodes()) if node in highlight_tokens],
-                    alpha=0.9,
-                    edgecolors='black',
-                    linewidths=2
-                )
-        
-        # Add title
-        plt.title(f"Token Graph for Layer {layer}")
-        
-        # Add legend for token types
-        from matplotlib.lines import Line2D
-        legend_elements = [
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='green', markersize=10, label='Generated'),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', markersize=10, label='Text'),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, label='Image')
-        ]
-        plt.legend(handles=legend_elements, loc='upper right')
-        
-        # Turn off axis
-        plt.axis('off')
-        
-        # Save figure
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
-        plt.close()
-        
-        print(f"Saved token graph visualization to: {output_path}")
-        
-        return output_path
-    
-    def identify_critical_tokens(
-        self,
-        combined_metrics: Dict[int, Dict[str, Any]],
-        top_k: int = 10,
-        method: str = "combined"
-    ) -> List[Dict[str, Any]]:
-        """
-        Identify the most critical tokens for the reasoning process.
-        
-        Args:
-            combined_metrics: Dictionary with combined token metrics
-            top_k: Number of critical tokens to return
-            method: Method to use ("importance", "centrality", "roles", or "combined")
-            
-        Returns:
-            List of critical token information
-        """
-        # Different scoring methods for critical tokens
-        if method == "importance":
-            # Sort by overall importance
-            sorted_tokens = sorted(
-                combined_metrics.items(),
-                key=lambda x: x[1]["overall_importance"],
-                reverse=True
-            )
-            
-        elif method == "centrality":
-            # Sort by network centrality (PageRank)
-            sorted_tokens = sorted(
-                [
-                    (token_idx, metrics) for token_idx, metrics in combined_metrics.items()
-                    if "network" in metrics and "global_metrics" in metrics["network"]
-                ],
-                key=lambda x: x[1]["network"]["global_metrics"].get("avg_pagerank", 0),
-                reverse=True
-            )
-            
-        elif method == "roles":
-            # Score based on critical global roles
-            critical_roles = ["key", "hub", "preservation", "gateway"]
-            
-            def role_score(metrics):
-                if "roles" not in metrics or "global_roles" not in metrics["roles"]:
-                    return 0
-                
-                global_roles = metrics["roles"]["global_roles"]
-                return sum(2 if role in critical_roles else 1 for role in global_roles)
-            
-            sorted_tokens = sorted(
-                combined_metrics.items(),
-                key=lambda x: role_score(x[1]),
-                reverse=True
-            )
-            
-        else:  # combined
-            # Combined scoring with multiple factors
-            def combined_score(metrics):
-                # Base score is importance
-                score = metrics.get("overall_importance", 0) * 0.5
-                
-                # Add network centrality component
-                pagerank = metrics.get("network", {}).get("global_metrics", {}).get("avg_pagerank", 0)
-                score += pagerank * 5  # Scale pagerank which is usually small
-                
-                # Add role-based component
-                critical_roles = ["key", "hub", "preservation", "gateway"]
-                global_roles = metrics.get("roles", {}).get("global_roles", [])
-                role_bonus = sum(0.15 if role in critical_roles else 0.05 for role in global_roles)
-                score += role_bonus
-                
-                # Add preservation component
-                preservation = metrics.get("metrics", {}).get("global_metrics", {}).get("preservation_score", 0)
-                score += preservation * 0.2
-                
-                return score
-            
-            sorted_tokens = sorted(
-                combined_metrics.items(),
-                key=lambda x: combined_score(x[1]),
-                reverse=True
-            )
-        
-        # Get top-k critical tokens
-        critical_tokens = [
-            {
-                "token_index": token_idx,
-                "token_text": metrics.get("token_text", ""),
-                "token_type": metrics.get("token_type_name", ""),
-                "importance": metrics.get("overall_importance", 0),
-                "global_roles": metrics.get("roles", {}).get("global_roles", []),
-                "layers_present": metrics.get("metrics", {}).get("layers_present", []),
-                "pagerank": metrics.get("network", {}).get("global_metrics", {}).get("avg_pagerank", 0)
-            }
-            for token_idx, metrics in sorted_tokens[:top_k]
-        ]
-        
-        return critical_tokens
