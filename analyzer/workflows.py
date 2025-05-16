@@ -903,8 +903,8 @@ def build_heatmaps_offline(
             img_test = Image.open(image_path)
             print(f"DEBUG: Image opened successfully: size={img_test.size}, mode={img_test.mode}")
             # 显示样本像素值以确认图像有效
-            img_array = np.array(img_test)
-            print(f"DEBUG: Image array shape={img_array.shape}, min/max={img_array.min()}/{img_array.max()}")
+            #img_array = np.array(img_test)
+            #print(f"DEBUG: Image array shape={img_array.shape}, min/max={img_array.min()}/{img_array.max()}")
         except Exception as e:
             print(f"DEBUG: Failed to open image: {e}")
     else:
