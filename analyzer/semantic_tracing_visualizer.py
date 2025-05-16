@@ -1161,10 +1161,16 @@ class EnhancedSemanticTracingVisualizer:
                 layer_patch_maps[L] = None
                 continue
 
-            # Extract and normalize weights for this layer only
-            # This ensures each layer has its own unique heatmap
-            # FIXED: Added debug print to verify weights are different per layer
-            tok_weights = img_toks["predicted_top_prob"].values
+            # MODIFIED: Use importance_weight instead of predicted_top_prob
+            # This change ensures we use the correct weights reflecting token importance
+            # across the semantic tracing process
+            if "importance_weight" in img_toks.columns:
+                tok_weights = img_toks["importance_weight"].values
+                print(f"Layer {L}: Using importance_weight column for heatmap")
+            else:
+                tok_weights = img_toks["predicted_top_prob"].values
+                print(f"Layer {L}: importance_weight column not found, using predicted_top_prob")
+                
             mx = tok_weights.max() if len(tok_weights) > 0 else 0
             print(f"Layer {L}: Max weight = {mx:.4f}, Tokens = {len(img_toks)}")
             
@@ -1176,7 +1182,7 @@ class EnhancedSemanticTracingVisualizer:
                 
             # Create normalized weights dictionary for this layer
             weights = {
-                int(r.token_index): r.predicted_top_prob / mx
+                int(r.token_index): r.importance_weight / mx
                 for _, r in img_toks.iterrows()
             }
             

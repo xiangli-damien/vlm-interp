@@ -36,6 +36,7 @@ from analyzer.workflows import (
 # Semantic Tracing Analyzer and Visualizer
 from analyzer.semantic_tracing import EnhancedSemanticTracer
 from analyzer.semantic_tracing_visualizer import EnhancedSemanticTracingVisualizer
+from analyzer.heatmap_visualizer import HeatmapVisualizer
 
 __all__ = [
     # Analyzers & Components
@@ -45,6 +46,7 @@ __all__ = [
     "compute_flow_metrics_optimized",
     "EnhancedSemanticTracer",
     "EnhancedSemanticTracingVisualizer",
+    "HeatmapVisualizer",
     
     # Workflows
     "run_logit_lens_workflow",

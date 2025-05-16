@@ -12,6 +12,7 @@ import gc
 import time
 from PIL import Image
 from typing import Dict, Any, Optional, Union, List, Tuple
+from analyzer.heatmap_visualizer import HeatmapVisualizer
 
 # Import analyzing components
 from analyzer.logit_lens import LLaVANextLogitLensAnalyzer
@@ -1098,3 +1099,26 @@ def run_semantic_tracing_test(
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+def build_heatmaps_offline(
+        trace_csv: str,
+        metadata_json: str,
+        image_path: str,
+        output_dir: str,
+        weight_column: str = "importance_weight",
+        composite_only: bool = True,
+        debug: bool = False
+    ):
+
+    hv = HeatmapVisualizer(
+        csv_path       = trace_csv,
+        metadata_path  = metadata_json,
+        image_path     = image_path,
+        out_dir        = output_dir,
+        weight_column  = weight_column,
+        debug_mode     = debug
+    )
+    files = hv.run(composite_only=composite_only, show_values=not composite_only)
+    print(f"[Heatmap] generated {len(files)} files under {output_dir}")
+    return files
