@@ -342,66 +342,6 @@ def run_saliency_workflow(
 
     return final_results
 
-def process_all_csvs_in_directory(
-    directory: str,
-    metadata_path: str,
-    image_path: Optional[str] = None,
-    output_dir: Optional[str] = None,
-    flow_graph_params: Optional[Dict[str, Any]] = None,
-    heatmap_params: Optional[Dict[str, Any]] = None
-) -> Dict[str, List[str]]:
-    """
-    Create visualizations for all CSV files in a directory.
-    
-    Args:
-        directory: Directory containing CSV files
-        metadata_path: Path to the metadata JSON file
-        image_path: Path to the original image
-        output_dir: Directory to save visualizations
-        flow_graph_params: Parameters for flow graph visualization
-        heatmap_params: Parameters for heatmap visualization
-        
-    Returns:
-        Dictionary mapping CSV files to lists of created visualization paths
-    """
-    import glob
-    
-    # Set default output directory
-    if output_dir is None:
-        output_dir = os.path.join(directory, "visualizations")
-    
-    # Find all CSV files in the directory
-    csv_files = glob.glob(os.path.join(directory, "**/*.csv"), recursive=True)
-    
-    # Process each CSV file
-    results = {}
-    for csv_file in csv_files:
-        print(f"\nProcessing CSV file: {os.path.basename(csv_file)}")
-        
-        # Create subdirectory for this CSV's visualizations
-        csv_basename = os.path.basename(csv_file).split('.')[0]
-        csv_output_dir = os.path.join(output_dir, csv_basename)
-        
-        # Create visualizations
-        vis_paths = create_visualizations_from_csv(
-            csv_path=csv_file,
-            metadata_path=metadata_path,
-            image_path=image_path,
-            output_dir=csv_output_dir,
-            flow_graph_params=flow_graph_params,
-            heatmap_params=heatmap_params
-        )
-        
-        results[csv_file] = vis_paths
-    
-    # Print summary
-    total_vis = sum(len(paths) for paths in results.values())
-    print(f"\n=== Visualization Processing Complete ===")
-    print(f"Processed {len(csv_files)} CSV files")
-    print(f"Created {total_vis} total visualizations")
-    
-    return results
-
 def run_semantic_tracing_analysis(
     model_id: str,
     image_path: str, 
