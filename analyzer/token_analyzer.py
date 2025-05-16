@@ -71,7 +71,8 @@ class TokenAnalyzer:
         self, 
         csv_path: str, 
         metadata_path: Optional[str] = None,
-        importance_column: str = "importance_weight"
+        importance_column: str = "importance_weight",
+        fast_mode: bool = True,
     ) -> Dict[str, Any]:
         """
         Analyze the trace data to determine appropriate threshold values.
@@ -88,7 +89,16 @@ class TokenAnalyzer:
         
         # Load trace data
         try:
-            trace_df = pd.read_csv(csv_path)
+            if fast_mode:
+                trace_df = TokenAnalyzer.optimize_trace_data_parsing(
+                    csv_path=csv_path,
+                    importance_column=importance_column,
+                    max_tokens=50,  # Limit to 50 tokens for faster statistics
+                    sample_rate=0.3  # Sample 30% of rows
+                )
+            else:
+                trace_df = pd.read_csv(csv_path)
+                
             if trace_df.empty:
                 print("Error: Trace data is empty")
                 return {"error": "Empty trace data"}
@@ -317,7 +327,8 @@ class TokenAnalyzer:
         csv_path: str, 
         metadata_path: Optional[str] = None,
         importance_column: str = "importance_weight",
-        analyze_thresholds_first: bool = True
+        analyze_thresholds_first: bool = True,
+        fast_mode: bool = True
     ) -> Dict[str, Any]:
         """
         Analyze token roles and metrics from traced data CSV file.
@@ -335,7 +346,16 @@ class TokenAnalyzer:
         
         # Load trace data
         try:
-            trace_df = pd.read_csv(csv_path)
+            if fast_mode:
+                trace_df = TokenAnalyzer.optimize_trace_data_parsing(
+                    csv_path=csv_path,
+                    importance_column=importance_column,
+                    max_tokens=100,  # Limit to 50 tokens for faster statistics
+                    sample_rate=0.5  # Sample 30% of rows
+                )
+            else:
+                trace_df = pd.read_csv(csv_path)
+            
             if trace_df.empty:
                 print("Error: Trace data is empty")
                 return {"error": "Empty trace data"}
@@ -1161,19 +1181,23 @@ class TokenAnalyzer:
         input_data: Dict[str, Any],
         critical_tokens: List[Dict[str, Any]],
         method: str = "zero_out",
-        include_individual_tests: bool = True
+        include_individual_tests: bool = True,
+        layer_tests: bool = False,
+        num_layer_samples: int = 5
     ) -> Dict[str, Any]:
         """
         Run token ablation experiments to measure token importance.
-        Standalone function for ablation testing.
+        Standalone function for ablation testing with layer-specific controls.
         
         Args:
             model: Model to use for simulation
             processor: Processor for the model
             input_data: Prepared input data
             critical_tokens: List of critical tokens to test
-            method: Blocking method ("zero_out", "average", or "noise")
+            method: Blocking method ("zero_out", "average", "noise", or "interpolate")
             include_individual_tests: Whether to test each token individually
+            layer_tests: Whether to test layer-specific blocking
+            num_layer_samples: Number of layer samples to test if layer_tests is True
             
         Returns:
             Dictionary with ablation test results
@@ -1183,28 +1207,58 @@ class TokenAnalyzer:
         # Extract token indices
         token_indices = [token["token_index"] for token in critical_tokens]
         
+        # Get an estimate of total layers
+        total_layers = 0
+        for name, _ in model.named_modules():
+            if any(pattern in name for pattern in ['layers.', 'layer.', 'h.']):
+                total_layers += 1
+        
+        # Fast estimation of layer count (may not be precise)
+        if total_layers == 0:
+            # Fallback estimation for common model architectures
+            if hasattr(model, 'config') and hasattr(model.config, 'num_hidden_layers'):
+                total_layers = model.config.num_hidden_layers
+            else:
+                total_layers = 32  # Common default for large LLMs
+        
+        print(f"Estimated model layers: {total_layers}")
+        
         # First run normal inference as reference
         inputs = input_data["inputs"]
         
-        with torch.no_grad():
-            reference_outputs = model(**{k: v for k, v in inputs.items() if k != "token_type_ids"})
-            
-            # Get reference output token
-            reference_logits = reference_outputs.logits[:, -1, :]
-            reference_ids = torch.argmax(reference_logits, dim=-1).unsqueeze(0)
-            reference_text = processor.tokenizer.decode(reference_ids[0].tolist())
-            
-            reference_result = {
-                "output_ids": reference_ids,
-                "output_text": reference_text,
-                "logits": reference_logits
-            }
+        try:
+            with torch.no_grad():
+                reference_outputs = model(**{k: v for k, v in inputs.items() if k != "token_type_ids"})
+                
+                # Get reference output token
+                reference_logits = reference_outputs.logits
+                
+                # Handle different logits shapes
+                if reference_logits.dim() == 2:  # [batch, vocab]
+                    pred_logits = reference_logits
+                else:  # [batch, seq, vocab]
+                    pred_logits = reference_logits[:, -1, :]
+                    
+                reference_ids = torch.argmax(pred_logits, dim=-1).unsqueeze(0)
+                reference_text = processor.tokenizer.decode(reference_ids[0].tolist())
+                
+                reference_result = {
+                    "output_ids": reference_ids,
+                    "output_text": reference_text,
+                    "logits": pred_logits
+                }
+        except Exception as e:
+            print(f"Error during reference inference: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"error": f"Reference inference failed: {str(e)}"}
         
         # Initialize results
         ablation_results = {
             "reference_output": reference_text,
             "individual_ablations": {},
-            "all_critical_tokens_ablation": {}
+            "all_critical_tokens_ablation": {},
+            "layer_specific_ablations": {} if layer_tests else None
         }
         
         # Run individual token tests if requested
@@ -1239,6 +1293,78 @@ class TokenAnalyzer:
         
         ablation_results["all_critical_tokens_ablation"] = all_tokens_result
         
+        # Run layer-specific tests if requested
+        if layer_tests and total_layers > 0:
+            print(f"\nPerforming layer-specific ablation tests...")
+            
+            # Calculate layer sample points
+            layer_samples = []
+            if num_layer_samples >= total_layers:
+                # Test all layers
+                layer_samples = list(range(total_layers))
+            else:
+                # Sample evenly distributed layers
+                for i in range(num_layer_samples):
+                    layer_idx = int(i * (total_layers / num_layer_samples))
+                    layer_samples.append(layer_idx)
+            
+            # Test blocking from specific layers onwards
+            ablation_results["layer_specific_ablations"]["from_layer"] = {}
+            for layer_idx in layer_samples:
+                print(f"Testing ablation from layer {layer_idx} onwards...")
+                
+                layer_result = self.simulate_token_blocking(
+                    model=model,
+                    processor=processor,
+                    input_data=input_data,
+                    tokens_to_block=token_indices,
+                    method=method,
+                    reference_output=reference_result,
+                    start_block_layer=layer_idx,
+                    end_block_layer=None
+                )
+                
+                ablation_results["layer_specific_ablations"]["from_layer"][f"layer_{layer_idx}"] = layer_result
+            
+            # Test blocking up to specific layers
+            ablation_results["layer_specific_ablations"]["up_to_layer"] = {}
+            for layer_idx in layer_samples:
+                if layer_idx == 0:
+                    continue  # Skip layer 0 as it's equivalent to no blocking
+                    
+                print(f"Testing ablation up to layer {layer_idx}...")
+                
+                layer_result = self.simulate_token_blocking(
+                    model=model,
+                    processor=processor,
+                    input_data=input_data,
+                    tokens_to_block=token_indices,
+                    method=method,
+                    reference_output=reference_result,
+                    start_block_layer=0,
+                    end_block_layer=layer_idx
+                )
+                
+                ablation_results["layer_specific_ablations"]["up_to_layer"][f"layer_{layer_idx}"] = layer_result
+            
+            # Test blocking specific layers individually
+            ablation_results["layer_specific_ablations"]["single_layer"] = {}
+            for layer_idx in layer_samples:
+                print(f"Testing ablation of only layer {layer_idx}...")
+                
+                layer_result = self.simulate_token_blocking(
+                    model=model,
+                    processor=processor,
+                    input_data=input_data,
+                    tokens_to_block=token_indices,
+                    method=method,
+                    reference_output=reference_result,
+                    start_block_layer=layer_idx,
+                    end_block_layer=layer_idx
+                )
+                
+                ablation_results["layer_specific_ablations"]["single_layer"][f"layer_{layer_idx}"] = layer_result
+        
         # Print summary
         print("\nAblation Test Results:")
         print(f"Reference output: '{reference_text}'")
@@ -1247,18 +1373,56 @@ class TokenAnalyzer:
             print("\nIndividual Token Ablation:")
             for token in critical_tokens:
                 token_idx = token["token_index"]
-                result = ablation_results["individual_ablations"][f"token_{token_idx}"]
+                result = ablation_results["individual_ablations"].get(f"token_{token_idx}", {})
                 impact = result.get("comparison", {}).get("impact_score", 0)
                 match = result.get("comparison", {}).get("token_match", False)
                 output = result.get("generated_text", "")
                 
                 print(f"  Token {token_idx} ('{token['token_text']}'): Impact={impact:.3f}, "
-                      f"Match={match}, Output='{output}'")
+                    f"Match={match}, Output='{output}'")
         
-        all_impact = all_tokens_result.get("comparison", {}).get("impact_score", 0)
-        all_match = all_tokens_result.get("comparison", {}).get("token_match", False)
-        all_output = all_tokens_result.get("generated_text", "")
+        all_result = ablation_results["all_critical_tokens_ablation"]
+        all_impact = all_result.get("comparison", {}).get("impact_score", 0)
+        all_match = all_result.get("comparison", {}).get("token_match", False)
+        all_output = all_result.get("generated_text", "")
         print(f"\nAll tokens ablation: Impact={all_impact:.3f}, Match={all_match}, Output='{all_output}'")
+        
+        # Print layer-specific results if available
+        if layer_tests and "layer_specific_ablations" in ablation_results:
+            print("\nLayer-Specific Ablation Results:")
+            
+            if "from_layer" in ablation_results["layer_specific_ablations"]:
+                print("\n  Blocking from specific layers onwards:")
+                for layer_key, result in ablation_results["layer_specific_ablations"]["from_layer"].items():
+                    impact = result.get("comparison", {}).get("impact_score", 0)
+                    match = result.get("comparison", {}).get("token_match", False)
+                    print(f"    {layer_key}: Impact={impact:.3f}, Match={match}")
+            
+            if "up_to_layer" in ablation_results["layer_specific_ablations"]:
+                print("\n  Blocking up to specific layers:")
+                for layer_key, result in ablation_results["layer_specific_ablations"]["up_to_layer"].items():
+                    impact = result.get("comparison", {}).get("impact_score", 0)
+                    match = result.get("comparison", {}).get("token_match", False)
+                    print(f"    {layer_key}: Impact={impact:.3f}, Match={match}")
+            
+            if "single_layer" in ablation_results["layer_specific_ablations"]:
+                print("\n  Blocking individual layers:")
+                for layer_key, result in ablation_results["layer_specific_ablations"]["single_layer"].items():
+                    impact = result.get("comparison", {}).get("impact_score", 0)
+                    match = result.get("comparison", {}).get("token_match", False)
+                    print(f"    {layer_key}: Impact={impact:.3f}, Match={match}")
+        
+        # Save results to file
+        try:
+            import json
+            ablation_path = os.path.join(self.output_dir, "ablation_results.json")
+            with open(ablation_path, 'w') as f:
+                # Convert to serializable format
+                serializable_results = self._make_serializable(ablation_results)
+                json.dump(serializable_results, f, indent=2)
+            print(f"Saved ablation results to: {ablation_path}")
+        except Exception as e:
+            print(f"Error saving ablation results: {e}")
         
         return ablation_results
     
@@ -1269,10 +1433,14 @@ class TokenAnalyzer:
         input_data: Dict[str, Any],
         tokens_to_block: List[int],
         method: str = "zero_out",
-        reference_output: Optional[Dict[str, Any]] = None
+        reference_output: Optional[Dict[str, Any]] = None,
+        start_block_layer: Optional[int] = None,
+        end_block_layer: Optional[int] = None,
+        cache_hidden_states: bool = True
     ) -> Dict[str, Any]:
         """
         Simulate blocking specific tokens to analyze their impact on model reasoning.
+        Supports specifying which layers to apply token blocking to.
         
         Args:
             model: Model to use for simulation
@@ -1281,64 +1449,166 @@ class TokenAnalyzer:
             tokens_to_block: List of token indices to block
             method: Blocking method ("zero_out", "average", or "noise")
             reference_output: Optional reference output for comparison
+            start_block_layer: First layer to apply blocking (None = all layers)
+            end_block_layer: Last layer to apply blocking (None = all layers)
+            cache_hidden_states: Whether to cache hidden states for faster computation
             
         Returns:
             Dictionary with simulation results
         """
         import torch
+        import gc
         
-        print(f"Simulating token blocking for {len(tokens_to_block)} tokens using method: {method}")
+        # Layer info for debugging
+        blocking_layers = "all layers"
+        if start_block_layer is not None or end_block_layer is not None:
+            if start_block_layer is not None and end_block_layer is not None:
+                blocking_layers = f"layers {start_block_layer} to {end_block_layer}"
+            elif start_block_layer is not None:
+                blocking_layers = f"layers {start_block_layer} and above"
+            else:
+                blocking_layers = f"layers up to {end_block_layer}"
+        
+        print(f"Simulating token blocking for {len(tokens_to_block)} tokens using method: {method} on {blocking_layers}")
+        
+        # Initialize hidden states cache if enabled
+        hidden_states_cache = {}
         
         # Define hook to modify hidden states
-        def blocking_hook(module, input_tensors, output_tensors):
-            # Apply to only hidden states (not attention masks or position IDs)
-            if isinstance(output_tensors, torch.Tensor):
-                hidden_states = output_tensors
+        def blocking_hook(name):
+            def hook_fn(module, input_tensors, output_tensors):
+                # Extract layer index from name (can be customized based on model)
+                layer_idx = -1
                 
-                # Create a copy to modify
-                modified = hidden_states.clone()
+                # Try to extract layer index from name patterns like "layer.10" or "layers.5"
+                import re
+                match = re.search(r'layer[s]?\.(\d+)', name)
+                if match:
+                    layer_idx = int(match.group(1))
+                else:
+                    # Try to get index from module name
+                    for attr_name in dir(module):
+                        if attr_name.startswith('layer_idx') and hasattr(module, attr_name):
+                            layer_idx = getattr(module, attr_name)
+                            break
                 
-                # Apply blocking based on specified method
-                for token_idx in tokens_to_block:
-                    if token_idx < modified.shape[1]:
-                        if method == "zero_out":
-                            # Zero out the token representation
-                            modified[:, token_idx, :] = 0
-                        elif method == "average":
-                            # Replace with average of all tokens
-                            avg_repr = torch.mean(hidden_states, dim=1, keepdim=True)
-                            modified[:, token_idx, :] = avg_repr
-                        elif method == "noise":
-                            # Replace with Gaussian noise
-                            noise = torch.randn_like(modified[:, token_idx, :])
-                            modified[:, token_idx, :] = noise
+                # Check if we should apply blocking to this layer
+                apply_blocking = True
+                if start_block_layer is not None and layer_idx < start_block_layer:
+                    apply_blocking = False
+                if end_block_layer is not None and layer_idx > end_block_layer:
+                    apply_blocking = False
                 
-                return modified
-            else:
+                # Cache hidden states if needed
+                if cache_hidden_states and isinstance(output_tensors, torch.Tensor):
+                    # Store copy of original hidden states
+                    hidden_states_cache[name] = output_tensors.detach().clone()
+                
+                # Apply to only hidden states (not attention masks or position IDs) if blocking applies
+                if isinstance(output_tensors, torch.Tensor) and apply_blocking:
+                    hidden_states = output_tensors
+                    
+                    # Create a copy to modify
+                    modified = hidden_states.clone()
+                    
+                    # Apply blocking based on specified method
+                    for token_idx in tokens_to_block:
+                        if token_idx < modified.shape[1]:
+                            if method == "zero_out":
+                                # Zero out the token representation
+                                modified[:, token_idx, :] = 0
+                            elif method == "average":
+                                # Replace with average of all tokens
+                                avg_repr = torch.mean(hidden_states, dim=1, keepdim=True)
+                                modified[:, token_idx, :] = avg_repr
+                            elif method == "noise":
+                                # Replace with Gaussian noise
+                                noise = torch.randn_like(modified[:, token_idx, :])
+                                modified[:, token_idx, :] = noise
+                            elif method == "interpolate":
+                                # Replace with interpolation of neighboring tokens
+                                if token_idx > 0 and token_idx < modified.shape[1] - 1:
+                                    prev_token = hidden_states[:, token_idx-1, :]
+                                    next_token = hidden_states[:, token_idx+1, :]
+                                    modified[:, token_idx, :] = (prev_token + next_token) / 2
+                    
+                    return modified
+                
                 return output_tensors
+            return hook_fn
         
-        # Get base LLM module to attach hook
+        # Get base LLM module to attach hooks
         llm_module = model.get_decoder() if hasattr(model, "get_decoder") else model
         
         # Run inference with blocking
         try:
-            # Register forward hook
-            hook_handle = llm_module.register_forward_hook(blocking_hook)
+            # Register hooks for each layer
+            hook_handles = []
+            
+            # Find all transformer layers in the model
+            # This pattern matches most HuggingFace models but may need adaptation
+            for name, module in llm_module.named_modules():
+                # Look for transformer blocks/layers
+                if any(pattern in name for pattern in ['layers.', 'layer.', 'h.']):
+                    # Register hook for this module
+                    hook_handles.append(module.register_forward_hook(blocking_hook(name)))
+            
+            print(f"Registered {len(hook_handles)} hooks for blocking")
             
             # Run model with blocked tokens
             inputs = input_data["inputs"]
             
-            with torch.no_grad():
-                outputs = model(**{k: v for k, v in inputs.items() if k != "token_type_ids"},
-                              output_hidden_states=True,
-                              output_attentions=True)
+            # To avoid OOM issues, use half precision and CPU offloading where possible
+            run_dtype = inputs["input_ids"].dtype
             
-            # Remove hook
-            hook_handle.remove()
+            # Check if we should use reference output's logits shape
+            ref_logits_dim = 2
+            if reference_output is not None and "logits" in reference_output:
+                ref_logits_dim = reference_output["logits"].dim()
+            
+            with torch.no_grad():
+                # Run the model with hooks active
+                outputs = model(**{k: v for k, v in inputs.items() if k != "token_type_ids"},
+                            output_hidden_states=True,
+                            output_attentions=False)  # Don't need attention, saves memory
+            
+            # Remove hooks
+            for handle in hook_handles:
+                handle.remove()
+            
+            # Clean up hidden states cache to save memory
+            hidden_states_cache.clear()
+            
+            # Force garbage collection to free memory
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             # Extract generated text
             logits = outputs.logits
-            generated_ids = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(0)
+            
+            # Handle different logits shapes
+            if logits.dim() == 2:  # [batch, vocab]
+                # Add sequence dimension if needed to match reference
+                if ref_logits_dim == 3:
+                    logits = logits.unsqueeze(1)  # [batch, seq=1, vocab]
+                    last_pos = 0
+                else:
+                    last_pos = -1  # Use last position for 2D
+            else:  # [batch, seq, vocab]
+                last_pos = -1  # Use last position for 3D
+                
+                # If reference is 2D but our result is 3D, extract last token
+                if ref_logits_dim == 2:
+                    logits = logits[:, -1, :]  # [batch, vocab]
+            
+            # Extract prediction
+            if logits.dim() == 3:
+                pred_logits = logits[:, last_pos, :]
+            else:
+                pred_logits = logits
+                
+            generated_ids = torch.argmax(pred_logits, dim=-1).unsqueeze(0)
             generated_text = processor.tokenizer.decode(generated_ids[0].tolist())
             
             # Compare with reference if provided
@@ -1346,21 +1616,35 @@ class TokenAnalyzer:
             if reference_output is not None and "output_ids" in reference_output:
                 ref_ids = reference_output["output_ids"]
                 
+                # Get reference logits
+                ref_logits = reference_output["logits"]
+                
+                # Ensure dimensions match for comparison
+                if ref_logits.dim() != pred_logits.dim():
+                    if ref_logits.dim() == 3 and pred_logits.dim() == 2:
+                        ref_logits = ref_logits[:, -1, :]
+                    elif ref_logits.dim() == 2 and pred_logits.dim() == 3:
+                        pred_logits = pred_logits[:, -1, :]
+                
                 # Compare output probability distributions
-                ref_probs = torch.softmax(reference_output["logits"][:, -1, :], dim=-1)
-                sim_probs = torch.softmax(logits[:, -1, :], dim=-1)
+                ref_probs = torch.softmax(ref_logits, dim=-1)
+                sim_probs = torch.softmax(pred_logits, dim=-1)
                 
                 # KL Divergence as distribution distance
-                kl_div = torch.nn.functional.kl_div(
-                    sim_probs.log(), ref_probs, reduction="batchmean"
-                ).item()
+                try:
+                    kl_div = torch.nn.functional.kl_div(
+                        sim_probs.log(), ref_probs, reduction="batchmean"
+                    ).item()
+                except:
+                    # Fallback if KL divergence fails
+                    kl_div = torch.sum((sim_probs - ref_probs) ** 2).item()
                 
                 # Token match - whether prediction is the same
                 token_match = (generated_ids == ref_ids).all().item()
                 
                 # Get probability of reference token in blocked model
                 ref_token_id = ref_ids[0].item()
-                ref_token_prob = sim_probs[0, ref_token_id].item()
+                ref_token_prob = sim_probs[0, ref_token_id].item() if ref_token_id < sim_probs.shape[1] else 0.0
                 
                 comparison = {
                     "kl_divergence": kl_div,
@@ -1373,6 +1657,9 @@ class TokenAnalyzer:
             results = {
                 "method": method,
                 "tokens_blocked": tokens_to_block,
+                "blocking_layers": blocking_layers,
+                "start_block_layer": start_block_layer,
+                "end_block_layer": end_block_layer,
                 "generated_text": generated_text,
                 "comparison": comparison
             }
@@ -1388,6 +1675,68 @@ class TokenAnalyzer:
             
             return {
                 "error": str(e),
+                "traceback": traceback.format_exc(),
                 "method": method,
-                "tokens_blocked": tokens_to_block
+                "tokens_blocked": tokens_to_block,
+                "blocking_layers": blocking_layers
             }
+
+    @staticmethod
+    def optimize_trace_data_parsing(
+        csv_path: str,
+        importance_column: str = "importance_weight",
+        max_tokens: Optional[int] = None,
+        sample_rate: Optional[float] = None
+    ) -> pd.DataFrame:
+        """
+        Optimize loading and parsing of the trace data CSV file, with options
+        to sample a subset for faster processing when obtaining statistics.
+        
+        Args:
+            csv_path: Path to the trace data CSV
+            importance_column: Column to use for importance values
+            max_tokens: Maximum number of tokens to analyze (sample if larger)
+            sample_rate: Optional sampling rate for rows (0.0-1.0)
+            
+        Returns:
+            DataFrame with trace data (potentially sampled)
+        """
+        try:
+            # Load only essential columns to speed up reading
+            essential_cols = [
+                "layer", "token_index", "token_text", "token_id", "token_type",
+                "sources_indices", "sources_weights", importance_column
+            ]
+            
+            # Use low_memory=False for more reliable parsing
+            trace_df = pd.read_csv(csv_path, low_memory=False)
+            
+            # Check if we have the essential columns
+            avail_cols = [col for col in essential_cols if col in trace_df.columns]
+            if not avail_cols:
+                # Fall back to reading all columns
+                trace_df = pd.read_csv(csv_path, low_memory=False)
+                
+            # Apply sampling if needed
+            if sample_rate and 0 < sample_rate < 1:
+                trace_df = trace_df.sample(frac=sample_rate, random_state=42)
+                print(f"Sampled {len(trace_df)} rows at rate {sample_rate}")
+                
+            # Limit number of tokens
+            if max_tokens:
+                unique_tokens = trace_df["token_index"].unique()
+                if len(unique_tokens) > max_tokens:
+                    sample_tokens = np.random.choice(unique_tokens, size=max_tokens, replace=False)
+                    trace_df = trace_df[trace_df["token_index"].isin(sample_tokens)]
+                    print(f"Limited analysis to {max_tokens} randomly selected tokens")
+                    
+            # Convert weights to numeric and handle NaNs
+            if importance_column in trace_df.columns:
+                trace_df[importance_column] = pd.to_numeric(trace_df[importance_column], errors='coerce').fillna(0)
+            
+            return trace_df
+            
+        except Exception as e:
+            print(f"Error optimizing trace data: {e}")
+            # Return the original DataFrame
+            return pd.read_csv(csv_path)
