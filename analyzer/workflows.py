@@ -1242,7 +1242,7 @@ def analyze_token_thresholds(
             print(f"Using provided trace data: {trace_data_path}")
         
         # 2. Initialize token analyzer
-        analyzer = OptimizedTokenAnalyzer(
+        analyzer = TokenAnalyzer(
             output_dir=output_dir,
             debug_mode=debug_mode
         )
@@ -1503,7 +1503,7 @@ def run_ablation_experiments(
         input_data = tracer.prepare_inputs(image_source, prompt_text)
         
         # Initialize token analyzer for ablation
-        analyzer = OptimizedTokenAnalyzer(
+        analyzer = TokenAnalyzer(
             output_dir=output_dir,
             debug_mode=debug_mode
         )
