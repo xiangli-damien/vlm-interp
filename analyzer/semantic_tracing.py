@@ -45,11 +45,11 @@ class EnhancedSemanticTracer:
         logit_lens_concepts: Optional[List[str]] = None,
         normalize_weights: bool = True,
         beta_target: float = 0.8,  # Target-level coverage threshold
-        beta_layer: float = 0.7,   # Layer-level coverage threshold 
-        min_keep: int = 1,         # Minimum nodes to keep per target
-        max_keep: int = 30,        # Maximum nodes to keep per target
-        min_keep_layer: int = 5,   # Minimum nodes to keep per layer
-        max_keep_layer: int = 100, # Maximum nodes to keep per layer
+        beta_layer: float = 1.0,   # Layer-level coverage threshold 
+        min_keep: int = 3,         # Minimum nodes to keep per target
+        max_keep: int = 8,        # Maximum nodes to keep per target
+        min_keep_layer: int = 10,   # Minimum nodes to keep per layer
+        max_keep_layer: int = 500, # Maximum nodes to keep per layer
         epsilon: float = 1e-7,     
         debug: bool = False,
     ):

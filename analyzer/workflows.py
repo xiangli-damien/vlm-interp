@@ -29,6 +29,7 @@ from utils.hook_utils import GradientAttentionCapture
 from utils.viz_utils import visualize_token_probabilities, visualize_information_flow
 from analyzer.semantic_tracing import EnhancedSemanticTracer
 from analyzer.semantic_tracing_visualizer import EnhancedSemanticTracingVisualizer
+from analyzer.token_analyzer import TokenAnalyzer
 
 def run_logit_lens_workflow(
     model: torch.nn.Module,
@@ -1222,7 +1223,7 @@ def run_token_analysis_workflow(
             trace_results = tracer.generate_and_analyze(
                 input_data=input_data,
                 num_tokens=1,  # Just analyze the first generated token
-                tracing_mode="both"  # Use both saliency and attention
+                tracing_mode="saliency"  # Use saliency tracing
             )
             
             # Get paths to trace data
