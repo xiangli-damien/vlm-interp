@@ -35,6 +35,7 @@ from analyzer.workflows import (
 from analyzer.semantic_tracing import EnhancedSemanticTracer
 from analyzer.semantic_tracing_visualizer import EnhancedSemanticTracingVisualizer
 from analyzer.heatmap_visualizer import HeatmapVisualizer
+from analyzer.token_analyzer import TokenAnalyzer
 
 __all__ = [
     # Analyzers & Components
@@ -45,12 +46,15 @@ __all__ = [
     "EnhancedSemanticTracer",
     "EnhancedSemanticTracingVisualizer",
     "HeatmapVisualizer",
+    "TokenAnalyzer",
     
     # Workflows
     "run_logit_lens_workflow",
     "run_saliency_workflow",
     "run_semantic_tracing_analysis",
     "run_semantic_tracing_test",
+    "build_heatmaps_offline",
+    "run_token_analysis_workflow"
 ]
 
 # Add stepwise_logit_lens_workflow if available

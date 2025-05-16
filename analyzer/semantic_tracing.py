@@ -2027,19 +2027,31 @@ class EnhancedSemanticTracer:
             analyze_indices = [original_seq_len + i for i in range(len(generated_tokens))]
         else:
             # Filter to ensure indices are valid
-            analyze_indices = [idx for idx in analyze_indices if original_seq_len <= idx < current_input_ids.shape[1]]
+            analyze_indices = [idx for idx in analyze_indices if idx < current_input_ids.shape[1]]
+            
+            # IMPORTANT FIX: Check if we're analyzing non-generated tokens (like text tokens)
+            # This is critical when analyzing specific indices that might be input tokens
+            for idx in analyze_indices:
+                if idx < original_seq_len:
+                    print(f"Note: Analyzing input token at index {idx} (not a generated token)")
         
         print(f"\n=== Analyzing {len(analyze_indices)} specific tokens ===")
         for i, idx in enumerate(analyze_indices):
-            relative_pos = idx - original_seq_len
-            if 0 <= relative_pos < len(generated_tokens):
-                token = generated_tokens[relative_pos]
-                print(f"Token {i+1}: '{token['text']}' at position {idx} (ID: {token['id']})")
+            if idx >= original_seq_len and idx - original_seq_len < len(generated_tokens):
+                # Generated token
+                token = generated_tokens[idx - original_seq_len]
+                print(f"Token {i+1}: '{token['text']}' at position {idx} (ID: {token['id']}) [Generated]")
+            else:
+                # Input token
+                token_id = current_input_ids[0, idx].item()
+                token_text = self._get_token_text(token_id)
+                token_type = "Text" if idx in input_data["text_indices"] else "Image" if idx in input_data["image_indices"] else "Other"
+                print(f"Token {i+1}: '{token_text}' at position {idx} (ID: {token_id}) [{token_type}]")
         
         # 3. Set up results dictionary
         all_results = {
-            "input_data": input_data,
-            "target_tokens": [generated_tokens[idx - original_seq_len] for idx in analyze_indices if original_seq_len <= idx < current_input_ids.shape[1]],
+            "input_data": input_data,  # Keep the entire input_data for reference
+            "target_tokens": [],
             "all_generated_tokens": generated_tokens,
             "full_sequence": {
                 "ids": current_input_ids[0].tolist(),
@@ -2047,13 +2059,41 @@ class EnhancedSemanticTracer:
                 "generated_text": complete_text
             },
             "trace_results": {},
-            "metadata": {"tracing_mode": tracing_mode}
+            "metadata": {
+                "tracing_mode": tracing_mode
+            }
         }
         
-        # 4. Analyze each requested token
+        # CRITICAL FIX: Preserve feature_mapping information from input_data
+        if "feature_mapping" in input_data:
+            all_results["metadata"]["feature_mapping"] = input_data["feature_mapping"]
+            print("Preserved feature mapping information from input data")
+        
+        # Save images in metadata if available - needed for visualization
+        if "original_image" in input_data:
+            all_results["metadata"]["image_available"] = True
+        
+        # 4. Populate target_tokens with all analyzed tokens
         for target_idx in analyze_indices:
-            if target_idx < original_seq_len or target_idx >= current_input_ids.shape[1]:
-                print(f"Warning: Token index {target_idx} is outside the valid range. Skipping.")
+            if target_idx >= current_input_ids.shape[1]:
+                print(f"Warning: Token index {target_idx} exceeds sequence length {current_input_ids.shape[1]}. Skipping.")
+                continue
+                
+            # Get token info
+            token_id = current_input_ids[0, target_idx].item()
+            token_text = self._get_token_text(token_id)
+            
+            # Add to target_tokens
+            token_info = {
+                "index": target_idx,
+                "id": token_id,
+                "text": token_text,
+            }
+            all_results["target_tokens"].append(token_info)
+        
+        # 5. Analyze each requested token
+        for target_idx in analyze_indices:
+            if target_idx >= current_input_ids.shape[1]:
                 continue
             
             # Get token info
@@ -2102,7 +2142,7 @@ class EnhancedSemanticTracer:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         
-        # 5. Save metadata for visualization
+        # 6. Save metadata for visualization
         metadata_path = os.path.join(self.output_dir, "csv_data", f"trace_metadata.json")
         self._save_trace_metadata(all_results, metadata_path)
         all_results["metadata_path"] = metadata_path
