@@ -1108,17 +1108,83 @@ def build_heatmaps_offline(
         output_dir: str,
         weight_column: str = "importance_weight",
         composite_only: bool = True,
+        unified_colorscale: bool = False,
+        download_resize_image: bool = False,
+        target_image_size: Optional[Tuple[int, int]] = None,
+        include_all_token_types: bool = False,
         debug: bool = False
     ):
-
+    """
+    Generate comprehensive heatmap visualizations from semantic tracing data.
+    
+    Args:
+        trace_csv: Path to the CSV file containing trace data
+        metadata_json: Path to JSON file containing metadata and feature mappings
+        image_path: Path or URL to the image to use in visualizations
+        output_dir: Directory to save visualization files
+        weight_column: Column name to use for importance weights (default: "importance_weight")
+        composite_only: If True, only generate composite visualizations, not per-layer
+        unified_colorscale: If True, use the same color scale across all layers for consistency
+        download_resize_image: If True, download image from URL and resize it
+        target_image_size: Target size for image resizing (width, height)
+        include_all_token_types: If True, include text and generated tokens in visualizations
+        debug: Whether to print additional debugging information
+        
+    Returns:
+        List of paths to generated visualization files
+    """
+    # Handle image download and resize if needed
+    processed_image_path = image_path
+    if download_resize_image and image_path.startswith(('http://', 'https://')):
+        # Create a temporary directory for downloaded images
+        download_dir = os.path.join(output_dir, "downloaded_images")
+        os.makedirs(download_dir, exist_ok=True)
+        temp_image_path = os.path.join(download_dir, os.path.basename(image_path) or "downloaded_image.jpg")
+        
+        try:
+            # Download the image
+            import requests
+            from PIL import Image
+            import io
+            
+            print(f"Downloading image from {image_path}...")
+            response = requests.get(image_path, stream=True, timeout=10)
+            response.raise_for_status()
+            
+            # Load the image
+            img = Image.open(io.BytesIO(response.content))
+            
+            # Resize if target size is provided
+            if target_image_size:
+                img = img.resize(target_image_size, Image.LANCZOS)
+                print(f"Resized image to {target_image_size}")
+            
+            # Save the processed image
+            img.save(temp_image_path)
+            print(f"Image saved to {temp_image_path}")
+            
+            # Update image path to the local file
+            processed_image_path = temp_image_path
+        except Exception as e:
+            print(f"Error downloading or processing image: {e}")
+            # Continue with original image path
+    
+    # Create visualizer with custom parameters
     hv = HeatmapVisualizer(
-        csv_path       = trace_csv,
-        metadata_path  = metadata_json,
-        image_path     = image_path,
-        out_dir        = output_dir,
-        weight_column  = weight_column,
-        debug_mode     = debug
+        csv_path=trace_csv,
+        metadata_path=metadata_json,
+        image_path=processed_image_path,
+        out_dir=output_dir,
+        weight_column=weight_column,
+        debug_mode=debug
     )
+    
+    # Set custom visualization parameters
+    hv.unified_colorscale = unified_colorscale
+    hv.include_all_token_types = include_all_token_types
+    
+    # Run visualization and collect output files
     files = hv.run(composite_only=composite_only, show_values=not composite_only)
+    
     print(f"[Heatmap] generated {len(files)} files under {output_dir}")
     return files
