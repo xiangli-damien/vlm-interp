@@ -401,7 +401,8 @@ class EnhancedSemanticTracer:
     
     def _save_trace_metadata(self, results, metadata_path):
         """
-        Save trace metadata to a JSON file for visualization use.
+        Save trace metadata to a JSON file for visualization use with complete
+        feature mapping information required for offline visualization.
         
         Args:
             results: Results dictionary containing metadata
@@ -455,12 +456,33 @@ class EnhancedSemanticTracer:
                     "grid_unpadded": patch_feature.get("grid_unpadded", [0, 0]),
                     "positions": {str(k): v for k, v in patch_feature.get("positions", {}).items()}
                 }
+                
+                # CRITICAL FIX: Include grid_for_visualization
+                serializable_patch["grid_for_visualization"] = patch_feature.get("grid_for_visualization", [0, 0])
+                
                 serializable_mapping["patch_feature"] = serializable_patch
             
             # Add other serializable properties
             for key in ["patch_size", "resized_dimensions"]:
                 if key in feature_map:
                     serializable_mapping[key] = feature_map[key]
+            
+            # CRITICAL FIX: Include padded_dimensions
+            if "padded_dimensions" in feature_map:
+                serializable_mapping["padded_dimensions"] = feature_map["padded_dimensions"]
+            else:
+                # If missing, try to infer from other dimensions
+                if "original_size" in feature_map and "patch_size" in feature_map:
+                    # Make best-effort guess about padded dimensions
+                    w, h = feature_map.get("original_size", (0, 0))
+                    patch_size = feature_map.get("patch_size", 14)
+                    # Round up to multiple of patch size
+                    padded_h = math.ceil(h / patch_size) * patch_size
+                    padded_w = math.ceil(w / patch_size) * patch_size
+                    serializable_mapping["padded_dimensions"] = (padded_w, padded_h)
+                else:
+                    # Use resized dimensions as fallback
+                    serializable_mapping["padded_dimensions"] = serializable_mapping.get("resized_dimensions", [0, 0])
             
             metadata["feature_mapping"] = serializable_mapping
         

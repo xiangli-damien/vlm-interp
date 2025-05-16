@@ -380,26 +380,8 @@ class EnhancedSemanticTracingVisualizer:
         vmax: Optional[float] = None
     ) -> Optional[str]:
         """
-        Create an enhanced heatmap overlay visualization for base image features.
-        
-        Args:
-            heatmap: 2D numpy array with heatmap values
-            original_image: Original PIL image
-            grid_size: Tuple of (height, width) for the grid
-            layer_idx: Index of the layer
-            target_idx: Index of the target token
-            title: Title for the plot
-            save_path: Path to save the visualization
-            target_size: Target size for the visualization
-            colormap: Matplotlib colormap name
-            alpha: Alpha blending value for overlay
-            add_gridlines: Whether to add grid lines
-            use_grid_visualization: Whether to use grid-based visualization
-            show_values: Whether to show numeric values in cells
-            vmax: Maximum value for colormap scaling (None for auto-scaling)
-            
-        Returns:
-            Path to saved visualization or None if failed
+        Create an enhanced heatmap overlay visualization for base image features
+        with improved transparency handling for better background visibility.
         """
         try:
             import matplotlib.pyplot as plt
@@ -420,12 +402,13 @@ class EnhancedSemanticTracingVisualizer:
             
             background_np = np.array(resized_background)
             
-            # Display background image with proper extent
+            # CRITICAL FIX 1: Display background with FULL opacity
             ax.imshow(
                 background_np, 
                 extent=(0, target_size[0], target_size[1], 0),
                 aspect='auto',
-                origin='upper'
+                origin='upper',
+                alpha=1.0  # Full opacity for background
             )
             
             # Calculate cell dimensions
@@ -444,14 +427,15 @@ class EnhancedSemanticTracingVisualizer:
                         # Get value for this cell
                         cell_value = heatmap[r, c] if r < len(heatmap) and c < len(heatmap[0]) else 0
                         
-                        if cell_value > 0:  # Only draw cells with influence
+                        if cell_value > 0.01:  # Only draw cells with significant influence
                             # Calculate cell boundaries
                             x_start = c * cell_width
                             y_start = r * cell_height
                             
                             # Get color with adjusted alpha based on value
                             cell_color = cmap(cell_value)
-                            cell_alpha = min(cell_value * 1.3, base_alpha)
+                            # CRITICAL FIX 2: Scale alpha with value for better visibility
+                            cell_alpha = min(cell_value * 2, base_alpha)
                             
                             # Create rectangle with appropriate alpha
                             rect = plt.Rectangle(
@@ -490,11 +474,19 @@ class EnhancedSemanticTracingVisualizer:
                     upscaled_heatmap = np.kron(heatmap, np.ones((repeat_y, repeat_x)))
                     upscaled_heatmap = upscaled_heatmap[:target_size[1], :target_size[0]]
                 
-                # Use adjusted alpha for better overlay
+                # CRITICAL FIX 3: Create a mask where near-zero values become NaN (transparent)
+                heat_vis = upscaled_heatmap.copy()
+                heat_vis[heat_vis < 1e-6] = np.nan
+                
+                # CRITICAL FIX 4: Modify colormap to make NaN values fully transparent
+                cmap = plt.get_cmap(colormap).copy()
+                cmap.set_bad(alpha=0)  # Make NaN values fully transparent
+                
+                # IMPROVED: Apply heatmap with proper transparency
                 im = ax.imshow(
-                    upscaled_heatmap, 
-                    alpha=min(0.6, alpha),
-                    cmap=colormap,
+                    heat_vis,
+                    alpha=alpha,
+                    cmap=cmap,
                     vmin=0,
                     vmax=vmax,  # Use provided vmax if available
                     extent=(0, target_size[0], target_size[1], 0),
@@ -555,7 +547,8 @@ class EnhancedSemanticTracingVisualizer:
         vmax: Optional[float] = None
     ) -> Optional[str]:
         """
-        Create an enhanced heatmap overlay visualization for patch image features.
+        Create an enhanced heatmap overlay visualization for patch image features with
+        proper transparency handling to preserve background visibility.
         """
         try:
             import matplotlib.pyplot as plt
@@ -586,16 +579,15 @@ class EnhancedSemanticTracingVisualizer:
             background_np = np.array(preview_image)
             
             # Debug: Verify image data
-            print(f"Debug: Background image shape={background_np.shape}, dtype={background_np.dtype}")
-            print(f"Debug: Image min/max values: {background_np.min()}/{background_np.max()}")
+            print(f"Background image shape={background_np.shape}, dtype={background_np.dtype}")
             
             # Get content dimensions and padding
             resized_dims_wh = feature_mapping.get("resized_dimensions", (0, 0))
             if resized_dims_wh == (0, 0):
-                print("Error: Missing resized dimensions in feature mapping.")
-                return None
-            
-            resized_w_actual, resized_h_actual = resized_dims_wh
+                print("Warning: Missing resized dimensions in feature mapping. Using preview size.")
+                resized_w_actual, resized_h_actual = preview_w, preview_h
+            else:
+                resized_w_actual, resized_h_actual = resized_dims_wh
             
             # Calculate padding
             pad_h_total = preview_h - resized_h_actual
@@ -603,39 +595,26 @@ class EnhancedSemanticTracingVisualizer:
             pad_top = max(0, pad_h_total // 2)
             pad_left = max(0, pad_w_total // 2)
             
-            # Calculate cell dimensions
-            cell_height = resized_h_actual / prob_grid_h
-            cell_width = resized_w_actual / prob_grid_w
-            
             # Create figure with improved aspect ratio
             aspect_ratio = preview_h / max(1, preview_w)
             fig = Figure(figsize=(10, 10 * aspect_ratio), dpi=100)
             canvas = FigureCanvas(fig)
             ax = fig.add_subplot(111)
             
-            # CRITICAL FIX: Check for all-zero or very small heatmap values
+            # CRITICAL FIX 1: Check for all-zero heatmap and add small values for visibility
             if np.all(np.isclose(heatmap, 0, atol=1e-8)):
                 print(f"Warning: Heatmap for layer {layer_idx} has all zero values. Adding small values for visibility.")
                 # Add small values to make visible
                 heatmap = np.ones_like(heatmap) * 0.1
             
-            # CRITICAL FIX: Ensure background image is fully visible first
-            # 修改: 确保背景图像完全可见且不透明
+            # CRITICAL FIX 2: Display background image first with FULL opacity
             ax.imshow(
                 background_np, 
                 extent=(0, preview_w, preview_h, 0),
                 aspect='equal',
                 origin='upper',
-                alpha=1.0  # 设置为完全不透明
+                alpha=1.0  # Full opacity for background
             )
-            
-            # Debug: Heatmap stats before overlay
-            print(f"Debug: Heatmap shape={heatmap.shape}, min/max={heatmap.min()}/{heatmap.max()}")
-            
-            # Create better colormap with improved alpha handling
-            cmap = plt.get_cmap(colormap)
-            # 修改: 降低热力图的不透明度，确保背景可见
-            base_alpha = min(0.5, alpha)  # 改为0.5，让背景更明显
             
             # Upscale heatmap to content area dimensions
             try:
@@ -643,7 +622,7 @@ class EnhancedSemanticTracingVisualizer:
                 upscaled_hm = skimage_resize(
                     heatmap, 
                     (resized_h_actual, resized_w_actual), 
-                    order=1,  # 线性插值，平滑结果
+                    order=1,  # Linear interpolation for smoother result
                     mode='constant',
                     cval=0, 
                     anti_aliasing=True, 
@@ -665,25 +644,30 @@ class EnhancedSemanticTracingVisualizer:
                             c_end = int((c + 1) * cell_w)
                             upscaled_hm[r_start:r_end, c_start:c_end] = heatmap[r, c]
             
-            # CRITICAL FIX: Properly set the extent coordinates for overlay
-            # 修改: 确保热力图和背景图像正确对齐
+            # CRITICAL FIX 3: Create a proper extent for the overlay
             extent = (
                 pad_left,                    # left
                 pad_left + resized_w_actual, # right
-                pad_top + resized_h_actual,  # bottom (origin='upper'时, y轴从上到下)
+                pad_top + resized_h_actual,  # bottom (when origin='upper')
                 pad_top                      # top
             )
             
-            # Debug: Print extent for verification
-            print(f"Debug: Heatmap extent={extent}, background extent=(0,{preview_w},{preview_h},0)")
+            # CRITICAL FIX 4: Make zero values transparent
+            # Create a mask where near-zero values become NaN (which will be transparent)
+            heat_vis = upscaled_hm.copy()
+            heat_vis[heat_vis < 1e-6] = np.nan
             
-            # IMPROVED: Set explicit value range and better alpha
+            # CRITICAL FIX 5: Modify colormap to make NaN values fully transparent
+            cmap = plt.get_cmap(colormap).copy()
+            cmap.set_bad(alpha=0)  # Make NaN values fully transparent
+            
+            # IMPROVED: Apply heatmap with proper transparency handling
             im = ax.imshow(
-                upscaled_hm, 
-                cmap=colormap,
-                alpha=base_alpha,  # 透明度降低，确保背景可见
-                extent=extent,     # 使用正确计算的extent值
-                origin='upper',    # 确保与背景图像使用相同的origin
+                heat_vis,
+                cmap=cmap,
+                alpha=alpha,  # This alpha only applies to non-NaN values
+                extent=extent,
+                origin='upper',
                 interpolation='bilinear',
                 vmin=0,
                 vmax=vmax if vmax is not None else max(0.01, np.max(heatmap))
@@ -693,12 +677,12 @@ class EnhancedSemanticTracingVisualizer:
             if add_gridlines:
                 # Horizontal grid lines
                 for i in range(prob_grid_h + 1):
-                    y = pad_top + i * cell_height
+                    y = pad_top + i * (resized_h_actual / prob_grid_h)
                     ax.axhline(y=y, color='white', linestyle='-', linewidth=0.5, alpha=0.7)
                 
                 # Vertical grid lines
                 for i in range(prob_grid_w + 1):
-                    x = pad_left + i * cell_width
+                    x = pad_left + i * (resized_w_actual / prob_grid_w)
                     ax.axvline(x=x, color='white', linestyle='-', linewidth=0.5, alpha=0.7)
                 
                 # Add content area border for clarity
@@ -726,11 +710,11 @@ class EnhancedSemanticTracingVisualizer:
             ax.set_title(f"{title}", fontsize=12, pad=10)
             ax.axis("off")
             
-            # DEBUGGING: 生成单独的背景和热力图图像用于调试
+            # Create debug directory for diagnostic images
             debug_dir = os.path.dirname(save_path)
             os.makedirs(debug_dir, exist_ok=True)
             
-            # 保存背景图像
+            # Save background-only image for debugging
             debug_bg_path = os.path.join(debug_dir, f"debug_bg_layer{layer_idx}.png")
             plt.figure(figsize=(8, 8))
             plt.imshow(background_np, origin='upper')
@@ -739,16 +723,16 @@ class EnhancedSemanticTracingVisualizer:
             plt.savefig(debug_bg_path, dpi=150)
             plt.close()
             
-            # 保存热力图
+            # Save heatmap-only image for debugging
             debug_heat_path = os.path.join(debug_dir, f"debug_heat_layer{layer_idx}.png")
             plt.figure(figsize=(8, 8))
             plt.imshow(upscaled_hm, cmap=colormap, origin='upper')
-            plt.title("Heatmap Only")
+            plt.title("Heatmap Only (Before Transparency)")
             plt.axis('off')
             plt.savefig(debug_heat_path, dpi=150)
             plt.close()
             
-            # Save with improved quality
+            # Save final visualization
             fig.tight_layout()
             canvas.draw()
             fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor='white')

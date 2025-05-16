@@ -10,6 +10,7 @@ import torch
 import os
 import gc
 import time
+import numpy as np
 from PIL import Image
 from typing import Dict, Any, Optional, Union, List, Tuple
 from analyzer.heatmap_visualizer import HeatmapVisualizer
