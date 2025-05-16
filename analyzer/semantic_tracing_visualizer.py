@@ -679,7 +679,7 @@ class EnhancedSemanticTracingVisualizer:
             
             # IMPROVED: Apply slight darkening to the background for better contrast with heatmap
             # Convert to float to avoid overflow issues
-            darkened_bg = background_np.astype(float) * 0.85  # Darken by 15%
+            darkened_bg = background_np.astype(float) * 0.45  # Darken by 15%
             darkened_bg = np.clip(darkened_bg, 0, 255).astype(np.uint8)
             
             # Display background image first with FULL opacity
@@ -697,7 +697,7 @@ class EnhancedSemanticTracingVisualizer:
             
             if use_grid_style:
                 # IMPROVED: Use grid-style visualization for consistency with base
-                base_alpha = 0.8  # Higher alpha for better visibility
+                base_alpha = 0.9  # Higher alpha for better visibility
                 cmap = plt.get_cmap(colormap)
                 
                 # Draw grid cells for patch visualization
@@ -713,7 +713,7 @@ class EnhancedSemanticTracingVisualizer:
                             
                             # Apply gamma correction for increased contrast
                             # This makes medium values appear darker, creating more visual contrast
-                            contrast_value = cell_value ** 0.5  # Square root for gamma correction
+                            contrast_value = cell_value ** 0.7  # Square root for gamma correction
                             
                             # Get color with adjusted alpha based on value
                             cell_color = cmap(contrast_value)
@@ -890,7 +890,12 @@ class EnhancedSemanticTracingVisualizer:
         unified_colorscale: bool = False
     ) -> Optional[str]:
         """
-        Arrange each layer's 2D heatmap array into a grid with improved layout and colorscale.
+        Arrange each layer's 2D heatmap array into a grid with improved layout, consistent colorscale,
+        and accurate max value display.
+        
+        This function creates a composite visualization that shows heatmaps for all specified layers
+        in a grid layout. It ensures that layer max values are displayed correctly and consistently
+        whether using a unified color scale or not.
         
         Args:
             heatmap_maps: Dictionary mapping layer index to 2D heatmap array
@@ -900,7 +905,7 @@ class EnhancedSemanticTracingVisualizer:
             cmap: Colormap to use
             show_values: Whether to show cell values
             unified_colorscale: Whether to use same colorscale across all layers
-            
+                
         Returns:
             Path to saved image or None if failed
         """
@@ -919,7 +924,7 @@ class EnhancedSemanticTracingVisualizer:
             if n == 0:
                 print("No valid layers with heatmaps. Cannot create composite.")
                 return None
-    
+
             # Better grid layout calculation
             if n <= 3:
                 ncols, nrows = n, 1
@@ -935,16 +940,19 @@ class EnhancedSemanticTracingVisualizer:
                 nrows = math.ceil(n / ncols)
             
             # Determine global max value if using unified colorscale
-            if unified_colorscale:
-                global_max = 0
-                for L in valid_layers:
-                    hm = heatmap_maps[L]
-                    if hm is not None:
-                        layer_max = np.max(hm)
-                        global_max = max(global_max, layer_max)
-                vmax = global_max
-            else:
-                vmax = None
+            global_max = 0
+            original_max_values = {}  # Store original max values for all layers
+            
+            for L in valid_layers:
+                hm = heatmap_maps[L]
+                if hm is not None:
+                    layer_max = np.max(hm)
+                    original_max_values[L] = layer_max  # Store original max
+                    global_max = max(global_max, layer_max)
+            
+            # For visualization with unified colorscale, we'll use vmax=1.0
+            # For non-unified, we'll use vmax=None to let each heatmap use its own scale
+            vmax_display = 1.0 if unified_colorscale else None
             
             # Create figure with better size calculation based on layout
             subplot_size = 2.5  # Base size of each subplot
@@ -986,13 +994,23 @@ class EnhancedSemanticTracingVisualizer:
                     ax.axis("off")
                     continue
                 
-                # Use consistent vmin/vmax when unified_colorscale is True
-                im = ax.imshow(hm, vmin=0, vmax=vmax, cmap=cmap_inst)
+                # If using unified colorscale, normalize the heatmap values
+                display_hm = hm.copy()
+                if unified_colorscale and global_max > 0:
+                    display_hm = display_hm / global_max  # Normalize to [0,1]
                 
-                # Add layer title with statistics
-                ax_title = f"Layer {L} "
-                if hm.max() > 0:
-                    ax_title += f"(max: {hm.max():.2f})"
+                # Use consistent vmin/vmax when unified_colorscale is True
+                im = ax.imshow(display_hm, vmin=0, vmax=vmax_display, cmap=cmap_inst)
+                
+                # Add layer title with appropriate statistics
+                # Show original max and normalized max (if using unified scale)
+                orig_max = original_max_values.get(L, 0)
+                if unified_colorscale and global_max > 0:
+                    normalized_max = orig_max / global_max
+                    ax_title = f"Layer {L} (max: {orig_max:.2f}, norm: {normalized_max:.2f})"
+                else:
+                    ax_title = f"Layer {L} (max: {orig_max:.2f})"
+                    
                 ax.set_title(ax_title, fontsize=10)
                 
                 # Add grid lines for better visualization
@@ -1007,30 +1025,33 @@ class EnhancedSemanticTracingVisualizer:
                     ax.tick_params(axis='both', which='both', length=0)
                 else:
                     ax.axis("off")
-    
+
                 # Show values in cells if requested
                 if show_values:
-                    H, W = hm.shape
+                    H, W = display_hm.shape
                     if H <= 10 and W <= 10:  # Only for reasonably sized grids
                         for i in range(H):
                             for j in range(W):
-                                val = hm[i, j]
+                                val = display_hm[i, j]
                                 if val > 0.1:  # Only show significant values
                                     ax.text(j, i, f"{val:.2f}",
                                             ha='center', va='center', fontsize=6,
                                             color='white' if val > 0.5 else 'black')
-    
+
             # Add shared colorbar
             if im is not None:
                 # Create a dedicated axis for the colorbar
                 cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
                 cbar = fig.colorbar(im, cax=cbar_ax)
-                cbar.set_label(f"Normalized Influence{' (Unified Scale)' if unified_colorscale else ''}")
-    
+                if unified_colorscale:
+                    cbar.set_label(f"Normalized Influence (0-1 scale)")
+                else:
+                    cbar.set_label(f"Layer-specific Influence")
+
             # Add overall title
             scale_note = " (Unified Color Scale)" if unified_colorscale else ""
             fig.suptitle(f"{title}{scale_note}", fontsize=14, y=0.98)
-    
+
             # Adjust layout and save with improved quality
             fig.tight_layout(rect=[0, 0, 0.9, 0.95])
             canvas.draw()
@@ -1045,6 +1066,7 @@ class EnhancedSemanticTracingVisualizer:
             traceback.print_exc()
             return None
 
+
     def _create_enhanced_composite_with_background(
         self,
         heatmap_maps: Dict[int, Optional[np.ndarray]],
@@ -1056,11 +1078,16 @@ class EnhancedSemanticTracingVisualizer:
         title: str,
         save_path: str,
         colormap: str = "hot",
-        alpha: float = 0.7,
+        alpha: float = 0.9,
         unified_colorscale: bool = False
     ) -> Optional[str]:
         """
-        Create a composite visualization that includes backgrounds for each layer.
+        Create a composite visualization with backgrounds for each layer, ensuring consistent
+        and accurate display of layer max values.
+        
+        This function creates a composite visualization with the original image as background
+        for each layer's heatmap. It ensures that max values are displayed accurately whether
+        using a unified color scale or layer-specific scales.
         
         Args:
             heatmap_maps: Dictionary mapping layer indices to heatmap arrays
@@ -1074,7 +1101,7 @@ class EnhancedSemanticTracingVisualizer:
             colormap: Colormap to use
             alpha: Alpha value for overlays
             unified_colorscale: Whether to use unified color scale across layers
-            
+                
         Returns:
             Path to saved visualization or None if failed
         """
@@ -1083,6 +1110,8 @@ class EnhancedSemanticTracingVisualizer:
             import matplotlib as mpl
             from matplotlib.figure import Figure
             from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+            import numpy as np
+            import math
             
             # Only use valid layers (that have heatmaps)
             valid_layers = [L for L in layers if heatmap_maps.get(L) is not None]
@@ -1106,17 +1135,20 @@ class EnhancedSemanticTracingVisualizer:
                 ncols = math.ceil(math.sqrt(n))
                 nrows = math.ceil(n / ncols)
             
+            # Store both original and normalized max values
+            original_max_values = {}
+            global_max = 0
+            
             # Determine global max value if using unified colorscale
-            if unified_colorscale:
-                global_max = 0
-                for L in valid_layers:
-                    hm = heatmap_maps[L]
-                    if hm is not None:
-                        layer_max = np.max(hm)
-                        global_max = max(global_max, layer_max)
-                vmax = global_max
-            else:
-                vmax = None
+            for L in valid_layers:
+                hm = heatmap_maps[L]
+                if hm is not None:
+                    layer_max = np.max(hm)
+                    original_max_values[L] = layer_max  # Store original max
+                    global_max = max(global_max, layer_max)
+            
+            # For unified colorscale, use normalized values [0,1]
+            # For non-unified, use original values with layer-specific scales
             
             # Create figure with better size calculation based on layout
             subplot_size = 3.5  # Larger size for better visibility of details
@@ -1143,6 +1175,16 @@ class EnhancedSemanticTracingVisualizer:
                 # Create subplot
                 ax = fig.add_subplot(grid[row, col])
                 
+                # If using unified colorscale, normalize values
+                if unified_colorscale and global_max > 0:
+                    # Create a normalized copy for display
+                    display_heatmap = heatmap / global_max
+                    norm_max = original_max_values[layer_idx] / global_max
+                    layer_title = f"Layer {layer_idx} (max: {original_max_values[layer_idx]:.2f}, norm: {norm_max:.2f})"
+                else:
+                    display_heatmap = heatmap  # Use original values
+                    layer_title = f"Layer {layer_idx} (max: {original_max_values[layer_idx]:.2f})"
+                
                 # Determine if working with base or patch features
                 if is_patch:
                     # For patch features
@@ -1163,7 +1205,7 @@ class EnhancedSemanticTracingVisualizer:
                     background_np = np.array(preview)
                     
                     # Apply slight darkening for better contrast
-                    darkened_bg = background_np.astype(float) * 0.85
+                    darkened_bg = background_np.astype(float) * 0.45
                     darkened_bg = np.clip(darkened_bg, 0, 255).astype(np.uint8)
                     
                     # Show background
@@ -1195,7 +1237,7 @@ class EnhancedSemanticTracingVisualizer:
                     
                     for r in range(grid_h):
                         for c in range(grid_w):
-                            val = heatmap[r, c] if r < heatmap.shape[0] and c < heatmap.shape[1] else 0
+                            val = display_heatmap[r, c] if r < display_heatmap.shape[0] and c < display_heatmap.shape[1] else 0
                             
                             if val > 0.01:  # Only draw significant values
                                 # Apply gamma correction for better contrast
@@ -1256,7 +1298,7 @@ class EnhancedSemanticTracingVisualizer:
                     background_np = np.array(resized_background)
                     
                     # Apply slight darkening for better contrast
-                    darkened_bg = background_np.astype(float) * 0.85
+                    darkened_bg = background_np.astype(float) * 0.45
                     darkened_bg = np.clip(darkened_bg, 0, 255).astype(np.uint8)
                     
                     # Show background
@@ -1276,7 +1318,7 @@ class EnhancedSemanticTracingVisualizer:
                     
                     for r in range(grid_h):
                         for c in range(grid_w):
-                            val = heatmap[r, c] if r < heatmap.shape[0] and c < heatmap.shape[1] else 0
+                            val = display_heatmap[r, c] if r < display_heatmap.shape[0] and c < display_heatmap.shape[1] else 0
                             
                             if val > 0.01:  # Only draw significant values
                                 # Apply gamma correction for better contrast
@@ -1306,18 +1348,22 @@ class EnhancedSemanticTracingVisualizer:
                         ax.axvline(x=x, color='white', linestyle='-', linewidth=0.5, alpha=0.5)
                 
                 # Add layer title
-                ax.set_title(f"Layer {layer_idx}", fontsize=10)
+                ax.set_title(layer_title, fontsize=10)
                 ax.axis("off")
             
             # Add colormap legend
             # Create a new axis for the colorbar
             cax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
-            norm = mpl.colors.Normalize(vmin=0, vmax=vmax if vmax is not None else 1.0)
+            norm = mpl.colors.Normalize(vmin=0, vmax=1.0 if unified_colorscale else None)
             cb = mpl.colorbar.ColorbarBase(cax, cmap=plt.get_cmap(colormap), norm=norm)
-            cb.set_label("Influence Weight")
+            if unified_colorscale:
+                cb.set_label("Normalized Influence (0-1 scale)")
+            else:
+                cb.set_label("Layer-specific Influence")
             
             # Add overall title
-            fig.suptitle(f"{title}", fontsize=14, y=0.98)
+            scale_note = " (Unified Color Scale)" if unified_colorscale else ""
+            fig.suptitle(f"{title}{scale_note}", fontsize=14, y=0.98)
             
             # Save with improved quality
             fig.tight_layout(rect=[0, 0, 0.9, 0.95])

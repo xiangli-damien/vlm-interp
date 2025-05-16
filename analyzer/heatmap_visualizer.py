@@ -119,87 +119,6 @@ class HeatmapVisualizer:
         
         # Create visualizer instance (only for its drawing functions)
         self.viz = self._create_visualizer(output_dir=out_dir, debug_mode=debug_mode)
-
-    def _load_dataframe(self) -> None:
-        """
-        Robust CSV loader that properly handles weight columns.
-        1) Forces the weight column to be converted to float type
-        2) Drops rows with NaN values after conversion
-        3) Fails early if all weights are zero or NaN
-        """
-        if not os.path.exists(self.csv_path):
-            raise FileNotFoundError(self.csv_path)
-        
-        df = pd.read_csv(self.csv_path)
-        
-        if self.weight_column not in df.columns:
-            raise KeyError(
-                f"CSV does not contain column '{self.weight_column}', actual columns: {list(df.columns)[:10]}..."
-            )
-        
-        # Force numeric conversion; invalid values → NaN → dropped
-        df[self.weight_column] = pd.to_numeric(df[self.weight_column], errors="coerce")
-        df = df.dropna(subset=[self.weight_column])
-        
-        if df.empty or np.isclose(df[self.weight_column].abs().sum(), 0.0):
-            raise ValueError(
-                f"Column '{self.weight_column}' read results are all 0 / NaN, "
-                "please ensure upstream trace CSV correctly writes importance_weight."
-            )
-        
-        self.df = df.reset_index(drop=True)
-
-    def _draw_overlay(
-        self,
-        layer: int,
-        concept: str,
-        background: Image.Image,
-        pad_left: int,
-        pad_top: int,
-        resized_w: int,
-        resized_h: int,
-        save_path: str,
-        cmap: str = "jet",
-        alpha: float = 0.6,
-        interpolation: str = "nearest",
-    ) -> None:
-        """
-        Generate single layer patch overlay aligned with preview image.
-        - Uses consistent coordinate system with origin='upper' for both background and heatmap
-        - Correctly handles extent parameters to align heatmap with image content area
-        - Ensures proper visibility with appropriate alpha and normalization
-        """
-        heat_norm = self._normalize_weights(layer)  # (H,W)→[0,1]
-        
-        # 1. First upscale (patch_h*ps, patch_w*ps) to content size
-        up = np.repeat(np.repeat(heat_norm, self.raw_patch_size, 0), self.raw_patch_size, 1)
-        up_img = Image.fromarray((up * 255).astype(np.uint8))
-        up_img = up_img.resize((resized_w, resized_h), Image.BILINEAR)
-        heat_vis = np.asarray(up_img, dtype=np.float32) / 255.0
-        
-        fig, ax = plt.subplots(figsize=(8, 8 * background.height / max(1, background.width)))
-        try:
-            ax.imshow(background, origin="upper")
-            
-            # Note: y-axis is reversed in extent coordinates for proper alignment
-            extent = (pad_left, pad_left + resized_w, pad_top + resized_h, pad_top)
-            
-            ax.imshow(
-                heat_vis,
-                cmap=cmap,
-                alpha=alpha,
-                extent=extent,
-                origin="upper",  # Match background orientation
-                interpolation=interpolation,
-                vmin=0,
-                vmax=1,
-            )
-            
-            ax.set_title(f"{concept} • L{layer}", fontsize=11)
-            ax.axis("off")
-            plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        finally:
-            plt.close(fig)
     
     def _create_visualizer(self, output_dir, debug_mode):
         """Create semantic tracing visualizer with custom enhancements"""
@@ -218,7 +137,7 @@ class HeatmapVisualizer:
         Args:
             composite_only: If True, only create composite visualizations
             show_values: Whether to show weight values in cells
-            
+                
         Returns:
             List of paths to generated visualization files
         """
@@ -241,36 +160,38 @@ class HeatmapVisualizer:
         # Set unified colorscale on visualizer
         self.viz.unified_colorscale = self.unified_colorscale
         
-        # Generate standard heatmaps
-        vis_results = self.viz.create_heatmaps_from_csv(
-            trace_data=self.df,
-            target_text=target_text,
-            target_idx=target_idx,
-            image_path=self.image_path,
-            save_dir=self.out_dir,
+        # Generate standard heatmaps (for backwards compatibility)
+        if not self.include_all_token_types:
+            vis_results = self.viz.create_heatmaps_from_csv(
+                trace_data=self.df,
+                target_text=target_text,
+                target_idx=target_idx,
+                image_path=self.image_path,
+                save_dir=self.out_dir,
+                feature_mapping=self.feature_mapping,
+                use_grid_visualization=True,
+                show_values=show_values,
+                composite_only=composite_only,
+                unified_colorscale=self.unified_colorscale
+            )
+            return vis_results
+        
+        # Generate combined visualizations with all token types
+        print("\nGenerating combined visualizations with all token types...")
+        
+        # Create combined heatmaps with all token types
+        combined_heatmaps = self.create_combined_all_token_types_heatmap(
+            df=self.df,
             feature_mapping=self.feature_mapping,
-            use_grid_visualization=True,
-            show_values=show_values,
-            composite_only=composite_only,
-            unified_colorscale=self.unified_colorscale
+            original_image=Image.open(self.image_path),
+            target_idx=target_idx,
+            target_text=target_text,
+            output_dir=self.out_dir,
+            unified_colorscale=self.unified_colorscale,
+            show_values=show_values
         )
         
-        # Generate additional visualizations if requested
-        if self.include_all_token_types:
-            # Create comprehensive token heatmap with all token types
-            token_heatmap_path = self.create_comprehensive_token_heatmap(target_idx, target_text)
-            if token_heatmap_path:
-                vis_results.append(token_heatmap_path)
-            
-            # Create token analysis visualizations
-            analysis_paths = self.create_token_analysis_visualizations()
-            vis_results.extend(analysis_paths)
-        
-        # Print results summary
-        total_files = len(vis_results)
-        print(f"Generated {total_files} heatmap visualization files")
-        
-        return vis_results
+        return combined_heatmaps
     
     def _verify_feature_mapping(self) -> bool:
         """
@@ -304,622 +225,885 @@ class HeatmapVisualizer:
             print("Warning: Missing resized_dimensions in feature mapping")
         
         return base_valid and patch_valid and dims_valid
-    
-    def create_comprehensive_token_heatmap(self, target_idx: int, target_text: str) -> Optional[str]:
+
+    def create_combined_all_token_types_heatmap(
+        self,
+        df: pd.DataFrame,
+        feature_mapping: Dict[str, Any],
+        original_image: Image.Image,
+        target_idx: int,
+        target_text: str,
+        output_dir: str,
+        unified_colorscale: bool = False,
+        show_values: bool = True
+    ) -> List[str]:
         """
-        Create a comprehensive heatmap visualization that includes text, image, and generated tokens.
+        Create comprehensive heatmaps combining base and patch features with all token types 
+        (image, text, generated) for each layer.
+        
+        This creates a visualization with 4 quadrants:
+        - Top-left: Base features visualization with background
+        - Top-right: Patch features visualization with background
+        - Bottom: Token type distribution analysis
         
         Args:
-            target_idx: Index of the target token
+            df: DataFrame containing trace data
+            feature_mapping: Dictionary with feature mapping information
+            original_image: Original image for background
+            target_idx: Target token index
             target_text: Text of the target token
+            output_dir: Directory to save output files
+            unified_colorscale: Whether to use unified color scale across all token types
+            show_values: Whether to show values in cells
             
         Returns:
-            Path to the generated visualization file, or None if failed
+            List of saved file paths
         """
-        try:
-            import matplotlib.pyplot as plt
-            import numpy as np
-            from matplotlib import gridspec
-            
-            # Create output directory
-            comp_dir = os.path.join(self.out_dir, "comprehensive_heatmaps")
-            os.makedirs(comp_dir, exist_ok=True)
-            
-            # Divide tokens by their types
-            text_tokens = self.df[self.df["token_type"] == 1]
-            image_tokens = self.df[self.df["token_type"] == 2]
-            generated_tokens = self.df[self.df["token_type"] == 0]
-            
-            # Group by token index and get the maximum importance weight
-            grouped_text = text_tokens.groupby("token_index").agg({
-                "token_text": "first", 
-                "importance_weight": "max",
-                "layer": "first"  # Keep layer info for sorting
-            }).reset_index()
-            
-            grouped_image = image_tokens.groupby("token_index").agg({
-                "token_text": "first", 
-                "importance_weight": "max",
-                "layer": "first"
-            }).reset_index()
-            
-            grouped_generated = generated_tokens.groupby("token_index").agg({
-                "token_text": "first", 
-                "importance_weight": "max",
-                "layer": "first"
-            }).reset_index()
-            
-            # Sort by token index
-            grouped_text = grouped_text.sort_values("token_index")
-            grouped_image = grouped_image.sort_values("token_index")
-            grouped_generated = grouped_generated.sort_values("token_index")
-            
-            # Get counts
-            n_text = len(grouped_text)
-            n_image = len(grouped_image)
-            n_generated = len(grouped_generated)
-            
-            # Determine global max for unified color scale
-            all_weights = np.concatenate([
-                grouped_text["importance_weight"].values,
-                grouped_image["importance_weight"].values,
-                grouped_generated["importance_weight"].values
-            ])
-            global_max = np.max(all_weights) if len(all_weights) > 0 else 1.0
-            
-            # Create figure with gridspec for better layout control
-            fig = plt.figure(figsize=(12, 10), facecolor='white')
-            gs = gridspec.GridSpec(3, 1, height_ratios=[2, 4, 2])
-            
-            # 1. Text tokens section
-            # 1. Text tokens section
-            ax_text = plt.subplot(gs[0])
-            if n_text > 0:
-                # Create a matrix for text tokens (1 row x n_text columns)
-                text_matrix = grouped_text["importance_weight"].values.reshape(1, -1)
-                
-                # Plot text token heatmap
-                im_text = ax_text.imshow(
-                    text_matrix, 
-                    aspect='auto', 
-                    cmap='viridis',
-                    vmin=0,
-                    vmax=global_max if self.unified_colorscale else None
-                )
-                
-                # Add token text as x-tick labels
-                ax_text.set_xticks(range(n_text))
-                ax_text.set_xticklabels(
-                    grouped_text["token_text"], 
-                    rotation=45, 
-                    ha="right", 
-                    fontsize=8
-                )
-                ax_text.set_yticks([])
-                ax_text.set_title("Text Tokens Importance Weights", fontsize=10)
-            else:
-                ax_text.text(0.5, 0.5, "No text tokens", ha='center', va='center')
-                ax_text.axis('off')
-            
-            # 2. Image tokens section (in a grid if possible)
-            ax_image = plt.subplot(gs[1])
-            if n_image > 0:
-                # Try to arrange in a grid if we have feature mapping
-                if self.feature_mapping and "base_feature" in self.feature_mapping:
-                    # Get grid dimensions
-                    grid_h, grid_w = self.feature_mapping["base_feature"].get("grid", (1, n_image))
-                    
-                    # Create an empty grid
-                    img_matrix = np.zeros((grid_h, grid_w))
-                    
-                    # Fill in values from positions
-                    positions = self.feature_mapping["base_feature"].get("positions", {})
-                    for idx, row in grouped_image.iterrows():
-                        token_idx = row["token_index"]
-                        # Convert string positions back to integers
-                        pos = None
-                        if str(token_idx) in positions:
-                            pos = positions[str(token_idx)]
-                        elif token_idx in positions:
-                            pos = positions[token_idx]
-                            
-                        if pos:
-                            r, c = pos
-                            if 0 <= r < grid_h and 0 <= c < grid_w:
-                                img_matrix[r, c] = row["importance_weight"]
-                else:
-                    # Simple 1D layout if no grid mapping
-                    grid_h, grid_w = 1, n_image
-                    img_matrix = grouped_image["importance_weight"].values.reshape(1, -1)
-                
-                # Load and display the background image
-                try:
-                    from PIL import Image
-                    bg_img = Image.open(self.image_path)
-                    ax_image.imshow(bg_img, aspect='equal', alpha=0.5)
-                    
-                    # Overlay heatmap
-                    im_img = ax_image.imshow(
-                        img_matrix,
-                        aspect='auto',
-                        cmap='hot',
-                        alpha=0.7,
-                        vmin=0,
-                        vmax=global_max if self.unified_colorscale else None
-                    )
-                except Exception as e:
-                    print(f"Error loading image: {e}")
-                    # Fallback to just the heatmap
-                    im_img = ax_image.imshow(
-                        img_matrix,
-                        aspect='auto',
-                        cmap='hot',
-                        vmin=0,
-                        vmax=global_max if self.unified_colorscale else None
-                    )
-                
-                ax_image.set_title("Image Tokens Importance (Overlay)", fontsize=10)
-                ax_image.axis('off')
-            else:
-                ax_image.text(0.5, 0.5, "No image tokens", ha='center', va='center')
-                ax_image.axis('off')
-            
-            # 3. Generated tokens section
-            ax_gen = plt.subplot(gs[2])
-            if n_generated > 0:
-                # Create a matrix for generated tokens (1 row x n_generated columns)
-                gen_matrix = grouped_generated["importance_weight"].values.reshape(1, -1)
-                
-                # Plot generated token heatmap
-                im_gen = ax_gen.imshow(
-                    gen_matrix, 
-                    aspect='auto', 
-                    cmap='plasma',
-                    vmin=0,
-                    vmax=global_max if self.unified_colorscale else None
-                )
-                
-                # Add token text as x-tick labels
-                ax_gen.set_xticks(range(n_generated))
-                ax_gen.set_xticklabels(
-                    grouped_generated["token_text"], 
-                    rotation=45, 
-                    ha="right", 
-                    fontsize=8
-                )
-                ax_gen.set_yticks([])
-                ax_gen.set_title("Generated Tokens Importance Weights", fontsize=10)
-            else:
-                ax_gen.text(0.5, 0.5, "No generated tokens", ha='center', va='center')
-                ax_gen.axis('off')
-            
-            # Add shared colorbar
-            cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
-            colorbar = plt.colorbar(im_image if 'im_image' in locals() else 
-                                    (im_text if 'im_text' in locals() else 
-                                     im_gen if 'im_gen' in locals() else None), 
-                                   cax=cbar_ax)
-            colorbar.set_label('Importance Weight')
-            
-            # Set overall title
-            plt.suptitle(f"Comprehensive Token Importance for Target '{target_text}' (idx: {target_idx})", 
-                         fontsize=14)
-            
-            # Adjust layout and save
-            plt.tight_layout(rect=[0, 0, 0.9, 0.95])  # Make room for suptitle and colorbar
-            out_path = os.path.join(comp_dir, f"comprehensive_heatmap_{target_idx}.png")
-            plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor='white')
-            plt.close(fig)
-            
-            print(f"Created comprehensive token heatmap: {out_path}")
-            return out_path
-            
-        except Exception as e:
-            print(f"Error creating comprehensive token heatmap: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-    
-    def create_token_analysis_visualizations(self) -> List[str]:
-        """
-        Create additional visualizations analyzing token usage patterns.
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import os
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
         
-        Returns:
-            List of paths to generated visualization files
-        """
-        output_files = []
+        saved_paths = []
         
         # Create output directory
-        analysis_dir = os.path.join(self.out_dir, "token_analysis")
-        os.makedirs(analysis_dir, exist_ok=True)
+        combined_dir = os.path.join(output_dir, "combined_heatmaps")
+        os.makedirs(combined_dir, exist_ok=True)
         
-        try:
-            import matplotlib.pyplot as plt
-            import seaborn as sns
-            
-            # 1. Token frequency and importance visualization
-            vis_path = self._create_token_frequency_importance_plot(analysis_dir)
-            if vis_path:
-                output_files.append(vis_path)
-            
-            # 2. Layer-wise token importance patterns
-            vis_path = self._create_layerwise_importance_plot(analysis_dir)
-            if vis_path:
-                output_files.append(vis_path)
-            
-            # 3. Token type distribution
-            vis_path = self._create_token_type_distribution_plot(analysis_dir)
-            if vis_path:
-                output_files.append(vis_path)
-            
-            # 4. Correlation between predicted probability and importance
-            vis_path = self._create_probability_importance_correlation_plot(analysis_dir)
-            if vis_path:
-                output_files.append(vis_path)
-            
-        except Exception as e:
-            print(f"Error creating token analysis visualizations: {e}")
-            import traceback
-            traceback.print_exc()
+        # Get unique layers
+        layers = sorted(df["layer"].unique())
         
-        return output_files
-    
-    def _create_token_frequency_importance_plot(self, save_dir: str) -> Optional[str]:
-        """
-        Create a visualization showing token frequency vs. importance.
-        
-        Args:
-            save_dir: Directory to save the visualization
+        # Process each layer
+        for layer_idx in layers:
+            # Filter data for this layer
+            layer_df = df[df["layer"] == layer_idx]
             
-        Returns:
-            Path to the saved visualization, or None if failed
-        """
-        try:
-            import matplotlib.pyplot as plt
-            import seaborn as sns
-            import pandas as pd
-            
-            # Group by token index to get frequency and average importance
-            token_stats = self.df.groupby(['token_index', 'token_text', 'token_type']).agg({
-                'importance_weight': ['mean', 'max', 'count']
-            }).reset_index()
-            
-            # Flatten the column names
-            token_stats.columns = ['_'.join(col) if col[1] else col[0] for col in token_stats.columns.values]
-            
-            # Rename to more intuitive column names
-            token_stats = token_stats.rename(columns={
-                'importance_weight_mean': 'avg_importance',
-                'importance_weight_max': 'max_importance',
-                'importance_weight_count': 'frequency'
-            })
-            
-            # Create figure
-            plt.figure(figsize=(12, 8))
-            
-            # Color mapping for token types
-            token_type_colors = {0: 'green', 1: 'blue', 2: 'red'}
-            token_type_labels = {0: 'Generated', 1: 'Text', 2: 'Image'}
-            
-            # Create scatter plot
-            for token_type, color in token_type_colors.items():
-                subset = token_stats[token_stats['token_type'] == token_type]
-                if len(subset) > 0:
-                    plt.scatter(
-                        subset['frequency'], 
-                        subset['max_importance'],
-                        c=color, 
-                        alpha=0.7,
-                        s=subset['frequency'] * 20,  # Size based on frequency
-                        label=token_type_labels[token_type]
-                    )
-            
-            # Add labels for top tokens
-            top_tokens = token_stats.nlargest(10, 'max_importance')
-            for _, row in top_tokens.iterrows():
-                plt.annotate(
-                    row['token_text'],
-                    xy=(row['frequency'], row['max_importance']),
-                    xytext=(5, 5),
-                    textcoords='offset points',
-                    fontsize=8,
-                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8)
-                )
-            
-            # Set axis labels and title
-            plt.xlabel('Token Frequency (Count across Layers)')
-            plt.ylabel('Maximum Importance Weight')
-            plt.title('Token Frequency vs. Importance Analysis')
-            plt.grid(True, linestyle='--', alpha=0.7)
-            plt.legend(title="Token Type")
-            
-            # Save figure
-            out_path = os.path.join(save_dir, 'token_frequency_importance.png')
-            plt.tight_layout()
-            plt.savefig(out_path, dpi=150)
-            plt.close()
-            
-            print(f"Created token frequency vs. importance plot: {out_path}")
-            return out_path
-            
-        except Exception as e:
-            print(f"Error creating token frequency vs. importance plot: {e}")
-            return None
-    
-    def _create_layerwise_importance_plot(self, save_dir: str) -> Optional[str]:
-        """
-        Create a visualization showing how token importance changes across layers.
-        
-        Args:
-            save_dir: Directory to save the visualization
-            
-        Returns:
-            Path to the saved visualization, or None if failed
-        """
-        try:
-            import matplotlib.pyplot as plt
-            import seaborn as sns
-            import pandas as pd
-            
-            # Get all layers
-            layers = sorted(self.df['layer'].unique())
-            
-            # Find top tokens by maximum importance
-            top_tokens = self.df.groupby('token_index').agg({
-                'token_text': 'first',
-                'token_type': 'first',
-                'importance_weight': 'max'
-            }).nlargest(8, 'importance_weight')
-            
-            # Create figure
-            plt.figure(figsize=(12, 8))
-            
-            # Color mapping for token types
-            token_type_colors = {0: 'green', 1: 'blue', 2: 'red'}
-            token_type_markers = {0: 'o', 1: 's', 2: '^'}
-            
-            # For each top token, plot importance across layers
-            for _, row in top_tokens.iterrows():
-                token_idx = row.name
-                token_text = row['token_text']
-                token_type = row['token_type']
+            # Skip if no data for this layer
+            if layer_df.empty:
+                print(f"No data for layer {layer_idx}. Skipping.")
+                continue
                 
-                # Get importance values across layers
-                layer_values = []
-                for layer in layers:
-                    layer_row = self.df[(self.df['token_index'] == token_idx) & 
-                                        (self.df['layer'] == layer)]
-                    if not layer_row.empty:
-                        layer_values.append(layer_row['importance_weight'].iloc[0])
-                    else:
-                        layer_values.append(0)
-                
-                # Plot line for this token
-                plt.plot(
-                    layers, 
-                    layer_values,
-                    marker=token_type_markers[token_type],
-                    color=token_type_colors[token_type],
-                    label=f"{token_text} (idx: {token_idx})",
-                    alpha=0.8,
-                    linewidth=2
-                )
+            print(f"Creating combined heatmap for layer {layer_idx}")
             
-            # Set axis labels and title
-            plt.xlabel('Layer')
-            plt.ylabel('Importance Weight')
-            plt.title('Layer-wise Token Importance Patterns for Top Tokens')
-            plt.grid(True, linestyle='--', alpha=0.7)
-            plt.legend(title="Tokens", bbox_to_anchor=(1.05, 1), loc='upper left')
+            # Divide tokens by their types
+            text_tokens = layer_df[layer_df["token_type"] == 1]
+            image_tokens = layer_df[layer_df["token_type"] == 2]
+            generated_tokens = layer_df[layer_df["token_type"] == 0]
             
-            # Save figure
-            out_path = os.path.join(save_dir, 'layerwise_importance_patterns.png')
-            plt.tight_layout()
-            plt.savefig(out_path, dpi=150, bbox_inches="tight")
-            plt.close()
+            # Determine global max value for unified color scale if requested
+            if unified_colorscale:
+                all_importance = layer_df["importance_weight"].values
+                global_max = all_importance.max() if len(all_importance) > 0 else 1.0
+                print(f"Using unified color scale with global maximum: {global_max:.4f}")
+            else:
+                global_max = None
             
-            print(f"Created layer-wise importance patterns plot: {out_path}")
-            return out_path
+            # Create figure with a 2x2 grid layout
+            fig = Figure(figsize=(20, 16), dpi=100, facecolor='white')
+            canvas = FigureCanvas(fig)
             
-        except Exception as e:
-            print(f"Error creating layer-wise importance patterns plot: {e}")
-            return None
-    
-    def _create_token_type_distribution_plot(self, save_dir: str) -> Optional[str]:
-        """
-        Create a visualization showing the distribution of token types and their importance.
+            # Create a 2x2 grid of subplots
+            grid = fig.add_gridspec(2, 2, height_ratios=[3, 1])
+            
+            # 1. Top-left: Base features visualization (with background)
+            ax_base = fig.add_subplot(grid[0, 0])
+            base_heatmap = self._create_base_features_heatmap_for_layer(
+                layer_df=layer_df, 
+                feature_mapping=feature_mapping,
+                original_image=original_image,
+                ax=ax_base,
+                layer_idx=layer_idx,
+                global_max=global_max if unified_colorscale else None,
+                show_values=show_values
+            )
+            
+            # 2. Top-right: Patch features visualization (with background)
+            ax_patch = fig.add_subplot(grid[0, 1])
+            patch_heatmap = self._create_patch_features_heatmap_for_layer(
+                layer_df=layer_df, 
+                feature_mapping=feature_mapping,
+                original_image=original_image,
+                ax=ax_patch,
+                layer_idx=layer_idx,
+                global_max=global_max if unified_colorscale else None,
+                show_values=show_values
+            )
+            
+            # 3. Bottom: Token importance distribution
+            ax_dist = fig.add_subplot(grid[1, :])
+            self._create_token_distribution_for_layer(
+                layer_df=layer_df,
+                ax=ax_dist,
+                layer_idx=layer_idx,
+                global_max=global_max if unified_colorscale else None
+            )
+            
+            # Set overall title
+            scale_note = " (Unified Scale)" if unified_colorscale else ""
+            fig.suptitle(
+                f"Layer {layer_idx} - Combined Base and Patch Features with All Token Types{scale_note}\n"
+                f"Target: '{target_text}' (idx: {target_idx})", 
+                fontsize=16
+            )
+            
+            # Save the figure
+            out_path = os.path.join(combined_dir, f"combined_all_tokens_layer{layer_idx}.png")
+            fig.tight_layout(rect=[0, 0, 1, 0.95])  # Adjust for the title
+            canvas.draw()
+            fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor='white')
+            plt.close(fig)
+            
+            saved_paths.append(out_path)
+            print(f"Created combined heatmap for layer {layer_idx} at {out_path}")
         
-        Args:
-            save_dir: Directory to save the visualization
-            
-        Returns:
-            Path to the saved visualization, or None if failed
-        """
-        try:
-            import matplotlib.pyplot as plt
-            import seaborn as sns
-            
-            # Create figure with two subplots
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-            
-            # Token type labels
-            token_type_labels = {0: 'Generated', 1: 'Text', 2: 'Image'}
-            token_type_colors = {0: 'green', 1: 'blue', 2: 'red'}
-            
-            # 1. Distribution of token counts by type
-            token_counts = self.df.groupby(['layer', 'token_type']).size().reset_index(name='count')
-            
-            # Pivot for stacked bar chart
-            pivot_counts = token_counts.pivot(index='layer', columns='token_type', values='count').fillna(0)
-            
-            # Ensure all token types are represented
-            for token_type in [0, 1, 2]:
-                if token_type not in pivot_counts.columns:
-                    pivot_counts[token_type] = 0
-            
-            # Sort columns for consistent order
-            pivot_counts = pivot_counts.reindex(sorted(pivot_counts.columns), axis=1)
-            
-            # Create stacked bar chart
-            pivot_counts.plot(
-                kind='bar', 
-                stacked=True, 
-                ax=ax1,
-                color=[token_type_colors.get(col, 'gray') for col in pivot_counts.columns]
+        # Create a composite image with all layers in a grid
+        if saved_paths:
+            composite_path = self._create_all_layers_composite(
+                saved_paths=saved_paths,
+                layers=layers,
+                output_dir=combined_dir,
+                target_idx=target_idx,
+                target_text=target_text,
+                unified_colorscale=unified_colorscale
             )
-            
-            # Replace numeric token types with labels in legend
-            handles, labels = ax1.get_legend_handles_labels()
-            ax1.legend(
-                handles, 
-                [token_type_labels.get(int(float(label)), f'Type {label}') for label in labels],
-                title="Token Type"
-            )
-            
-            ax1.set_xlabel('Layer')
-            ax1.set_ylabel('Token Count')
-            ax1.set_title('Distribution of Token Types Across Layers')
-            ax1.grid(axis='y', linestyle='--', alpha=0.7)
-            
-            # 2. Boxplot of importance by token type
-            sns.boxplot(
-                x='token_type', 
-                y='importance_weight', 
-                data=self.df,
-                palette=token_type_colors,
-                ax=ax2
-            )
-            
-            ax2.set_xlabel('Token Type')
-            ax2.set_ylabel('Importance Weight')
-            ax2.set_title('Distribution of Importance Weights by Token Type')
-            ax2.set_xticklabels([token_type_labels.get(i, f'Type {i}') for i in sorted(token_type_labels.keys())])
-            ax2.grid(axis='y', linestyle='--', alpha=0.7)
-            
-            # Save figure
-            plt.tight_layout()
-            out_path = os.path.join(save_dir, 'token_type_distribution.png')
-            plt.savefig(out_path, dpi=150)
-            plt.close()
-            
-            print(f"Created token type distribution plot: {out_path}")
-            return out_path
-            
-        except Exception as e:
-            print(f"Error creating token type distribution plot: {e}")
-            return None
-    
-    def _create_probability_importance_correlation_plot(self, save_dir: str) -> Optional[str]:
-        """
-        Create a visualization showing the correlation between predicted probability and importance weight.
+            if composite_path:
+                saved_paths.append(composite_path)
         
-        Args:
-            save_dir: Directory to save the visualization
-            
-        Returns:
-            Path to the saved visualization, or None if failed
-        """
-        try:
-            import matplotlib.pyplot as plt
-            import seaborn as sns
-            
-            # Check if we have prediction probability data
-            if 'predicted_top_prob' not in self.df.columns:
-                print("No predicted_top_prob column found for correlation analysis")
-                return None
-            
-            # Create figure
-            plt.figure(figsize=(10, 8))
-            
-            # Token type labels and colors
-            token_type_labels = {0: 'Generated', 1: 'Text', 2: 'Image'}
-            token_type_colors = {0: 'green', 1: 'blue', 2: 'red'}
-            
-            # Create scatter plot with regression line for each token type
-            for token_type, color in token_type_colors.items():
-                subset = self.df[self.df['token_type'] == token_type]
-                if len(subset) > 0:
-                    sns.regplot(
-                        x='predicted_top_prob',
-                        y='importance_weight',
-                        data=subset,
-                        scatter_kws={'alpha': 0.5, 's': 20},
-                        line_kws={'color': color, 'lw': 2},
-                        color=color,
-                        label=token_type_labels[token_type]
-                    )
-            
-            # Calculate overall correlation
-            correlation = self.df['predicted_top_prob'].corr(self.df['importance_weight'])
-            
-            # Set axis labels and title
-            plt.xlabel('Predicted Top Token Probability')
-            plt.ylabel('Importance Weight')
-            plt.title(f'Correlation between Prediction Probability and Importance Weight\nOverall r = {correlation:.3f}')
-            plt.grid(True, linestyle='--', alpha=0.7)
-            plt.legend(title="Token Type")
-            
-            # Save figure
-            out_path = os.path.join(save_dir, 'probability_importance_correlation.png')
-            plt.tight_layout()
-            plt.savefig(out_path, dpi=150)
-            plt.close()
-            
-            print(f"Created probability-importance correlation plot: {out_path}")
-            return out_path
-            
-        except Exception as e:
-            print(f"Error creating probability-importance correlation plot: {e}")
-            return None
+        return saved_paths
 
-def run_multi_target_heatmap_analysis(
-    trace_csv: str,
-    metadata_json: str,
-    image_path: str,
-    output_dir: str,
-    target_indices: Optional[List[int]] = None,
-    weight_column: str = "importance_weight",
-    composite_only: bool = True,
-    unified_colorscale: bool = False,
-    include_all_token_types: bool = False,
-    debug: bool = False
-) -> Dict[int, List[str]]:
-    """
-    Run heatmap analysis for multiple target tokens in the trace.
-    
-    Args:
-        trace_csv: Path to CSV file with trace data
-        metadata_json: Path to metadata JSON file
-        image_path: Path to the image
-        output_dir: Directory to save results
-        target_indices: Specific target token indices to analyze (None for all)
-        weight_column: Column to use for importance weights
-        composite_only: Whether to only generate composite visualizations
-        unified_colorscale: Whether to use unified color scale across layers
-        include_all_token_types: Whether to include text and generated tokens
-        debug: Whether to print debug information
+    def _create_base_features_heatmap_for_layer(
+        self,
+        layer_df: pd.DataFrame,
+        feature_mapping: Dict[str, Any],
+        original_image: Image.Image,
+        ax,
+        layer_idx: int,
+        global_max: Optional[float] = None,
+        show_values: bool = True
+    ) -> bool:
+        """
+        Create base features heatmap for a specific layer with all token types.
         
-    Returns:
-        Dictionary mapping target indices to lists of generated visualization paths
-    """
-    hv = HeatmapVisualizer(
-        csv_path=trace_csv,
-        metadata_path=metadata_json,
-        image_path=image_path,
-        out_dir=output_dir,
-        weight_column=weight_column,
-        debug_mode=debug
-    )
-    
-    # Configure visualizer
-    hv.unified_colorscale = unified_colorscale
-    hv.include_all_token_types = include_all_token_types
-    
-    # Run multi-target analysis
-    results = hv.run_multi_target(
-        target_indices=target_indices,
-        composite_only=composite_only,
-        show_values=not composite_only
-    )
-    
-    return results
+        Args:
+            layer_df: DataFrame with layer-specific trace data
+            feature_mapping: Dictionary with feature mapping information
+            original_image: Original image for background
+            ax: Matplotlib axis for plotting
+            layer_idx: Layer index
+            global_max: Maximum value for colormap normalization (for unified scale)
+            show_values: Whether to show values in cells
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        # Get base feature mapping
+        bf = feature_mapping.get("base_feature", {})
+        if not bf:
+            ax.text(0.5, 0.5, "No base feature mapping available", ha='center', va='center', fontsize=12)
+            ax.axis('off')
+            return False
+        
+        # Get grid dimensions
+        grid_h, grid_w = bf.get("grid", (0, 0))
+        if grid_h == 0 or grid_w == 0:
+            ax.text(0.5, 0.5, "Invalid grid dimensions", ha='center', va='center', fontsize=12)
+            ax.axis('off')
+            return False
+        
+        # Use consistent size for base images
+        target_size = (336, 336)
+        
+        # Resize image for background
+        if original_image.mode != 'RGB':
+            resized_background = original_image.convert('RGB').resize(target_size, Image.LANCZOS)
+        else:
+            resized_background = original_image.resize(target_size, Image.LANCZOS)
+        
+        background_np = np.array(resized_background)
+        
+        # Apply slight darkening for better contrast
+        darkened_bg = background_np.astype(float) * 0.45
+        darkened_bg = np.clip(darkened_bg, 0, 255).astype(np.uint8)
+        
+        # Show background
+        ax.imshow(
+            darkened_bg,
+            extent=(0, target_size[0], target_size[1], 0),
+            aspect='auto',
+            origin='upper'
+        )
+        
+        # Calculate cell dimensions
+        cell_height = target_size[1] / grid_h
+        cell_width = target_size[0] / grid_w
+        
+        # Get token data divided by types
+        text_tokens = layer_df[layer_df["token_type"] == 1]
+        image_tokens = layer_df[layer_df["token_type"] == 2]
+        generated_tokens = layer_df[layer_df["token_type"] == 0]
+        
+        # Get token positions mapped to the grid
+        token_to_position = {}
+        token_to_type = {}
+        token_to_weight = {}
+        
+        # For each token type, extract positions and weights
+        for token_type, tokens_df in [
+            (2, image_tokens),    # Image tokens
+            (1, text_tokens),     # Text tokens
+            (0, generated_tokens) # Generated tokens
+        ]:
+            for _, row in tokens_df.iterrows():
+                token_idx = row["token_index"]
+                weight = row["importance_weight"]
+                
+                # Skip tokens with zero importance
+                if weight <= 0:
+                    continue
+                    
+                # Map token index to position in grid
+                pos = None
+                if str(token_idx) in bf["positions"]:
+                    pos = bf["positions"][str(token_idx)]
+                elif token_idx in bf["positions"]:
+                    pos = bf["positions"][token_idx]
+                    
+                if pos:
+                    r, c = pos
+                    if 0 <= r < grid_h and 0 <= c < grid_w:
+                        # Store position, type and weight
+                        token_to_position[token_idx] = (r, c)
+                        token_to_type[token_idx] = token_type
+                        
+                        # If same token appears multiple times, keep the maximum weight
+                        if token_idx in token_to_weight:
+                            token_to_weight[token_idx] = max(token_to_weight[token_idx], weight)
+                        else:
+                            token_to_weight[token_idx] = weight
+        
+        # If using unified scale, normalize weights
+        if global_max and global_max > 0:
+            for token_idx in token_to_weight:
+                token_to_weight[token_idx] = token_to_weight[token_idx] / global_max
+        
+        # Set colormaps for different token types
+        cmap_image = plt.get_cmap('hot')      # Red-yellow for image tokens
+        cmap_text = plt.get_cmap('Blues')     # Blue for text tokens
+        cmap_generated = plt.get_cmap('Greens')  # Green for generated tokens
+        
+        # Draw tokens on the grid
+        for token_idx, pos in token_to_position.items():
+            r, c = pos
+            token_type = token_to_type[token_idx]
+            weight = token_to_weight[token_idx]
+            
+            # Skip tokens with very low weight
+            if weight < 0.01:
+                continue
+                
+            # Calculate cell position
+            x_start = c * cell_width
+            y_start = r * cell_height
+            
+            # Apply gamma correction for better contrast
+            contrast_val = weight ** 0.5
+            
+            # Choose colormap based on token type
+            if token_type == 2:  # Image token
+                cmap = cmap_image
+                edgecolor = 'white'
+            elif token_type == 1:  # Text token
+                cmap = cmap_text
+                edgecolor = 'lightblue'
+            else:  # Generated token
+                cmap = cmap_generated
+                edgecolor = 'lightgreen'
+            
+            # Create colored rectangle
+            rect = plt.Rectangle(
+                (x_start, y_start),
+                cell_width, cell_height,
+                facecolor=cmap(contrast_val),
+                edgecolor=edgecolor,
+                linewidth=0.5 if weight > 0.5 else 0,
+                alpha=min(0.8, contrast_val + 0.3)
+            )
+            ax.add_patch(rect)
+            
+            # Show weight value if requested
+            if show_values and weight > 0.2:
+                cell_center_x = x_start + cell_width / 2
+                cell_center_y = y_start + cell_height / 2
+                ax.text(
+                    cell_center_x, cell_center_y,
+                    f"{weight:.2f}",
+                    ha='center', va='center',
+                    fontsize=7,
+                    color='white' if weight > 0.4 else 'black',
+                    weight='bold'
+                )
+        
+        # Add grid lines
+        for i in range(grid_h + 1):
+            y = i * cell_height
+            ax.axhline(y=y, color='white', linestyle='-', linewidth=0.5, alpha=0.5)
+        
+        for i in range(grid_w + 1):
+            x = i * cell_width
+            ax.axvline(x=x, color='white', linestyle='-', linewidth=0.5, alpha=0.5)
+        
+        # Add legend
+        import matplotlib.patches as mpatches
+        legend_handles = []
+        
+        # Count tokens of each type for legend
+        img_count = len(image_tokens)
+        text_count = len(text_tokens)
+        gen_count = len(generated_tokens)
+        
+        # Add legend entries only for token types that are present
+        if img_count > 0:
+            max_img_weight = image_tokens["importance_weight"].max() if not image_tokens.empty else 0
+            if global_max and global_max > 0:
+                norm_max_img = max_img_weight / global_max
+                img_label = f"Image Tokens ({img_count}) - Max: {max_img_weight:.3f}, Norm: {norm_max_img:.3f}"
+            else:
+                img_label = f"Image Tokens ({img_count}) - Max: {max_img_weight:.3f}"
+            legend_handles.append(mpatches.Patch(color=cmap_image(0.7), label=img_label))
+            
+        if text_count > 0:
+            max_text_weight = text_tokens["importance_weight"].max() if not text_tokens.empty else 0
+            if global_max and global_max > 0:
+                norm_max_text = max_text_weight / global_max
+                text_label = f"Text Tokens ({text_count}) - Max: {max_text_weight:.3f}, Norm: {norm_max_text:.3f}"
+            else:
+                text_label = f"Text Tokens ({text_count}) - Max: {max_text_weight:.3f}"
+            legend_handles.append(mpatches.Patch(color=cmap_text(0.7), label=text_label))
+            
+        if gen_count > 0:
+            max_gen_weight = generated_tokens["importance_weight"].max() if not generated_tokens.empty else 0
+            if global_max and global_max > 0:
+                norm_max_gen = max_gen_weight / global_max
+                gen_label = f"Generated Tokens ({gen_count}) - Max: {max_gen_weight:.3f}, Norm: {norm_max_gen:.3f}"
+            else:
+                gen_label = f"Generated Tokens ({gen_count}) - Max: {max_gen_weight:.3f}"
+            legend_handles.append(mpatches.Patch(color=cmap_generated(0.7), label=gen_label))
+        
+        # Add legend to plot
+        if legend_handles:
+            ax.legend(
+                handles=legend_handles,
+                loc='upper center',
+                bbox_to_anchor=(0.5, -0.05),
+                fancybox=True,
+                shadow=True,
+                ncol=min(3, len(legend_handles))
+            )
+        
+        # Set title
+        ax.set_title(f"Base Features - Layer {layer_idx}", fontsize=12)
+        ax.axis('off')
+        
+        return True
+
+    def _create_patch_features_heatmap_for_layer(
+        self,
+        layer_df: pd.DataFrame,
+        feature_mapping: Dict[str, Any],
+        original_image: Image.Image,
+        ax,
+        layer_idx: int,
+        global_max: Optional[float] = None,
+        show_values: bool = True
+    ) -> bool:
+        """
+        Create patch features heatmap for a specific layer with all token types.
+        
+        Args:
+            layer_df: DataFrame with layer-specific trace data
+            feature_mapping: Dictionary with feature mapping information
+            original_image: Original image for background
+            ax: Matplotlib axis for plotting
+            layer_idx: Layer index
+            global_max: Maximum value for colormap normalization (for unified scale)
+            show_values: Whether to show values in cells
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        # Get patch feature mapping
+        pf = feature_mapping.get("patch_feature", {})
+        if not pf:
+            ax.text(0.5, 0.5, "No patch feature mapping available", ha='center', va='center', fontsize=12)
+            ax.axis('off')
+            return False
+        
+        # Get grid dimensions
+        grid_h, grid_w = pf.get("grid_unpadded", (0, 0))
+        if grid_h == 0 or grid_w == 0:
+            ax.text(0.5, 0.5, "Invalid grid dimensions", ha='center', va='center', fontsize=12)
+            ax.axis('off')
+            return False
+        
+        # Create preview image for background
+        preview = original_image.copy()
+        if "resized_dimensions" in feature_mapping:
+            w, h = feature_mapping["resized_dimensions"]
+            preview = preview.resize((w, h), Image.LANCZOS)
+        
+        preview_w, preview_h = preview.size
+        background_np = np.array(preview)
+        
+        # Apply slight darkening for better contrast
+        darkened_bg = background_np.astype(float) * 0.45
+        darkened_bg = np.clip(darkened_bg, 0, 255).astype(np.uint8)
+        
+        # Show background
+        ax.imshow(
+            darkened_bg,
+            extent=(0, preview_w, preview_h, 0),
+            aspect='equal',
+            origin='upper'
+        )
+        
+        # Calculate padding
+        resized_dims_wh = feature_mapping.get("resized_dimensions", (0, 0))
+        if resized_dims_wh == (0, 0):
+            resized_w_actual, resized_h_actual = preview_w, preview_h
+        else:
+            resized_w_actual, resized_h_actual = resized_dims_wh
+        
+        pad_h_total = preview_h - resized_h_actual
+        pad_w_total = preview_w - resized_w_actual
+        pad_top = max(0, pad_h_total // 2)
+        pad_left = max(0, pad_w_total // 2)
+        
+        # Calculate cell dimensions
+        cell_height = resized_h_actual / grid_h
+        cell_width = resized_w_actual / grid_w
+        
+        # Get token data divided by types
+        text_tokens = layer_df[layer_df["token_type"] == 1]
+        image_tokens = layer_df[layer_df["token_type"] == 2]
+        generated_tokens = layer_df[layer_df["token_type"] == 0]
+        
+        # Get token positions mapped to the grid
+        token_to_position = {}
+        token_to_type = {}
+        token_to_weight = {}
+        
+        # For each token type, extract positions and weights
+        for token_type, tokens_df in [
+            (2, image_tokens),    # Image tokens
+            (1, text_tokens),     # Text tokens
+            (0, generated_tokens) # Generated tokens
+        ]:
+            for _, row in tokens_df.iterrows():
+                token_idx = row["token_index"]
+                weight = row["importance_weight"]
+                
+                # Skip tokens with zero importance
+                if weight <= 0:
+                    continue
+                    
+                # Map token index to position in grid
+                pos = None
+                if str(token_idx) in pf["positions"]:
+                    pos = pf["positions"][str(token_idx)]
+                elif token_idx in pf["positions"]:
+                    pos = pf["positions"][token_idx]
+                    
+                if pos:
+                    r, c = pos
+                    if 0 <= r < grid_h and 0 <= c < grid_w:
+                        # Store position, type and weight
+                        token_to_position[token_idx] = (r, c)
+                        token_to_type[token_idx] = token_type
+                        
+                        # If same token appears multiple times, keep the maximum weight
+                        if token_idx in token_to_weight:
+                            token_to_weight[token_idx] = max(token_to_weight[token_idx], weight)
+                        else:
+                            token_to_weight[token_idx] = weight
+        
+        # If using unified scale, normalize weights
+        if global_max and global_max > 0:
+            for token_idx in token_to_weight:
+                token_to_weight[token_idx] = token_to_weight[token_idx] / global_max
+        
+        # Set colormaps for different token types
+        cmap_image = plt.get_cmap('hot')      # Red-yellow for image tokens
+        cmap_text = plt.get_cmap('Blues')     # Blue for text tokens
+        cmap_generated = plt.get_cmap('Greens')  # Green for generated tokens
+        
+        # Draw tokens on the grid
+        for token_idx, pos in token_to_position.items():
+            r, c = pos
+            token_type = token_to_type[token_idx]
+            weight = token_to_weight[token_idx]
+            
+            # Skip tokens with very low weight
+            if weight < 0.01:
+                continue
+                
+            # Calculate cell position
+            x_start = pad_left + c * cell_width
+            y_start = pad_top + r * cell_height
+            
+            # Apply gamma correction for better contrast
+            contrast_val = weight ** 0.5
+            
+            # Choose colormap based on token type
+            if token_type == 2:  # Image token
+                cmap = cmap_image
+                edgecolor = 'white'
+            elif token_type == 1:  # Text token
+                cmap = cmap_text
+                edgecolor = 'lightblue'
+            else:  # Generated token
+                cmap = cmap_generated
+                edgecolor = 'lightgreen'
+            
+            # Create colored rectangle
+            rect = plt.Rectangle(
+                (x_start, y_start),
+                cell_width, cell_height,
+                facecolor=cmap(contrast_val),
+                edgecolor=edgecolor,
+                linewidth=0.5 if weight > 0.5 else 0,
+                alpha=min(0.8, contrast_val + 0.3)
+            )
+            ax.add_patch(rect)
+            
+            # Show weight value if requested
+            if show_values and weight > 0.2:
+                cell_center_x = x_start + cell_width / 2
+                cell_center_y = y_start + cell_height / 2
+                ax.text(
+                    cell_center_x, cell_center_y,
+                    f"{weight:.2f}",
+                    ha='center', va='center',
+                    fontsize=7,
+                    color='white' if weight > 0.4 else 'black',
+                    weight='bold'
+                )
+        
+        # Add grid lines
+        for i in range(grid_h + 1):
+            y = pad_top + i * cell_height
+            ax.axhline(y=y, color='white', linestyle='-', linewidth=0.5, alpha=0.5)
+        
+        for i in range(grid_w + 1):
+            x = pad_left + i * cell_width
+            ax.axvline(x=x, color='white', linestyle='-', linewidth=0.5, alpha=0.5)
+        
+        # Add content area border
+        content_rect = plt.Rectangle(
+            (pad_left, pad_top),
+            resized_w_actual, resized_h_actual,
+            fill=False,
+            edgecolor='cyan',
+            linestyle='--',
+            linewidth=1.5
+        )
+        ax.add_patch(content_rect)
+        
+        # Add legend
+        import matplotlib.patches as mpatches
+        legend_handles = []
+        
+        # Count tokens of each type for legend
+        img_count = len(image_tokens)
+        text_count = len(text_tokens)
+        gen_count = len(generated_tokens)
+        
+        # Add legend entries only for token types that are present
+        if img_count > 0:
+            max_img_weight = image_tokens["importance_weight"].max() if not image_tokens.empty else 0
+            if global_max and global_max > 0:
+                norm_max_img = max_img_weight / global_max
+                img_label = f"Image Tokens ({img_count}) - Max: {max_img_weight:.3f}, Norm: {norm_max_img:.3f}"
+            else:
+                img_label = f"Image Tokens ({img_count}) - Max: {max_img_weight:.3f}"
+            legend_handles.append(mpatches.Patch(color=cmap_image(0.7), label=img_label))
+            
+        if text_count > 0:
+            max_text_weight = text_tokens["importance_weight"].max() if not text_tokens.empty else 0
+            if global_max and global_max > 0:
+                norm_max_text = max_text_weight / global_max
+                text_label = f"Text Tokens ({text_count}) - Max: {max_text_weight:.3f}, Norm: {norm_max_text:.3f}"
+            else:
+                text_label = f"Text Tokens ({text_count}) - Max: {max_text_weight:.3f}"
+            legend_handles.append(mpatches.Patch(color=cmap_text(0.7), label=text_label))
+            
+        if gen_count > 0:
+            max_gen_weight = generated_tokens["importance_weight"].max() if not generated_tokens.empty else 0
+            if global_max and global_max > 0:
+                norm_max_gen = max_gen_weight / global_max
+                gen_label = f"Generated Tokens ({gen_count}) - Max: {max_gen_weight:.3f}, Norm: {norm_max_gen:.3f}"
+            else:
+                gen_label = f"Generated Tokens ({gen_count}) - Max: {max_gen_weight:.3f}"
+            legend_handles.append(mpatches.Patch(color=cmap_generated(0.7), label=gen_label))
+        
+        # Add legend to plot
+        if legend_handles:
+            ax.legend(
+                handles=legend_handles,
+                loc='upper center',
+                bbox_to_anchor=(0.5, -0.05),
+                fancybox=True,
+                shadow=True,
+                ncol=min(3, len(legend_handles))
+            )
+        
+        # Set title
+        ax.set_title(f"Patch Features - Layer {layer_idx}", fontsize=12)
+        ax.axis('off')
+        
+        return True
+
+    def _create_token_distribution_for_layer(
+        self,
+        layer_df: pd.DataFrame,
+        ax,
+        layer_idx: int,
+        global_max: Optional[float] = None
+    ) -> bool:
+        """
+        Create token distribution visualization for a specific layer.
+        
+        Args:
+            layer_df: DataFrame with layer-specific trace data
+            ax: Matplotlib axis for plotting
+            layer_idx: Layer index
+            global_max: Maximum value for colormap normalization (for unified scale)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import seaborn as sns
+        import pandas as pd
+        
+        # Skip if no data
+        if layer_df.empty:
+            ax.text(0.5, 0.5, "No token data available", ha='center', va='center', fontsize=12)
+            ax.axis('off')
+            return False
+        
+        # Get token data divided by types
+        text_tokens = layer_df[layer_df["token_type"] == 1]
+        image_tokens = layer_df[layer_df["token_type"] == 2]
+        generated_tokens = layer_df[layer_df["token_type"] == 0]
+        
+        # Set colors for different token types
+        colors = {0: 'green', 1: 'blue', 2: 'red'}
+        token_type_labels = {0: 'Generated', 1: 'Text', 2: 'Image'}
+        
+        # Aggregate by token index to get maximum weight per token
+        tokens_with_max_weight = []
+        
+        for token_type, tokens_df in [
+            (2, image_tokens),    # Image tokens
+            (1, text_tokens),     # Text tokens
+            (0, generated_tokens) # Generated tokens
+        ]:
+            if tokens_df.empty:
+                continue
+                
+            for token_idx, group in tokens_df.groupby("token_index"):
+                max_weight = group["importance_weight"].max()
+                if global_max and global_max > 0:
+                    normalized_weight = max_weight / global_max
+                else:
+                    normalized_weight = max_weight
+                    
+                tokens_with_max_weight.append({
+                    "token_index": token_idx,
+                    "token_text": group["token_text"].iloc[0],
+                    "token_type": token_type,
+                    "weight": max_weight,
+                    "normalized_weight": normalized_weight
+                })
+        
+        # Convert to DataFrame for easier plotting
+        tokens_df = pd.DataFrame(tokens_with_max_weight)
+        
+        if tokens_df.empty:
+            ax.text(0.5, 0.5, "No tokens with weights available", ha='center', va='center', fontsize=12)
+            ax.axis('off')
+            return False
+        
+        # Sort by token index for consistent ordering
+        tokens_df = tokens_df.sort_values("token_index")
+        
+        # Create bar chart of token weights
+        bar_width = 0.8
+        x = np.arange(len(tokens_df))
+        
+        # Plot bars with token type colors
+        for token_type in sorted(tokens_df["token_type"].unique()):
+            type_df = tokens_df[tokens_df["token_type"] == token_type]
+            if type_df.empty:
+                continue
+                
+            # Get indices in the overall array
+            type_indices = [list(tokens_df["token_index"]).index(idx) for idx in type_df["token_index"]]
+            
+            # Plot bars
+            ax.bar(
+                x[type_indices],
+                type_df["normalized_weight"] if "normalized_weight" in type_df.columns else type_df["weight"],
+                width=bar_width,
+                color=colors[token_type],
+                label=f"{token_type_labels[token_type]} Tokens ({len(type_df)})"
+            )
+        
+        # Add token texts as x-tick labels
+        if len(tokens_df) <= 30:  # Only add labels if not too many tokens
+            ax.set_xticks(x)
+            ax.set_xticklabels(
+                tokens_df["token_text"],
+                rotation=45,
+                ha="right",
+                fontsize=8
+            )
+        else:
+            # Just mark a few positions
+            step = max(1, len(tokens_df) // 10)
+            ax.set_xticks(x[::step])
+            ax.set_xticklabels(
+                tokens_df["token_text"].iloc[::step],
+                rotation=45,
+                ha="right",
+                fontsize=8
+            )
+        
+        # Add token indices above the bars
+        for i, (_, row) in enumerate(tokens_df.iterrows()):
+            ax.text(
+                i,
+                row["normalized_weight"] if "normalized_weight" in row else row["weight"],
+                f"{row['token_index']}",
+                ha='center',
+                va='bottom',
+                fontsize=7,
+                color='black'
+            )
+        
+        # Set labels and title
+        weight_label = "Normalized Weight" if "normalized_weight" in tokens_df.columns else "Weight"
+        ax.set_xlabel("Tokens", fontsize=10)
+        ax.set_ylabel(weight_label, fontsize=10)
+        ax.set_title(f"Token Distribution - Layer {layer_idx}", fontsize=12)
+        
+        # Add grid lines for readability
+        ax.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        # Add legend
+        ax.legend(fontsize=9)
+        
+        return True
+
+    def _create_all_layers_composite(
+        self,
+        saved_paths: List[str],
+        layers: List[int],
+        output_dir: str,
+        target_idx: int,
+        target_text: str,
+        unified_colorscale: bool = False
+    ) -> Optional[str]:
+        """
+        Create a composite visualization of all layers.
+        
+        Args:
+            saved_paths: List of paths to individual layer visualizations
+            layers: List of layer indices
+            output_dir: Directory to save output
+            target_idx: Target token index
+            target_text: Text of the target token
+            unified_colorscale: Whether unified colorscale was used
+            
+        Returns:
+            Path to saved composite visualization or None if failed
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.image as mpimg
+        import numpy as np
+        import math
+        import os
+        
+        try:
+            # Determine grid layout
+            n = len(saved_paths)
+            if n == 0:
+                return None
+                
+            # Use a grid layout that's as square as possible
+            ncols = int(math.ceil(math.sqrt(n)))
+            nrows = int(math.ceil(n / ncols))
+            
+            # Create figure
+            fig_width = ncols * 6
+            fig_height = nrows * 6
+            fig, axes = plt.subplots(nrows, ncols, figsize=(fig_width, fig_height))
+            
+            # Make axes a 2D array even if nrows or ncols is 1
+            if nrows == 1 and ncols == 1:
+                axes = np.array([[axes]])
+            elif nrows == 1:
+                axes = axes.reshape(1, -1)
+            elif ncols == 1:
+                axes = axes.reshape(-1, 1)
+            
+            # Add each layer image to the grid
+            for i, path in enumerate(saved_paths):
+                row = i // ncols
+                col = i % ncols
+                
+                # Load image
+                img = mpimg.imread(path)
+                
+                # Display in the grid
+                axes[row, col].imshow(img)
+                axes[row, col].axis('off')
+                
+                # Add layer number
+                if i < len(layers):
+                    axes[row, col].set_title(f"Layer {layers[i]}", fontsize=12)
+            
+            # Turn off empty subplots
+            for i in range(len(saved_paths), nrows * ncols):
+                row = i // ncols
+                col = i % ncols
+                axes[row, col].axis('off')
+            
+            # Add overall title
+            scale_note = " (Unified Scale)" if unified_colorscale else ""
+            fig.suptitle(
+                f"All Layers - Combined Base and Patch Features with All Token Types{scale_note}\n"
+                f"Target: '{target_text}' (idx: {target_idx})",
+                fontsize=20
+            )
+            
+            # Save figure
+            output_path = os.path.join(output_dir, f"all_layers_composite_{target_idx}.png")
+            plt.tight_layout(rect=[0, 0, 1, 0.97])  # Adjust for the title
+            plt.savefig(output_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            
+            print(f"Created all layers composite at {output_path}")
+            return output_path
+            
+        except Exception as e:
+            print(f"Error creating all layers composite: {e}")
+            return None
