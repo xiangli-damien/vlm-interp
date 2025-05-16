@@ -382,6 +382,7 @@ class HeatmapVisualizer:
                 layer_idx=layer_idx,
                 global_max=global_max
             )
+
             
             # Set overall title
             scale_note = " (Unified Scale)" if unified_colorscale else " (Independent Scales)"
@@ -401,20 +402,208 @@ class HeatmapVisualizer:
             saved_paths.append(out_path)
             print(f"Created combined heatmap for layer {layer_idx} at {out_path}")
         
-        # Create a composite image with all layers in a grid
-        if saved_paths:
-            composite_path = self._create_all_layers_composite(
-                saved_paths=saved_paths,
-                layers=layers,
-                output_dir=combined_dir,
-                target_idx=target_idx,
-                target_text=target_text,
-                unified_colorscale=unified_colorscale
-            )
-            if composite_path:
-                saved_paths.append(composite_path)
-        
         return saved_paths
+
+    def _create_token_distribution_for_layer(
+        self,
+        layer_df: pd.DataFrame,
+        ax,
+        layer_idx: int,
+        global_max: Optional[float] = None
+    ) -> None:
+        """
+        Creates a visualization showing the distribution of token importance weights for a specific layer.
+        
+        This function generates a bar chart that visualizes how importance weights are distributed
+        across different token types (text, image base, image patch, generated) within a specific layer.
+        The visualization provides insights into the relative influence of different token categories
+        and their importance weight patterns, helping to understand which token types contribute most
+        to the model's processing at this layer.
+        
+        Args:
+            layer_df: DataFrame containing layer-specific trace data with token information
+            ax: Matplotlib axis object for plotting the visualization
+            layer_idx: The index of the layer being visualized
+            global_max: Optional maximum value for normalizing weights across visualizations.
+                    If provided, weights are normalized against this value for consistent scaling.
+        
+        Returns:
+            None - The visualization is plotted directly on the provided axis
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        # Check if we have data
+        if layer_df.empty:
+            ax.text(0.5, 0.5, f"No token data available for layer {layer_idx}", 
+                    ha='center', va='center', fontsize=14)
+            ax.axis('off')
+            return
+        
+        # Divide tokens by their types
+        text_tokens = layer_df[layer_df["token_type"] == 1]
+        image_tokens = layer_df[layer_df["token_type"] == 2]
+        generated_tokens = layer_df[layer_df["token_type"] == 0]
+        
+        # Further divide image tokens into base and patch (if possible)
+        base_tokens = pd.DataFrame()
+        patch_tokens = pd.DataFrame()
+        
+        if not image_tokens.empty:
+            # Attempt to identify base vs patch tokens based on feature mapping
+            # This implementation depends on the specific structure of your data
+            if hasattr(self, 'feature_mapping') and self.feature_mapping:
+                base_indices = set()
+                patch_indices = set()
+                
+                # Extract base token indices from feature mapping
+                if ("base_feature" in self.feature_mapping and 
+                    "positions" in self.feature_mapping["base_feature"]):
+                    base_indices = set(int(idx) for idx in self.feature_mapping["base_feature"]["positions"].keys())
+                    
+                # Extract patch token indices from feature mapping
+                if ("patch_feature" in self.feature_mapping and 
+                    "positions" in self.feature_mapping["patch_feature"]):
+                    patch_indices = set(int(idx) for idx in self.feature_mapping["patch_feature"]["positions"].keys())
+                
+                # Filter tokens by these indices
+                base_tokens = image_tokens[image_tokens["token_index"].isin(base_indices)]
+                patch_tokens = image_tokens[image_tokens["token_index"].isin(patch_indices)]
+            
+            # Fallback if we couldn't separate base/patch using feature mapping
+            if base_tokens.empty and patch_tokens.empty:
+                # Just treat all image tokens as a single category
+                base_tokens = image_tokens
+        
+        # Prepare data for visualization
+        token_categories = []
+        token_counts = []
+        max_weights = []
+        mean_weights = []
+        median_weights = []
+        total_weights = []
+        colors = []
+        
+        # Analyze text tokens
+        if not text_tokens.empty:
+            token_categories.append("Text")
+            token_counts.append(len(text_tokens))
+            max_weights.append(text_tokens["importance_weight"].max())
+            mean_weights.append(text_tokens["importance_weight"].mean())
+            median_weights.append(text_tokens["importance_weight"].median())
+            total_weights.append(text_tokens["importance_weight"].sum())
+            colors.append('royalblue')
+        
+        # Analyze base image tokens
+        if not base_tokens.empty:
+            token_categories.append("Image (Base)")
+            token_counts.append(len(base_tokens))
+            max_weights.append(base_tokens["importance_weight"].max())
+            mean_weights.append(base_tokens["importance_weight"].mean())
+            median_weights.append(base_tokens["importance_weight"].median())
+            total_weights.append(base_tokens["importance_weight"].sum())
+            colors.append('firebrick')
+        
+        # Analyze patch image tokens
+        if not patch_tokens.empty:
+            token_categories.append("Image (Patch)")
+            token_counts.append(len(patch_tokens))
+            max_weights.append(patch_tokens["importance_weight"].max())
+            mean_weights.append(patch_tokens["importance_weight"].mean())
+            median_weights.append(patch_tokens["importance_weight"].median())
+            total_weights.append(patch_tokens["importance_weight"].sum())
+            colors.append('orangered')
+        
+        # Analyze generated tokens
+        if not generated_tokens.empty:
+            token_categories.append("Generated")
+            token_counts.append(len(generated_tokens))
+            max_weights.append(generated_tokens["importance_weight"].max())
+            mean_weights.append(generated_tokens["importance_weight"].mean())
+            median_weights.append(generated_tokens["importance_weight"].median())
+            total_weights.append(generated_tokens["importance_weight"].sum())
+            colors.append('forestgreen')
+        
+        # If no valid categories, show message and return
+        if not token_categories:
+            ax.text(0.5, 0.5, "No token categories available for analysis", 
+                    ha='center', va='center', fontsize=14)
+            ax.axis('off')
+            return
+        
+        # Calculate total influence percentage for each token type
+        total_influence = sum(total_weights)
+        if total_influence > 0:
+            influence_percentages = [100 * w / total_influence for w in total_weights]
+        else:
+            influence_percentages = [0] * len(total_weights)
+        
+        # Create positions for the bars
+        x_pos = np.arange(len(token_categories))
+        width = 0.35  # Width of the bars
+        
+        # Create bars for token counts (secondary axis)
+        ax2 = ax.twinx()
+        count_bars = ax2.bar(x_pos - width/2, token_counts, width, alpha=0.3, color='gray', label='Count')
+        ax2.set_ylabel('Token Count', color='gray')
+        ax2.tick_params(axis='y', labelcolor='gray')
+        ax2.set_ylim(0, max(token_counts) * 1.2 if token_counts else 100)
+        
+        # Create bars for influence percentage (primary axis)
+        influence_bars = ax.bar(x_pos + width/2, influence_percentages, width, color=colors, alpha=0.7, label='% Influence')
+        ax.set_ylabel('% of Total Influence', color='black')
+        ax.set_ylim(0, max(influence_percentages) * 1.2 if influence_percentages else 100)
+        
+        # Add data labels on bars
+        for i, (count, pct) in enumerate(zip(token_counts, influence_percentages)):
+            # Token count label
+            ax2.text(i - width/2, count, str(count), 
+                    ha='center', va='bottom', fontsize=8, color='dimgray')
+            
+            # Influence percentage label
+            if pct > 0.1:
+                ax.text(i + width/2, pct, f"{pct:.1f}%", 
+                        ha='center', va='bottom', fontsize=9, color='black', fontweight='bold')
+        
+        # Set x-axis labels
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(token_categories)
+        
+        # Add a title
+        ax.set_title(f"Token Distribution Analysis - Layer {layer_idx}", fontsize=14)
+        
+        # Add a horizontal line for average influence
+        if token_categories:
+            avg_influence = 100 / len(token_categories)
+            ax.axhline(y=avg_influence, color='black', linestyle='--', alpha=0.5)
+            ax.text(len(token_categories) - 0.5, avg_influence, f"Avg: {avg_influence:.1f}%", 
+                    va='bottom', ha='right', fontsize=8, alpha=0.7)
+        
+        # Add summary statistics as text
+        stats_text = "Token Statistics:\n"
+        for i, category in enumerate(token_categories):
+            stats_text += f"{category}: {token_counts[i]} tokens, "
+            stats_text += f"Max: {max_weights[i]:.3f}, "
+            stats_text += f"Mean: {mean_weights[i]:.3f}, "
+            stats_text += f"Total: {total_weights[i]:.3f} ({influence_percentages[i]:.1f}%)\n"
+        
+        # Place text box in bottom right
+        props = dict(boxstyle='round', facecolor='wheat', alpha=0.4)
+        ax.text(0.98, 0.02, stats_text, transform=ax.transAxes, fontsize=8,
+                verticalalignment='bottom', horizontalalignment='right', bbox=props)
+        
+        # Add grid lines for readability
+        ax.grid(True, axis='y', linestyle='--', alpha=0.3)
+        
+        # Adjust layout
+        ax.set_axisbelow(True)  # Put grid behind bars
+        
+        # If global_max is provided, add an annotation about normalization
+        if global_max is not None and global_max > 0:
+            norm_text = f"Note: Weights normalized against global max: {global_max:.3f}"
+            ax.text(0.02, 0.98, norm_text, transform=ax.transAxes, fontsize=8,
+                    verticalalignment='top', horizontalalignment='left', 
+                    bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.3))
 
     def _create_specific_token_heatmap(
         self,
