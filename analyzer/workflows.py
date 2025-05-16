@@ -949,25 +949,28 @@ def build_heatmaps_offline(
     ):
     """
     Generate comprehensive heatmap visualizations from semantic tracing data.
-    
-    Args:
-        trace_csv: Path to the CSV file containing trace data
-        metadata_json: Path to JSON file containing metadata and feature mappings
-        image_path: Path or URL to the image to use in visualizations
-        output_dir: Directory to save visualization files
-        weight_column: Column name to use for importance weights (default: "importance_weight")
-        composite_only: If True, only generate composite visualizations, not per-layer
-        unified_colorscale: If True, use the same color scale across all layers for consistency
-        download_resize_image: If True, download image from URL and resize it
-        target_image_size: Target size for image resizing (width, height)
-        include_all_token_types: If True, include text and generated tokens in visualizations
-        debug: Whether to print additional debugging information
-        
-    Returns:
-        List of paths to generated visualization files
     """
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
+    
+    # 调试: 验证图像路径
+    print(f"DEBUG: Image path: {image_path}")
+    if os.path.exists(image_path):
+        print(f"DEBUG: Image exists with size: {os.path.getsize(image_path)} bytes")
+        # 尝试打开图像来验证它是否有效
+        try:
+            from PIL import Image
+            img_test = Image.open(image_path)
+            print(f"DEBUG: Image opened successfully: size={img_test.size}, mode={img_test.mode}")
+            # 显示样本像素值以确认图像有效
+            img_array = np.array(img_test)
+            print(f"DEBUG: Image array shape={img_array.shape}, min/max={img_array.min()}/{img_array.max()}")
+        except Exception as e:
+            print(f"DEBUG: Failed to open image: {e}")
+    else:
+        print(f"DEBUG: Image does not exist at path: {image_path}")
+        if image_path.startswith(('http://', 'https://')):
+            print(f"DEBUG: Image path appears to be a URL")
     
     # Handle image download and resize if needed
     processed_image_path = image_path
@@ -989,6 +992,7 @@ def build_heatmaps_offline(
             
             # Load the image
             img = Image.open(io.BytesIO(response.content))
+            print(f"DEBUG: Downloaded image: size={img.size}, mode={img.mode}")
             
             # Resize if target size is provided
             if target_image_size:
@@ -1004,6 +1008,23 @@ def build_heatmaps_offline(
         except Exception as e:
             print(f"Error downloading or processing image: {e}")
             # Continue with original image path
+    
+    # DEBUG: 检查元数据文件
+    print(f"DEBUG: Checking metadata file: {metadata_json}")
+    try:
+        import json
+        with open(metadata_json, 'r') as f:
+            metadata = json.load(f)
+        feature_mapping = metadata.get("feature_mapping", {})
+        if feature_mapping:
+            if "base_feature" in feature_mapping:
+                print(f"DEBUG: base_feature grid: {feature_mapping['base_feature'].get('grid')}")
+            if "patch_feature" in feature_mapping:
+                print(f"DEBUG: patch_feature grid: {feature_mapping['patch_feature'].get('grid_unpadded')}")
+            if "resized_dimensions" in feature_mapping:
+                print(f"DEBUG: resized_dimensions: {feature_mapping['resized_dimensions']}")
+    except Exception as e:
+        print(f"DEBUG: Error reading metadata: {e}")
     
     # First attempt: standard approach
     try:
@@ -1026,18 +1047,64 @@ def build_heatmaps_offline(
             image_path=processed_image_path,
             out_dir=output_dir,
             weight_column=weight_column,
-            debug_mode=debug
+            debug_mode=True  # 启用调试模式
         )
         
         # Set custom visualization parameters
         hv.unified_colorscale = unified_colorscale
         hv.include_all_token_types = include_all_token_types
         
-        # IMPROVED: Try direct visualization with more debugging
-        if debug:
-            print("Debug mode: Using direct approach with higher visibility settings")
-            unified_colorscale = False  # Turn off unified colorscale in debug mode for better visibility
+        # 创建一个简单的直接可视化，用于调试确认图像加载正确
+        try:
+            from PIL import Image
+            import matplotlib.pyplot as plt
+            import numpy as np
             
+            # 创建调试目录
+            debug_dir = os.path.join(output_dir, "debug_images")
+            os.makedirs(debug_dir, exist_ok=True)
+            
+            # 加载图像
+            test_img = Image.open(processed_image_path).convert('RGB')
+            debug_img_path = os.path.join(debug_dir, "debug_direct_image.png")
+            
+            # 保存一个直接的图像用于检查
+            plt.figure(figsize=(8, 8))
+            plt.imshow(np.array(test_img), origin='upper')
+            plt.title("Direct Image Test")
+            plt.axis('off')
+            plt.savefig(debug_img_path, dpi=150)
+            plt.close()
+            
+            print(f"DEBUG: Saved direct image test to {debug_img_path}")
+            
+            # 创建一个简单的热力图叠加测试
+            H, W = test_img.size[1], test_img.size[0]
+            # 创建一个简单的测试热力图
+            test_heat = np.random.rand(24, 24)
+            # 上采样热力图到图像大小
+            test_heat_up = np.kron(test_heat, np.ones((H//24, W//24)))
+            if test_heat_up.shape[0] < H or test_heat_up.shape[1] < W:
+                pad_h = max(0, H - test_heat_up.shape[0])
+                pad_w = max(0, W - test_heat_up.shape[1])
+                test_heat_up = np.pad(test_heat_up, ((0, pad_h), (0, pad_w)), mode='constant')
+            test_heat_up = test_heat_up[:H, :W]
+            
+            # 保存一个直接的热力图叠加用于检查
+            debug_overlay_path = os.path.join(debug_dir, "debug_direct_overlay.png")
+            plt.figure(figsize=(8, 8))
+            plt.imshow(np.array(test_img), origin='upper')
+            plt.imshow(test_heat_up, cmap='hot', alpha=0.5, origin='upper')
+            plt.title("Direct Overlay Test")
+            plt.axis('off')
+            plt.savefig(debug_overlay_path, dpi=150)
+            plt.close()
+            
+            print(f"DEBUG: Saved direct overlay test to {debug_overlay_path}")
+            
+        except Exception as e:
+            print(f"DEBUG: Direct visualization test failed: {e}")
+        
         # Run visualization and collect output files
         files = hv.run(composite_only=composite_only, show_values=not composite_only)
         
@@ -1055,6 +1122,41 @@ def build_heatmaps_offline(
         # ADDED: Fallback approach - try with preprocessed CSV
         try:
             print("\nTrying fallback approach with preprocessed CSV...")
+            
+            # 创建一个直接的可视化测试
+            direct_viz_dir = os.path.join(output_dir, "direct_viz")
+            os.makedirs(direct_viz_dir, exist_ok=True)
+            
+            # 加载图像并创建一个直接的matplotlib可视化
+            try:
+                from PIL import Image
+                import matplotlib.pyplot as plt
+                import numpy as np
+                
+                direct_img = Image.open(processed_image_path).convert('RGB')
+                direct_output_path = os.path.join(direct_viz_dir, "direct_combined.png")
+                
+                # 创建一个简单的热力图模板
+                h, w = direct_img.size[1], direct_img.size[0]
+                heat_template = np.ones((h//20, w//20)) * 0.5
+                for i in range(heat_template.shape[0]):
+                    for j in range(heat_template.shape[1]):
+                        heat_template[i, j] = max(0.1, np.cos(i/5) * np.sin(j/5) + 0.5)
+                
+                heat_big = np.kron(heat_template, np.ones((20, 20)))
+                heat_big = heat_big[:h, :w]
+                
+                plt.figure(figsize=(10, 10))
+                plt.imshow(np.array(direct_img), origin='upper')
+                plt.imshow(heat_big, alpha=0.6, cmap='hot', origin='upper')
+                plt.title("Direct Fallback Visualization")
+                plt.axis('off')
+                plt.savefig(direct_output_path, dpi=150)
+                plt.close()
+                
+                print(f"Created direct fallback visualization at {direct_output_path}")
+            except Exception as e_direct:
+                print(f"Direct visualization fallback failed: {e_direct}")
             
             # Read and preprocess the CSV
             import pandas as pd

@@ -435,7 +435,7 @@ class EnhancedSemanticTracingVisualizer:
             
             if use_grid_visualization:
                 # Create a colored grid overlay with improved visibility
-                base_alpha = min(0.6, alpha)  # Limit maximum alpha
+                base_alpha = min(0.2, alpha)  # Limit maximum alpha
                 cmap = plt.get_cmap(colormap)
                 
                 # Draw grid cells with color based on heatmap value
@@ -556,24 +556,6 @@ class EnhancedSemanticTracingVisualizer:
     ) -> Optional[str]:
         """
         Create an enhanced heatmap overlay visualization for patch image features.
-        
-        Args:
-            heatmap: 2D numpy array with heatmap values
-            spatial_preview_image: Preprocessed spatial image
-            feature_mapping: Feature mapping dictionary
-            patch_size: Raw patch size for the vision model
-            layer_idx: Index of the layer
-            target_idx: Index of the target token
-            title: Title for the plot
-            save_path: Path to save the visualization
-            colormap: Matplotlib colormap name
-            alpha: Alpha blending value for overlay
-            add_gridlines: Whether to add grid lines
-            show_values: Whether to show numeric values in cells
-            vmax: Maximum value for colormap scaling (None for auto-scaling)
-            
-        Returns:
-            Path to saved visualization or None if failed
         """
         try:
             import matplotlib.pyplot as plt
@@ -595,12 +577,17 @@ class EnhancedSemanticTracingVisualizer:
             # Ensure the preview image is in RGB mode
             if spatial_preview_image.mode != 'RGB':
                 preview_image = spatial_preview_image.convert('RGB')
+                print(f"Converting image from {spatial_preview_image.mode} to RGB")
             else:
                 preview_image = spatial_preview_image
                     
             # Get dimensions
             preview_w, preview_h = preview_image.size
             background_np = np.array(preview_image)
+            
+            # Debug: Verify image data
+            print(f"Debug: Background image shape={background_np.shape}, dtype={background_np.dtype}")
+            print(f"Debug: Image min/max values: {background_np.min()}/{background_np.max()}")
             
             # Get content dimensions and padding
             resized_dims_wh = feature_mapping.get("resized_dimensions", (0, 0))
@@ -632,34 +619,38 @@ class EnhancedSemanticTracingVisualizer:
                 # Add small values to make visible
                 heatmap = np.ones_like(heatmap) * 0.1
             
-            # Show background image with proper positioning
+            # CRITICAL FIX: Ensure background image is fully visible first
+            # 修改: 确保背景图像完全可见且不透明
             ax.imshow(
                 background_np, 
                 extent=(0, preview_w, preview_h, 0),
-                aspect='equal',  # Use equal aspect for better alignment
-                origin='upper'   # CRITICAL: Must use 'upper' consistently across all plots
+                aspect='equal',
+                origin='upper',
+                alpha=1.0  # 设置为完全不透明
             )
+            
+            # Debug: Heatmap stats before overlay
+            print(f"Debug: Heatmap shape={heatmap.shape}, min/max={heatmap.min()}/{heatmap.max()}")
             
             # Create better colormap with improved alpha handling
             cmap = plt.get_cmap(colormap)
-            base_alpha = min(0.8, alpha)  # IMPROVED: Increased from 0.7 for better visibility
+            # 修改: 降低热力图的不透明度，确保背景可见
+            base_alpha = min(0.5, alpha)  # 改为0.5，让背景更明显
             
-            # IMPROVED: Use upscaled heatmap instead of cell-by-cell rendering for smoother visualization
-            # This approach is better for visualization quality
+            # Upscale heatmap to content area dimensions
             try:
                 from skimage.transform import resize as skimage_resize
-                # Upscale heatmap to match content area dimensions
                 upscaled_hm = skimage_resize(
                     heatmap, 
                     (resized_h_actual, resized_w_actual), 
-                    order=1,  # Use linear interpolation for smoother result
+                    order=1,  # 线性插值，平滑结果
                     mode='constant',
                     cval=0, 
                     anti_aliasing=True, 
                     preserve_range=True
                 )
             except ImportError:
-                # Fallback if skimage not available: manual upscaling
+                # Fallback upscaling method
                 print("Using fallback upscaling method (skimage not available)")
                 cell_h = resized_h_actual / prob_grid_h
                 cell_w = resized_w_actual / prob_grid_w
@@ -675,24 +666,27 @@ class EnhancedSemanticTracingVisualizer:
                             upscaled_hm[r_start:r_end, c_start:c_end] = heatmap[r, c]
             
             # CRITICAL FIX: Properly set the extent coordinates for overlay
-            # This ensures the heatmap is positioned correctly over the content area
+            # 修改: 确保热力图和背景图像正确对齐
             extent = (
-                pad_left,                # left
-                pad_left + resized_w_actual,  # right
-                pad_top + resized_h_actual,   # bottom (remember origin='upper')
-                pad_top                  # top
+                pad_left,                    # left
+                pad_left + resized_w_actual, # right
+                pad_top + resized_h_actual,  # bottom (origin='upper'时, y轴从上到下)
+                pad_top                      # top
             )
+            
+            # Debug: Print extent for verification
+            print(f"Debug: Heatmap extent={extent}, background extent=(0,{preview_w},{preview_h},0)")
             
             # IMPROVED: Set explicit value range and better alpha
             im = ax.imshow(
                 upscaled_hm, 
                 cmap=colormap,
-                alpha=base_alpha,  # Use higher alpha for better visibility
-                extent=extent,
-                origin='upper',  # CRITICAL: Must match background image
-                interpolation='bilinear',  # Better interpolation for smoother look
+                alpha=base_alpha,  # 透明度降低，确保背景可见
+                extent=extent,     # 使用正确计算的extent值
+                origin='upper',    # 确保与背景图像使用相同的origin
+                interpolation='bilinear',
                 vmin=0,
-                vmax=vmax if vmax is not None else max(0.01, np.max(heatmap))  # Ensure non-zero max
+                vmax=vmax if vmax is not None else max(0.01, np.max(heatmap))
             )
             
             # Add grid lines with improved visibility
@@ -732,11 +726,36 @@ class EnhancedSemanticTracingVisualizer:
             ax.set_title(f"{title}", fontsize=12, pad=10)
             ax.axis("off")
             
+            # DEBUGGING: 生成单独的背景和热力图图像用于调试
+            debug_dir = os.path.dirname(save_path)
+            os.makedirs(debug_dir, exist_ok=True)
+            
+            # 保存背景图像
+            debug_bg_path = os.path.join(debug_dir, f"debug_bg_layer{layer_idx}.png")
+            plt.figure(figsize=(8, 8))
+            plt.imshow(background_np, origin='upper')
+            plt.title("Background Image Only")
+            plt.axis('off')
+            plt.savefig(debug_bg_path, dpi=150)
+            plt.close()
+            
+            # 保存热力图
+            debug_heat_path = os.path.join(debug_dir, f"debug_heat_layer{layer_idx}.png")
+            plt.figure(figsize=(8, 8))
+            plt.imshow(upscaled_hm, cmap=colormap, origin='upper')
+            plt.title("Heatmap Only")
+            plt.axis('off')
+            plt.savefig(debug_heat_path, dpi=150)
+            plt.close()
+            
             # Save with improved quality
             fig.tight_layout()
             canvas.draw()
             fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor='white')
             plt.close(fig)
+            
+            print(f"Success: Saved visualization to {save_path}")
+            print(f"Saved debug images to {debug_bg_path} and {debug_heat_path}")
             
             return save_path
         
