@@ -1426,7 +1426,7 @@ def run_token_analysis(
         import traceback
         traceback.print_exc()
         return {"error": str(e)}
-
+        
 def run_ablation_experiments(
     model: torch.nn.Module,
     processor: Any,
@@ -1438,10 +1438,15 @@ def run_ablation_experiments(
     output_dir: str = "token_ablation_results",
     method: str = "zero_out",
     include_individual_tests: bool = True,
+    layer_tests: bool = False,
+    num_layer_samples: int = 5,
+    start_block_layer: Optional[int] = None,
+    end_block_layer: Optional[int] = None,
     debug_mode: bool = False
 ) -> Dict[str, Any]:
     """
-    Performs ablation experiments on critical tokens to measure their impact.
+    Performs ablation experiments on critical tokens to measure their impact,
+    with enhanced controls for layer-specific blocking.
     
     Args:
         model: The loaded VLM model instance
@@ -1453,14 +1458,24 @@ def run_ablation_experiments(
                         new trace will be run)
         metadata_path: Path to trace metadata JSON
         output_dir: Directory path to save analysis outputs
-        method: Blocking method ("zero_out", "average", or "noise")
+        method: Blocking method ("zero_out", "average", "noise", or "interpolate")
         include_individual_tests: Whether to test each token individually
+        layer_tests: Whether to run layer-specific ablation tests
+        num_layer_samples: Number of layer samples to test if layer_tests is True
+        start_block_layer: First layer to apply blocking (None = all layers)
+        end_block_layer: Last layer to apply blocking (None = all layers)
         debug_mode: Whether to print detailed debug information
         
     Returns:
         Dict containing ablation experiment results
     """
-    print("\n--- Starting Token Ablation Experiments ---")
+    import os
+    import json
+    import torch
+    import traceback
+    from typing import Dict, List, Any, Optional, Union
+    
+    print("\n--- Starting Enhanced Token Ablation Experiments ---")
     print(f"  Output directory: {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
     results = {}
@@ -1490,6 +1505,17 @@ def run_ablation_experiments(
             critical_tokens = analysis_results["critical_tokens"]
             results["token_analysis"] = analysis_results
         
+        # Print layer blocking configuration
+        layer_info = "all layers"
+        if start_block_layer is not None or end_block_layer is not None:
+            if start_block_layer is not None and end_block_layer is not None:
+                layer_info = f"layers {start_block_layer} to {end_block_layer}"
+            elif start_block_layer is not None:
+                layer_info = f"layers {start_block_layer} and above"
+            else:
+                layer_info = f"layers up to {end_block_layer}"
+        print(f"  Blocking tokens in {layer_info}")
+        
         # Prepare input data
         from analyzer.semantic_tracing import EnhancedSemanticTracer
         
@@ -1503,20 +1529,104 @@ def run_ablation_experiments(
         input_data = tracer.prepare_inputs(image_source, prompt_text)
         
         # Initialize token analyzer for ablation
+        from analyzer.token_analyzer import TokenAnalyzer
+        
         analyzer = TokenAnalyzer(
             output_dir=output_dir,
             debug_mode=debug_mode
         )
         
-        # Run ablation tests
-        ablation_results = analyzer.run_ablation_tests(
-            model=model,
-            processor=processor,
-            input_data=input_data,
-            critical_tokens=critical_tokens,
-            method=method,
-            include_individual_tests=include_individual_tests
-        )
+        # Run ablation tests with enhanced parameters
+        if layer_tests:
+            # Run comprehensive layer-specific tests
+            ablation_results = analyzer.run_ablation_tests(
+                model=model,
+                processor=processor,
+                input_data=input_data,
+                critical_tokens=critical_tokens,
+                method=method,
+                include_individual_tests=include_individual_tests,
+                layer_tests=True,
+                num_layer_samples=num_layer_samples
+            )
+        elif start_block_layer is not None or end_block_layer is not None:
+            # Run tests with specified layer range
+            # First run reference inference
+            with torch.no_grad():
+                reference_outputs = model(**{k: v for k, v in input_data["inputs"].items() if k != "token_type_ids"})
+                
+                # Get reference output token
+                reference_logits = reference_outputs.logits
+                
+                # Handle different logits shapes
+                if reference_logits.dim() == 2:  # [batch, vocab]
+                    pred_logits = reference_logits
+                else:  # [batch, seq, vocab]
+                    pred_logits = reference_logits[:, -1, :]
+                    
+                reference_ids = torch.argmax(pred_logits, dim=-1).unsqueeze(0)
+                reference_text = processor.tokenizer.decode(reference_ids[0].tolist())
+                
+                reference_result = {
+                    "output_ids": reference_ids,
+                    "output_text": reference_text,
+                    "logits": pred_logits
+                }
+            
+            # Run ablation with specific layer range
+            token_indices = [token["token_index"] for token in critical_tokens]
+            
+            ablation_results = {
+                "reference_output": reference_text,
+                "individual_ablations": {},
+                "all_critical_tokens_ablation": {}
+            }
+            
+            # Individual token tests
+            if include_individual_tests:
+                for token in critical_tokens:
+                    token_idx = token["token_index"]
+                    token_text = token["token_text"]
+                    print(f"Testing ablation of token {token_idx} ('{token_text}') in {layer_info}...")
+                    
+                    sim_result = analyzer.simulate_token_blocking(
+                        model=model,
+                        processor=processor,
+                        input_data=input_data,
+                        tokens_to_block=[token_idx],
+                        method=method,
+                        reference_output=reference_result,
+                        start_block_layer=start_block_layer,
+                        end_block_layer=end_block_layer
+                    )
+                    
+                    ablation_results["individual_ablations"][f"token_{token_idx}"] = sim_result
+            
+            # All tokens test
+            print(f"Testing ablation of all {len(token_indices)} critical tokens in {layer_info}...")
+            
+            all_tokens_result = analyzer.simulate_token_blocking(
+                model=model,
+                processor=processor,
+                input_data=input_data,
+                tokens_to_block=token_indices,
+                method=method,
+                reference_output=reference_result,
+                start_block_layer=start_block_layer,
+                end_block_layer=end_block_layer
+            )
+            
+            ablation_results["all_critical_tokens_ablation"] = all_tokens_result
+        else:
+            # Run standard ablation tests
+            ablation_results = analyzer.run_ablation_tests(
+                model=model,
+                processor=processor,
+                input_data=input_data,
+                critical_tokens=critical_tokens,
+                method=method,
+                include_individual_tests=include_individual_tests
+            )
         
         # Store ablation results
         results["ablation_results"] = ablation_results
@@ -1532,11 +1642,39 @@ def run_ablation_experiments(
         except Exception as e:
             print(f"Error saving ablation results: {e}")
         
+        # Print summary information
+        if "reference_output" in ablation_results:
+            print(f"\nAblation Test Results Summary:")
+            print(f"Reference output: '{ablation_results['reference_output']}'")
+            
+            # Individual token results
+            if include_individual_tests and "individual_ablations" in ablation_results:
+                print("\nIndividual Token Impact:")
+                for token in critical_tokens:
+                    token_idx = token["token_index"]
+                    result_key = f"token_{token_idx}"
+                    if result_key in ablation_results["individual_ablations"]:
+                        result = ablation_results["individual_ablations"][result_key]
+                        impact = result.get("comparison", {}).get("impact_score", 0)
+                        match = result.get("comparison", {}).get("token_match", False)
+                        output = result.get("generated_text", "")
+                        
+                        print(f"  Token {token_idx} ('{token['token_text']}'): Impact={impact:.3f}, "
+                              f"Match={match}, Output='{output}'")
+            
+            # All tokens result
+            if "all_critical_tokens_ablation" in ablation_results:
+                all_result = ablation_results["all_critical_tokens_ablation"]
+                all_impact = all_result.get("comparison", {}).get("impact_score", 0)
+                all_match = all_result.get("comparison", {}).get("token_match", False)
+                all_output = all_result.get("generated_text", "")
+                
+                print(f"\nAll tokens ablation: Impact={all_impact:.3f}, Match={all_match}, Output='{all_output}'")
+        
         print(f"\n--- Token Ablation Experiments Complete ---")
         return results
 
     except Exception as e:
         print(f"Error during ablation experiments: {e}")
-        import traceback
         traceback.print_exc()
-        return {"error": str(e)}
+        return {"error": str(e), "traceback": traceback.format_exc()}

@@ -1055,9 +1055,10 @@ class TokenAnalyzer:
         with open(metrics_path, 'w') as f:
             json.dump(serializable_metrics, f, indent=2)
         
-        # Save summary
+        # Convert summary to serializable format and save
+        serializable_summary = self._make_serializable(summary)  # Added this line
         with open(summary_path, 'w') as f:
-            json.dump(summary, f, indent=2)
+            json.dump(serializable_summary, f, indent=2)
         
         print(f"Saved token metrics to: {metrics_path}")
         print(f"Saved analysis summary to: {summary_path}")
