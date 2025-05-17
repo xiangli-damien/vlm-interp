@@ -1437,7 +1437,7 @@ class TokenAnalyzer:
         reference_output: Optional[Dict[str, Any]] = None,
         start_block_layer: Optional[int] = None,
         end_block_layer: Optional[int] = None,
-        attention_mask_strategy: str = "none",  # New parameter: 'none', 'block', 'reduce'
+        attention_mask_strategy: str = "none",  # 'none', 'block', 'reduce'
         cache_hidden_states: bool = True,
         debug_logging: bool = False
     ) -> Dict[str, Any]:
@@ -1555,8 +1555,8 @@ class TokenAnalyzer:
                 return output_tensors
             return hook_fn
         
-        # Define hook for attention modules to modify attention masks
-        def attention_hook(name):
+        # Define hook for attention modules to modify attention weights
+        def attention_output_hook(name):
             def hook_fn(module, input_tensors, output_tensors):
                 # Don't apply attention masking if it's disabled
                 if attention_mask_strategy == "none":
@@ -1609,7 +1609,40 @@ class TokenAnalyzer:
                         new_outputs[1] = attention_weights
                         return tuple(new_outputs)
                 
-                # For inputs to attention (typically q, k, v tensors and attention mask)
+                return output_tensors
+            return hook_fn
+        
+        # Define hook for attention modules to modify attention masks - for pre-hooks
+        def attention_input_hook(name):
+            def hook_fn(module, input_tensors):  # Note: pre_hook only has two parameters
+                # Don't apply attention masking if it's disabled
+                if attention_mask_strategy == "none":
+                    return input_tensors
+                
+                # Extract layer index from name
+                layer_idx = -1
+                import re
+                match = re.search(r'layer[s]?\.(\d+)', name)
+                if match:
+                    layer_idx = int(match.group(1))
+                else:
+                    match = re.search(r'h\.(\d+)', name)
+                    if match:
+                        layer_idx = int(match.group(1))
+                    elif hasattr(module, 'layer_idx'):
+                        layer_idx = module.layer_idx
+                
+                # Check if we should apply blocking to this layer
+                apply_blocking = True
+                if start_block_layer is not None and layer_idx < start_block_layer:
+                    apply_blocking = False
+                if end_block_layer is not None and layer_idx > end_block_layer:
+                    apply_blocking = False
+                
+                if not apply_blocking:
+                    return input_tensors
+                
+                # For attention inputs (typically q, k, v tensors and attention mask)
                 if isinstance(input_tensors, tuple) and len(input_tensors) >= 2:
                     # Look for attention mask in inputs (typically position 3)
                     for i in range(len(input_tensors)):
@@ -1652,11 +1685,11 @@ class TokenAnalyzer:
                 
                 # Look for attention modules
                 if attention_mask_strategy != "none" and any(pattern in name for pattern in ['attention', 'attn']):
-                    # Register attention hook
-                    attn_hook_handles.append(module.register_forward_hook(attention_hook(name)))
-                    # Also try to hook attention input 
+                    # Register attention output hook
+                    attn_hook_handles.append(module.register_forward_hook(attention_output_hook(name)))
+                    # Also try to register attention input hook
                     if hasattr(module, 'register_forward_pre_hook'):
-                        attn_hook_handles.append(module.register_forward_pre_hook(attention_hook(f"{name}_input")))
+                        attn_hook_handles.append(module.register_forward_pre_hook(attention_input_hook(f"{name}_input")))
             
             print(f"Registered {len(hook_handles)} layer hooks and {len(attn_hook_handles)} attention hooks")
             
@@ -1670,11 +1703,19 @@ class TokenAnalyzer:
             
             with torch.no_grad():
                 # Run the model with hooks active
-                outputs = model(
-                    **{k: v for k, v in inputs.items() if k != "token_type_ids"},
-                    output_hidden_states=True,
-                    output_attentions=True  # Get attention matrices
-                )
+                try:
+                    outputs = model(
+                        **{k: v for k, v in inputs.items() if k != "token_type_ids"},
+                        output_hidden_states=True,
+                        output_attentions=True  # Get attention matrices
+                    )
+                except TypeError:
+                    # If model doesn't support output_attentions, try without it
+                    print("Model does not support output_attentions, trying without it...")
+                    outputs = model(
+                        **{k: v for k, v in inputs.items() if k != "token_type_ids"},
+                        output_hidden_states=True
+                    )
             
             # Remove hooks
             for handle in hook_handles:

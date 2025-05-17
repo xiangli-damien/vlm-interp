@@ -1785,3 +1785,275 @@ def run_enhanced_ablation_experiments(
         print(f"Error during enhanced ablation experiments: {e}")
         traceback.print_exc()
         return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+def run_specific_layer_blocking_experiment(
+    model,
+    processor,
+    image_source: Union[str, Image.Image],
+    prompt_text: str,
+    token_index: int,
+    token_text: str = "",
+    output_dir: str = "layer_specific_blocking_results",
+    method: str = "zero_out",
+    attention_mask_strategy: str = "block",
+    start_block_layer: int = 13,
+    end_block_layer: Optional[int] = None,
+    debug_mode: bool = False
+) -> Dict[str, Any]:
+    """
+    Run a blocking experiment for a specific token and layer range.
+    
+    This function focuses on examining the impact of blocking a specific token
+    starting from a particular layer.
+    
+    Args:
+        model: Model instance
+        processor: Processor instance
+        image_source: Image source (PIL image, URL, or local file path)
+        prompt_text: Text prompt for the model
+        token_index: Index of the token to block
+        token_text: Text representation of the token (optional, for logging)
+        output_dir: Directory path to save analysis outputs
+        method: Blocking method ("zero_out", "average", "noise", "interpolate")
+        attention_mask_strategy: Attention mask strategy ("none", "block", "reduce")
+        start_block_layer: First layer to apply blocking
+        end_block_layer: Last layer to apply blocking (None = to the last layer)
+        debug_mode: Whether to print detailed debug information
+        
+    Returns:
+        Dictionary with experiment results
+    """
+    import os
+    import json
+    import torch
+    import traceback
+    from typing import Dict, List, Any, Optional, Union
+    from PIL import Image
+    import matplotlib.pyplot as plt
+    
+    print(f"\n--- Running experiment blocking token {token_index} ({token_text}) from layer {start_block_layer} {'to layer ' + str(end_block_layer) if end_block_layer else 'to the end'} ---")
+    print(f"Blocking method: {method}, Attention mask strategy: {attention_mask_strategy}")
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    try:
+        # Prepare input data
+        from analyzer.semantic_tracing import EnhancedSemanticTracer
+        
+        tracer = EnhancedSemanticTracer(
+            model=model,
+            processor=processor,
+            output_dir=output_dir,
+            debug=debug_mode
+        )
+        
+        input_data = tracer.prepare_inputs(image_source, prompt_text)
+        
+        # Initialize TokenAnalyzer
+        from analyzer.token_analyzer import TokenAnalyzer
+        
+        analyzer = TokenAnalyzer(
+            output_dir=output_dir,
+            debug_mode=debug_mode
+        )
+        
+        # Run reference inference to get baseline
+        print("Running reference inference...")
+        with torch.no_grad():
+            reference_outputs = model(**{k: v for k, v in input_data["inputs"].items() if k != "token_type_ids"})
+            
+            # Get reference output token
+            reference_logits = reference_outputs.logits
+            
+            # Handle different logits shapes
+            if reference_logits.dim() == 2:  # [batch, vocab]
+                pred_logits = reference_logits
+            else:  # [batch, seq, vocab]
+                pred_logits = reference_logits[:, -1, :]
+                
+            reference_ids = torch.argmax(pred_logits, dim=-1).unsqueeze(0)
+            reference_text = processor.tokenizer.decode(reference_ids[0].tolist())
+            
+            # Get reference probabilities
+            reference_probs = torch.softmax(pred_logits, dim=-1)
+            
+            reference_result = {
+                "output_ids": reference_ids,
+                "output_text": reference_text,
+                "logits": pred_logits,
+                "probabilities": reference_probs
+            }
+        
+        print(f"Reference output: '{reference_text}'")
+        print(f"Reference token ID: {reference_ids[0].item()}")
+        print(f"Reference probability: {reference_probs[0, reference_ids[0]].item():.4f}")
+        
+        # Perform specific layer blocking experiment
+        print(f"\nPerforming blocking from layer {start_block_layer} {'to layer ' + str(end_block_layer) if end_block_layer else 'to the end'}...")
+        
+        block_result = analyzer.simulate_token_blocking(
+            model=model,
+            processor=processor,
+            input_data=input_data,
+            tokens_to_block=[token_index],
+            method=method,
+            reference_output=reference_result,
+            start_block_layer=start_block_layer,
+            end_block_layer=end_block_layer,
+            attention_mask_strategy=attention_mask_strategy,
+            debug_logging=debug_mode
+        )
+        
+        # Calculate total layers count (for visualization)
+        total_layers = 0
+        for name, _ in model.named_modules():
+            if any(pattern in name for pattern in ['layers.', 'layer.', 'h.']):
+                total_layers += 1
+        
+        if total_layers == 0:
+            if hasattr(model, 'config') and hasattr(model.config, 'num_hidden_layers'):
+                total_layers = model.config.num_hidden_layers
+            else:
+                total_layers = 32  # Common default for large LLMs
+        
+        # Create blocking range visualization
+        plt.figure(figsize=(12, 3))
+        plt.barh(["Blocking Range"], [end_block_layer - start_block_layer + 1 if end_block_layer else total_layers - start_block_layer], 
+                 left=[start_block_layer], color='red', alpha=0.6)
+        plt.xlim(0, total_layers)
+        plt.xlabel('Model Layers')
+        plt.title(f'Blocking Range Visualization for Token {token_index} ({token_text})')
+        
+        # Add legend
+        plt.axvline(x=start_block_layer, color='black', linestyle='--', label=f'Start Layer ({start_block_layer})')
+        if end_block_layer:
+            plt.axvline(x=end_block_layer, color='gray', linestyle='--', label=f'End Layer ({end_block_layer})')
+        else:
+            plt.axvline(x=total_layers-1, color='gray', linestyle=':', label=f'Last Layer ({total_layers-1})')
+        
+        plt.legend()
+        plt.tight_layout()
+        
+        # Save visualization
+        block_range_viz_path = os.path.join(output_dir, f'token_{token_index}_block_range.png')
+        plt.savefig(block_range_viz_path)
+        plt.close()
+        
+        # Get experiment results
+        print("\nBlocking Experiment Results:")
+        
+        if "error" in block_result:
+            print(f"Error: {block_result['error']}")
+            return block_result
+        
+        generated_text = block_result.get("generated_text", "")
+        comparison = block_result.get("comparison", {})
+        
+        impact_score = comparison.get("impact_score", 0)
+        token_match = comparison.get("token_match", False)
+        ref_token_prob = comparison.get("ref_token_prob", 0)
+        
+        print(f"Reference output: '{reference_text}'")
+        print(f"Blocked output: '{generated_text}'")
+        print(f"Impact score: {impact_score:.4f}")
+        print(f"Reference token probability: {ref_token_prob:.4f}")
+        print(f"Matches original output: {token_match}")
+        
+        # If we have top tokens information, display it
+        if "ref_top_tokens" in comparison and "sim_top_tokens" in comparison:
+            print("\nTop Tokens Comparison:")
+            print("  Reference Model Top-5:")
+            for i, token in enumerate(comparison["ref_top_tokens"]):
+                print(f"    {i+1}. '{token['text']}' (ID: {token['id']}, Prob: {token['prob']:.4f})")
+                
+            print("  Blocked Model Top-5:")
+            for i, token in enumerate(comparison["sim_top_tokens"]):
+                print(f"    {i+1}. '{token['text']}' (ID: {token['id']}, Prob: {token['prob']:.4f})")
+        
+        # Create probability change visualization
+        if "ref_top_tokens" in comparison and "sim_top_tokens" in comparison:
+            ref_top = comparison["ref_top_tokens"]
+            sim_top = comparison["sim_top_tokens"]
+            
+            # Collect all unique tokens
+            all_tokens = {}
+            for t in ref_top:
+                all_tokens[t["id"]] = {"text": t["text"], "ref_prob": t["prob"], "sim_prob": 0}
+            for t in sim_top:
+                if t["id"] in all_tokens:
+                    all_tokens[t["id"]]["sim_prob"] = t["prob"]
+                else:
+                    all_tokens[t["id"]] = {"text": t["text"], "ref_prob": 0, "sim_prob": t["prob"]}
+            
+            # Get sorted list of all tokens
+            tokens_list = sorted(all_tokens.items(), key=lambda x: max(x[1]["ref_prob"], x[1]["sim_prob"]), reverse=True)
+            
+            # Chart data
+            token_ids = [t[0] for t in tokens_list[:8]]  # Limit to top 8
+            token_texts = [t[1]["text"] for t in tokens_list[:8]]
+            ref_probs = [t[1]["ref_prob"] for t in tokens_list[:8]]
+            sim_probs = [t[1]["sim_prob"] for t in tokens_list[:8]]
+            
+            # Create comparative bar chart
+            plt.figure(figsize=(12, 6))
+            x = range(len(token_ids))
+            width = 0.35
+            
+            plt.bar([i - width/2 for i in x], ref_probs, width, label='Reference Model', color='blue', alpha=0.7)
+            plt.bar([i + width/2 for i in x], sim_probs, width, label='Blocked Model', color='red', alpha=0.7)
+            
+            plt.xlabel('Tokens')
+            plt.ylabel('Probability')
+            plt.title(f'Top Token Probability Changes After Blocking Token {token_index}\nFrom Layer {start_block_layer} {"to Layer " + str(end_block_layer) if end_block_layer else "to the End"}')
+            plt.xticks(x, [f"{txt}\n(ID: {id})" for txt, id in zip(token_texts, token_ids)], rotation=45, ha='right')
+            plt.legend()
+            plt.grid(True, linestyle='--', alpha=0.3)
+            plt.tight_layout()
+            
+            probs_viz_path = os.path.join(output_dir, f'token_{token_index}_probability_changes.png')
+            plt.savefig(probs_viz_path)
+            plt.close()
+        
+        # Save detailed results
+        results = {
+            "experiment_config": {
+                "token_index": token_index,
+                "token_text": token_text,
+                "method": method,
+                "attention_mask_strategy": attention_mask_strategy,
+                "start_block_layer": start_block_layer,
+                "end_block_layer": end_block_layer,
+                "total_layers": total_layers
+            },
+            "reference_output": {
+                "text": reference_text,
+                "token_id": reference_ids[0].item(),
+                "probability": reference_probs[0, reference_ids[0]].item()
+            },
+            "blocking_results": block_result,
+            "visualizations": {
+                "block_range": block_range_viz_path
+            }
+        }
+        
+        if "probs_viz_path" in locals():
+            results["visualizations"]["probability_changes"] = probs_viz_path
+        
+        # Save results to JSON
+        results_path = os.path.join(output_dir, f"token_{token_index}_layer_{start_block_layer}_results.json")
+        with open(results_path, 'w') as f:
+            # Convert to serializable format
+            serializable_results = analyzer._make_serializable(results)
+            json.dump(serializable_results, f, indent=2)
+        
+        print(f"\nExperiment results saved to: {results_path}")
+        print(f"Visualizations saved to: {output_dir}")
+        
+        return results
+        
+    except Exception as e:
+        print(f"Error during experiment: {e}")
+        traceback.print_exc()
+        return {"error": str(e), "traceback": traceback.format_exc()}
