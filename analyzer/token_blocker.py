@@ -22,7 +22,8 @@ class TokenBlockingExperiment:
         output_dir: str = "blocking_experiments",
         debug_mode: bool = False,
         cpu_offloading: bool = True,  # New parameter to enable CPU offloading
-        batch_size: int = 4          # New parameter for batched token generation
+        batch_size: int = 4,          # New parameter for batched token generation
+        save_top_k_probs: int = 5     # New parameter to save top-k probabilities
     ):
         """
         Initialize the experiment framework.
@@ -34,6 +35,7 @@ class TokenBlockingExperiment:
             debug_mode: Enable detailed debug logging
             cpu_offloading: Whether to offload tensors to CPU to reduce GPU memory
             batch_size: Number of tokens to generate in each batch
+            save_top_k_probs: Number of top token probabilities to save (0 to disable)
         """
         self.model = model
         self.processor = processor
@@ -41,6 +43,7 @@ class TokenBlockingExperiment:
         self.debug_mode = debug_mode
         self.cpu_offloading = cpu_offloading
         self.batch_size = batch_size
+        self.save_top_k_probs = save_top_k_probs
         os.makedirs(output_dir, exist_ok=True)
         
         # For tracking hook calls
@@ -114,14 +117,15 @@ class TokenBlockingExperiment:
         end_layer: Optional[int] = None,
         num_tokens_to_generate: int = 1,
         max_memory_usage: float = 0.95,  # New parameter to limit memory usage (fraction of available)
-        save_hidden_states: bool = False  # New parameter to optionally disable saving hidden states
+        save_hidden_states: bool = False,  # New parameter to optionally disable saving hidden states
+        analyze_target_tokens: Optional[List[int]] = None  # New parameter to specify tokens for detailed analysis
     ):
         """
         Run a token blocking experiment, generating multiple tokens.
         
         Args:
             inputs: Model inputs (output from processor)
-            tokens_to_block: List of token indices to block
+            tokens_to_block: List of token indices to block, or a single token index
             method: Blocking method ("zero_out", "average", "noise", "interpolate", "reduce")
             attention_strategy: Attention masking strategy ("none", "block", "reduce")
             start_layer: First layer to apply blocking (None = from beginning)
@@ -129,6 +133,7 @@ class TokenBlockingExperiment:
             num_tokens_to_generate: Number of tokens to generate
             max_memory_usage: Maximum fraction of GPU memory to use before moving to CPU
             save_hidden_states: Whether to save hidden states (memory intensive)
+            analyze_target_tokens: List of token IDs to analyze in detail (probabilities before and after)
             
         Returns:
             Dictionary with experiment results
@@ -136,6 +141,10 @@ class TokenBlockingExperiment:
         # Validate parameters
         if not self.all_layers:
             return {"error": "No layers found in model"}
+        
+        # Convert single token to list if needed
+        if isinstance(tokens_to_block, (int, float)):
+            tokens_to_block = [int(tokens_to_block)]
         
         valid_methods = ["zero_out", "average", "noise", "interpolate", "reduce"]
         if method not in valid_methods:
@@ -163,7 +172,8 @@ class TokenBlockingExperiment:
         reference_results = self._run_model_inference(
             inputs, 
             num_tokens=num_tokens_to_generate,
-            include_hidden_states=save_hidden_states
+            include_hidden_states=save_hidden_states,
+            analyze_token_ids=analyze_target_tokens
         )
         
         # Format baseline results
@@ -171,6 +181,15 @@ class TokenBlockingExperiment:
         reference_text = reference_results["generated_text"]
         
         print(f"Baseline generated: '{reference_text}'")
+        
+        # Display token prediction probabilities if analyzing target tokens
+        if analyze_target_tokens and "token_predictions" in reference_results:
+            print("\nBaseline token predictions:")
+            for token_id, probs in reference_results["token_predictions"].items():
+                top_tokens = [(self.processor.tokenizer.decode([idx]), prob) for idx, prob in probs["top_tokens"]]
+                print(f"  Token ID {token_id}: Top predictions")
+                for i, (text, prob) in enumerate(top_tokens[:5]):
+                    print(f"    {i+1}. '{text}' - Probability: {prob:.6f}")
         
         # Clean up memory again before running the blocking experiment
         self._clean_memory()
@@ -196,7 +215,8 @@ class TokenBlockingExperiment:
                     inputs, 
                     num_tokens=num_tokens_to_generate,
                     include_hidden_states=save_hidden_states,
-                    max_memory_usage=max_memory_usage
+                    max_memory_usage=max_memory_usage,
+                    analyze_token_ids=analyze_target_tokens
                 )
             
             # Format results
@@ -204,6 +224,38 @@ class TokenBlockingExperiment:
             blocked_text = blocked_results["generated_text"]
             
             print(f"Blocked generated: '{blocked_text}'")
+            
+            # Display token prediction probabilities with blocking
+            if analyze_target_tokens and "token_predictions" in blocked_results:
+                print("\nBlocked token predictions:")
+                for token_id, probs in blocked_results["token_predictions"].items():
+                    top_tokens = [(self.processor.tokenizer.decode([idx]), prob) for idx, prob in probs["top_tokens"]]
+                    print(f"  Token ID {token_id}: Top predictions")
+                    for i, (text, prob) in enumerate(top_tokens[:5]):
+                        print(f"    {i+1}. '{text}' - Probability: {prob:.6f}")
+                
+                # Compare probabilities between baseline and blocked runs
+                if "token_predictions" in reference_results:
+                    print("\nToken prediction changes (baseline → blocked):")
+                    for token_id in analyze_target_tokens:
+                        if token_id in reference_results["token_predictions"] and token_id in blocked_results["token_predictions"]:
+                            ref_probs = reference_results["token_predictions"][token_id]
+                            block_probs = blocked_results["token_predictions"][token_id]
+                            
+                            # Get the top tokens from baseline
+                            top_ref_tokens = dict(ref_probs["top_tokens"])
+                            top_block_tokens = dict(block_probs["top_tokens"])
+                            
+                            # Compare top tokens from baseline
+                            print(f"  Token ID {token_id} - Top tokens from baseline:")
+                            for idx, ref_prob in ref_probs["top_tokens"]:
+                                token_text = self.processor.tokenizer.decode([idx])
+                                block_prob = top_block_tokens.get(idx, 0.0)
+                                change = block_prob - ref_prob
+                                change_pct = (change / ref_prob) * 100 if ref_prob > 0 else float('inf')
+                                
+                                print(f"    '{token_text}' - {ref_prob:.6f} → {block_prob:.6f} "
+                                      f"(Change: {change:+.6f}, {change_pct:+.2f}%)")
             
             # Compare results
             token_comparison = self._compare_token_sequences(reference_tokens, blocked_tokens)
@@ -221,11 +273,13 @@ class TokenBlockingExperiment:
                 },
                 "reference": {
                     "tokens": reference_tokens,
-                    "text": reference_text
+                    "text": reference_text,
+                    "token_predictions": reference_results.get("token_predictions", {})
                 },
                 "blocked": {
                     "tokens": blocked_tokens,
-                    "text": blocked_text
+                    "text": blocked_text,
+                    "token_predictions": blocked_results.get("token_predictions", {})
                 },
                 "comparison": token_comparison,
                 "hook_calls": dict(self.hook_call_tracking) if self.debug_mode else None
@@ -570,7 +624,7 @@ class TokenBlockingExperiment:
         
         return hook_fn
     
-    def _run_model_inference(self, inputs, num_tokens=1, include_hidden_states=False, max_memory_usage=0.95):
+    def _run_model_inference(self, inputs, num_tokens=1, include_hidden_states=False, max_memory_usage=0.95, analyze_token_ids=None):
         """
         Run model inference, potentially generating multiple tokens.
         
@@ -581,6 +635,7 @@ class TokenBlockingExperiment:
             num_tokens: Number of tokens to generate
             include_hidden_states: Whether to include hidden states in output (memory intensive)
             max_memory_usage: Maximum fraction of GPU memory to use before offloading
+            analyze_token_ids: List of token IDs to analyze in detail (save prediction probabilities)
             
         Returns:
             Dictionary with generation results
@@ -592,6 +647,9 @@ class TokenBlockingExperiment:
         
         # Make sure model is in eval mode
         self.model.eval()
+        
+        # Track token predictions for analysis
+        token_predictions = {}
         
         # For generation with multiple tokens
         if num_tokens > 1:
@@ -657,6 +715,28 @@ class TokenBlockingExperiment:
                     
                     # Get prediction for next token
                     logits = outputs.logits[:, -1, :]
+                    
+                    # Save token prediction probabilities if this position is in analyze_token_ids
+                    current_position = original_length + token_idx
+                    if analyze_token_ids is not None and current_position in analyze_token_ids:
+                        # Calculate softmax probabilities
+                        probs = torch.nn.functional.softmax(logits, dim=-1)[0]
+                        
+                        # Get top-k tokens and their probabilities
+                        k = min(self.save_top_k_probs, probs.shape[0]) if self.save_top_k_probs > 0 else 10
+                        top_k_probs, top_k_indices = torch.topk(probs, k)
+                        
+                        # Convert to list for easier processing
+                        top_tokens = [(idx.item(), prob.item()) for idx, prob in zip(top_k_indices, top_k_probs)]
+                        
+                        # Save predictions for this token
+                        token_predictions[current_position] = {
+                            "position": current_position,
+                            "top_tokens": top_tokens,
+                            "top_prob_sum": sum(prob for _, prob in top_tokens)
+                        }
+                    
+                    # Get next token
                     next_token_id = torch.argmax(logits, dim=-1, keepdim=True)
                     
                     # Extract token text
@@ -720,6 +800,10 @@ class TokenBlockingExperiment:
                 "token_ids": all_ids,
             }
             
+            # Add token predictions if available
+            if token_predictions:
+                result["token_predictions"] = token_predictions
+            
             # Clean up before returning
             del current_inputs
             gc.collect()
@@ -735,6 +819,27 @@ class TokenBlockingExperiment:
             
             # Get prediction for next token
             logits = outputs.logits[:, -1, :]
+            current_position = inputs["input_ids"].shape[1]
+            
+            # Save token prediction probabilities if requested
+            if analyze_token_ids is not None and current_position in analyze_token_ids:
+                # Calculate softmax probabilities
+                probs = torch.nn.functional.softmax(logits, dim=-1)[0]
+                
+                # Get top-k tokens and their probabilities
+                k = min(self.save_top_k_probs, probs.shape[0]) if self.save_top_k_probs > 0 else 10
+                top_k_probs, top_k_indices = torch.topk(probs, k)
+                
+                # Convert to list for easier processing
+                top_tokens = [(idx.item(), prob.item()) for idx, prob in zip(top_k_indices, top_k_probs)]
+                
+                # Save predictions for this token
+                token_predictions[current_position] = {
+                    "position": current_position,
+                    "top_tokens": top_tokens,
+                    "top_prob_sum": sum(prob for _, prob in top_tokens)
+                }
+            
             next_token_id = torch.argmax(logits, dim=-1).item()
             token_text = self.processor.tokenizer.decode([next_token_id])
             
@@ -747,6 +852,10 @@ class TokenBlockingExperiment:
                 "generated_text": token_text,
                 "token_ids": [next_token_id],
             }
+            
+            # Add token predictions if available
+            if token_predictions:
+                result["token_predictions"] = token_predictions
             
             # Clean up
             del outputs, logits
