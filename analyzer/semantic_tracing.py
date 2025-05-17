@@ -701,10 +701,12 @@ class EnhancedSemanticTracer:
             layer_name = self._get_layer_name(layer_idx)
             print(f"\nProcessing layer {layer_idx} ({layer_name})...")
             
+            source_totals: Dict[int, float] = {}
+            
             # Debug information for the current layer and targets
             if self.debug:
                 print(f"[DBG][layer {layer_idx}] #cur_tgt={len(current_targets)} "
-                      f"sum_tgt_weights={sum(current_targets.values()):.4e}")
+                    f"sum_tgt_weights={sum(current_targets.values()):.4e}")
             
             # 1. Get attention weights for current targets
             current_target_indices = list(current_targets.keys())
@@ -768,7 +770,7 @@ class EnhancedSemanticTracer:
                 # Debug: Check selected values sum
                 if self.debug:
                     print(f"[DBG][layer {layer_idx}] Selected {len(selected_indices)} sources, "
-                          f"sum: {selected_values.sum().item():.4e}")
+                        f"sum: {selected_values.sum().item():.4e}")
                 
                 # Get source info and normalize weights for next iteration
                 sources = []
@@ -843,76 +845,6 @@ class EnhancedSemanticTracer:
                 if logit_lens_results:
                     layer_results["logit_lens_projections"] = logit_lens_results
                     
-                    # Add records to the trace dataframe
-                    for token_idx in all_token_indices:
-                        # Find if this token is a target
-                        is_target = any(t["index"] == token_idx for t in layer_results["target_tokens"])
-                        
-                        # Find if this token is a source and for which target(s)
-                        # Modified to track all targets this token is a source for
-                        source_targets = []
-                        for t in layer_results["target_tokens"]:
-                            for s in t["sources"]:
-                                if s["index"] == token_idx:
-                                    source_targets.append(t["index"])
-                        
-                        # Get token projection data
-                        token_projection = logit_lens_results.get(token_idx, {})
-                        top_predictions = token_projection.get("top_predictions", [])
-                        concept_predictions = token_projection.get("concept_predictions", {})
-                        
-                        # Extract top prediction
-                        top_pred_text = ""
-                        top_pred_prob = 0.0
-                        if top_predictions and len(top_predictions) > 0:
-                            top_pred_text = top_predictions[0].get("token_text", "")
-                            top_pred_prob = top_predictions[0].get("probability", 0.0)
-                        
-                        # Extract target concept probabilities
-                        concept_probs = {}
-                        for concept, data in concept_predictions.items():
-                            concept_probs[concept] = data.get("probability", 0.0)
-                        
-                        # Sanitize token text for CSV
-                        sanitized_token_text = self._sanitize_text_for_display(all_token_texts[token_idx])
-                        sanitized_pred_text = self._sanitize_text_for_display(top_pred_text)
-                        
-                        # Create record
-                        record = {
-                            "layer": layer_idx,
-                            "token_index": token_idx,
-                            "token_text": sanitized_token_text,
-                            "token_id": all_token_ids[token_idx],
-                            "token_type": token_types[token_idx].item(),
-                            "is_target": is_target,
-                            "source_for_targets": ",".join(map(str, source_targets)),  # Store as comma-separated list
-                            "predicted_top_token": sanitized_pred_text,
-                            "predicted_top_prob": top_pred_prob,
-                            "trace_id": trace_id,
-                        }
-
-                        # Add importance weight for heatmap visualization
-                        record["importance_weight"] = source_totals.get(token_idx, 0.0)
-                        
-                        # Add source-target relationship (needed for flow graph visualization)
-                        if is_target:
-                            sources_indices = []
-                            sources_weights = []
-                            for target in layer_results["target_tokens"]:
-                                if target["index"] == token_idx:
-                                    for src in target["sources"]:
-                                        sources_indices.append(src["index"])
-                                        sources_weights.append(src["scaled_weight"])
-                            
-                            # Store as comma-separated strings for CSV compatibility
-                            record["sources_indices"] = ",".join(map(str, sources_indices))
-                            record["sources_weights"] = ",".join(map(str, sources_weights))
-                        
-                        # Add concept probabilities
-                        for concept, prob in concept_probs.items():
-                            record[f"concept_{concept}_prob"] = prob
-                            
-                        trace_records.append(record)
             
             # 4. Layer-level source node pruning - OPTIMIZED to avoid duplicates
             # Aggregate sources by index to avoid duplicates
@@ -963,6 +895,79 @@ class EnhancedSemanticTracer:
                         if s["index"] in remaining_source_indices
                     ]
             
+            # FIX: 在剪枝完成后添加记录到trace_records
+            # 此时 source_totals 已经被定义，可以安全使用
+            if all_token_indices and logit_lens_results:
+                for token_idx in all_token_indices:
+                    # Find if this token is a target
+                    is_target = any(t["index"] == token_idx for t in layer_results["target_tokens"])
+                    
+                    # Find if this token is a source and for which target(s)
+                    # Modified to track all targets this token is a source for
+                    source_targets = []
+                    for t in layer_results["target_tokens"]:
+                        for s in t["sources"]:
+                            if s["index"] == token_idx:
+                                source_targets.append(t["index"])
+                    
+                    # Get token projection data
+                    token_projection = logit_lens_results.get(token_idx, {})
+                    top_predictions = token_projection.get("top_predictions", [])
+                    concept_predictions = token_projection.get("concept_predictions", {})
+                    
+                    # Extract top prediction
+                    top_pred_text = ""
+                    top_pred_prob = 0.0
+                    if top_predictions and len(top_predictions) > 0:
+                        top_pred_text = top_predictions[0].get("token_text", "")
+                        top_pred_prob = top_predictions[0].get("probability", 0.0)
+                    
+                    # Extract target concept probabilities
+                    concept_probs = {}
+                    for concept, data in concept_predictions.items():
+                        concept_probs[concept] = data.get("probability", 0.0)
+                    
+                    # Sanitize token text for CSV
+                    sanitized_token_text = self._sanitize_text_for_display(all_token_texts[token_idx])
+                    sanitized_pred_text = self._sanitize_text_for_display(top_pred_text)
+                    
+                    # Create record
+                    record = {
+                        "layer": layer_idx,
+                        "token_index": token_idx,
+                        "token_text": sanitized_token_text,
+                        "token_id": all_token_ids[token_idx],
+                        "token_type": token_types[token_idx].item(),
+                        "is_target": is_target,
+                        "source_for_targets": ",".join(map(str, source_targets)),  # Store as comma-separated list
+                        "predicted_top_token": sanitized_pred_text,
+                        "predicted_top_prob": top_pred_prob,
+                        "trace_id": trace_id,
+                    }
+
+                    # 现在可以安全地使用 source_totals
+                    record["importance_weight"] = source_totals.get(token_idx, 0.0)
+                    
+                    # Add source-target relationship (needed for flow graph visualization)
+                    if is_target:
+                        sources_indices = []
+                        sources_weights = []
+                        for target in layer_results["target_tokens"]:
+                            if target["index"] == token_idx:
+                                for src in target["sources"]:
+                                    sources_indices.append(src["index"])
+                                    sources_weights.append(src["scaled_weight"])
+                        
+                        # Store as comma-separated strings for CSV compatibility
+                        record["sources_indices"] = ",".join(map(str, sources_indices))
+                        record["sources_weights"] = ",".join(map(str, sources_weights))
+                    
+                    # Add concept probabilities
+                    for concept, prob in concept_probs.items():
+                        record[f"concept_{concept}_prob"] = prob
+                        
+                    trace_records.append(record)
+            
             # 5. Update current_targets for next layer
             new_targets = {}
             for target_idx, sources in target_to_sources.items():
@@ -988,7 +993,7 @@ class EnhancedSemanticTracer:
                 # Debug: Print after normalization
                 if self.debug:
                     print(f"[DBG][layer {layer_idx}] New targets after norm: "
-                          f"count={len(current_targets)}, sum={sum(current_targets.values()):.4f}")
+                        f"count={len(current_targets)}, sum={sum(current_targets.values()):.4f}")
             else:
                 print("Warning: No valid sources found for this layer. Stopping trace.")
                 break
@@ -1275,10 +1280,13 @@ class EnhancedSemanticTracer:
             layer_name = self._get_layer_name(layer_idx)
             print(f"\nProcessing layer {layer_idx} ({layer_name})...")
             
+            # FIX: 提前初始化 source_totals 字典，确保在任何分支都能安全访问
+            source_totals: Dict[int, float] = {}
+            
             # Debug information for the current layer and targets
             if self.debug:
                 print(f"[DBG][layer {layer_idx}] #cur_tgt={len(current_targets)} "
-                      f"sum_tgt_weights={sum(current_targets.values()):.4e}")
+                    f"sum_tgt_weights={sum(current_targets.values()):.4e}")
             
             # 1. Compute saliency scores for current targets
             current_target_indices = list(current_targets.keys())
@@ -1351,7 +1359,7 @@ class EnhancedSemanticTracer:
                 # Debug: Check selected values sum
                 if self.debug:
                     print(f"[DBG][layer {layer_idx}] Selected {len(selected_indices)} sources, "
-                          f"sum: {selected_values.sum().item():.4e}")
+                        f"sum: {selected_values.sum().item():.4e}")
                     print(f"[DBG][layer {layer_idx}] Selected values abs sum: {selected_values.abs().sum().item():.4e}")
                 
                 # Get source info and normalize weights for next iteration
@@ -1429,75 +1437,8 @@ class EnhancedSemanticTracer:
                 if logit_lens_results:
                     layer_results["logit_lens_projections"] = logit_lens_results
                     
-                    # Add records to the trace dataframe
-                    for token_idx in all_token_indices:
-                        # Find if this token is a target
-                        is_target = any(t["index"] == token_idx for t in layer_results["target_tokens"])
-                        
-                        # Find if this token is a source and for which target(s)
-                        # Modified to track all targets this token is a source for
-                        source_targets = []
-                        for t in layer_results["target_tokens"]:
-                            for s in t["sources"]:
-                                if s["index"] == token_idx:
-                                    source_targets.append(t["index"])
-                        
-                        # Get token projection data
-                        token_projection = logit_lens_results.get(token_idx, {})
-                        top_predictions = token_projection.get("top_predictions", [])
-                        concept_predictions = token_projection.get("concept_predictions", {})
-                        
-                        # Extract top prediction
-                        top_pred_text = ""
-                        top_pred_prob = 0.0
-                        if top_predictions and len(top_predictions) > 0:
-                            top_pred_text = top_predictions[0].get("token_text", "")
-                            top_pred_prob = top_predictions[0].get("probability", 0.0)
-                        
-                        # Extract target concept probabilities
-                        concept_probs = {}
-                        for concept, data in concept_predictions.items():
-                            concept_probs[concept] = data.get("probability", 0.0)
-                        
-                        # Sanitize token text for CSV
-                        sanitized_token_text = self._sanitize_text_for_display(all_token_texts[token_idx])
-                        sanitized_pred_text = self._sanitize_text_for_display(top_pred_text)
-                        
-                        # Create record
-                        record = {
-                            "layer": layer_idx,
-                            "token_index": token_idx,
-                            "token_text": sanitized_token_text,
-                            "token_id": all_token_ids[token_idx],
-                            "token_type": token_types[token_idx].item(),
-                            "is_target": is_target,
-                            "source_for_targets": ",".join(map(str, source_targets)),  # Store as comma-separated list
-                            "predicted_top_token": sanitized_pred_text,
-                            "predicted_top_prob": top_pred_prob,
-                            "trace_id": trace_id,
-                        }
-
-                        record["importance_weight"] = source_totals.get(token_idx, 0.0)
-                        
-                        # Add source-target relationship (needed for flow graph visualization)
-                        if is_target:
-                            sources_indices = []
-                            sources_weights = []
-                            for target in layer_results["target_tokens"]:
-                                if target["index"] == token_idx:
-                                    for src in target["sources"]:
-                                        sources_indices.append(src["index"])
-                                        sources_weights.append(src["scaled_weight"])
-                            
-                            # Store as comma-separated strings for CSV compatibility
-                            record["sources_indices"] = ",".join(map(str, sources_indices))
-                            record["sources_weights"] = ",".join(map(str, sources_weights))
-                        
-                        # Add concept probabilities
-                        for concept, prob in concept_probs.items():
-                            record[f"concept_{concept}_prob"] = prob
-                            
-                        trace_records.append(record)
+                    # FIX: 删除这里的记录添加代码，移到完成剪枝后进行
+                    # 原代码在这里添加记录，但此时 source_totals 尚未定义
             
             # 4. Layer-level source node pruning - OPTIMIZED to avoid duplicates
             # Aggregate sources by index to avoid duplicates
@@ -1548,6 +1489,79 @@ class EnhancedSemanticTracer:
                         if s["index"] in remaining_source_indices
                     ]
             
+            # FIX: 在剪枝完成后添加记录到trace_records
+            # 此时 source_totals 已经被定义，可以安全使用
+            if all_token_indices and logit_lens_results:
+                for token_idx in all_token_indices:
+                    # Find if this token is a target
+                    is_target = any(t["index"] == token_idx for t in layer_results["target_tokens"])
+                    
+                    # Find if this token is a source and for which target(s)
+                    # Modified to track all targets this token is a source for
+                    source_targets = []
+                    for t in layer_results["target_tokens"]:
+                        for s in t["sources"]:
+                            if s["index"] == token_idx:
+                                source_targets.append(t["index"])
+                    
+                    # Get token projection data
+                    token_projection = logit_lens_results.get(token_idx, {})
+                    top_predictions = token_projection.get("top_predictions", [])
+                    concept_predictions = token_projection.get("concept_predictions", {})
+                    
+                    # Extract top prediction
+                    top_pred_text = ""
+                    top_pred_prob = 0.0
+                    if top_predictions and len(top_predictions) > 0:
+                        top_pred_text = top_predictions[0].get("token_text", "")
+                        top_pred_prob = top_predictions[0].get("probability", 0.0)
+                    
+                    # Extract target concept probabilities
+                    concept_probs = {}
+                    for concept, data in concept_predictions.items():
+                        concept_probs[concept] = data.get("probability", 0.0)
+                    
+                    # Sanitize token text for CSV
+                    sanitized_token_text = self._sanitize_text_for_display(all_token_texts[token_idx])
+                    sanitized_pred_text = self._sanitize_text_for_display(top_pred_text)
+                    
+                    # Create record
+                    record = {
+                        "layer": layer_idx,
+                        "token_index": token_idx,
+                        "token_text": sanitized_token_text,
+                        "token_id": all_token_ids[token_idx],
+                        "token_type": token_types[token_idx].item(),
+                        "is_target": is_target,
+                        "source_for_targets": ",".join(map(str, source_targets)),  # Store as comma-separated list
+                        "predicted_top_token": sanitized_pred_text,
+                        "predicted_top_prob": top_pred_prob,
+                        "trace_id": trace_id,
+                    }
+
+                    # 现在可以安全地使用 source_totals
+                    record["importance_weight"] = source_totals.get(token_idx, 0.0)
+                    
+                    # Add source-target relationship (needed for flow graph visualization)
+                    if is_target:
+                        sources_indices = []
+                        sources_weights = []
+                        for target in layer_results["target_tokens"]:
+                            if target["index"] == token_idx:
+                                for src in target["sources"]:
+                                    sources_indices.append(src["index"])
+                                    sources_weights.append(src["scaled_weight"])
+                        
+                        # Store as comma-separated strings for CSV compatibility
+                        record["sources_indices"] = ",".join(map(str, sources_indices))
+                        record["sources_weights"] = ",".join(map(str, sources_weights))
+                    
+                    # Add concept probabilities
+                    for concept, prob in concept_probs.items():
+                        record[f"concept_{concept}_prob"] = prob
+                        
+                    trace_records.append(record)
+            
             # 5. Update current_targets for next layer
             new_targets = {}
             for target_idx, sources in target_to_sources.items():
@@ -1573,7 +1587,7 @@ class EnhancedSemanticTracer:
                 # Debug: Print after normalization
                 if self.debug:
                     print(f"[DBG][layer {layer_idx}] New targets after norm: "
-                          f"count={len(current_targets)}, sum={sum(current_targets.values()):.4f}")
+                        f"count={len(current_targets)}, sum={sum(current_targets.values()):.4f}")
             else:
                 print("Warning: No valid sources found for this layer. Stopping trace.")
                 break
