@@ -1,4 +1,3 @@
-# analyzer/token_blocker.py
 import torch
 import os
 import gc
@@ -13,7 +12,7 @@ class TokenBlockingExperiment:
     Conducts experiments by blocking specific tokens in a model's hidden states
     to analyze their impact on model prediction.
     
-    Focuses on reliable hidden state blocking with optional attention masking.
+    Memory-optimized version with CPU offloading and enhanced memory management.
     """
     
     def __init__(
@@ -21,7 +20,9 @@ class TokenBlockingExperiment:
         model,
         processor,
         output_dir: str = "blocking_experiments",
-        debug_mode: bool = False
+        debug_mode: bool = False,
+        cpu_offloading: bool = True,  # New parameter to enable CPU offloading
+        batch_size: int = 4          # New parameter for batched token generation
     ):
         """
         Initialize the experiment framework.
@@ -31,11 +32,15 @@ class TokenBlockingExperiment:
             processor: Model processor/tokenizer
             output_dir: Directory to save results
             debug_mode: Enable detailed debug logging
+            cpu_offloading: Whether to offload tensors to CPU to reduce GPU memory
+            batch_size: Number of tokens to generate in each batch
         """
         self.model = model
         self.processor = processor
         self.output_dir = output_dir
         self.debug_mode = debug_mode
+        self.cpu_offloading = cpu_offloading
+        self.batch_size = batch_size
         os.makedirs(output_dir, exist_ok=True)
         
         # For tracking hook calls
@@ -107,7 +112,9 @@ class TokenBlockingExperiment:
         attention_strategy: str = "none",
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        num_tokens_to_generate: int = 1
+        num_tokens_to_generate: int = 1,
+        max_memory_usage: float = 0.95,  # New parameter to limit memory usage (fraction of available)
+        save_hidden_states: bool = False  # New parameter to optionally disable saving hidden states
     ):
         """
         Run a token blocking experiment, generating multiple tokens.
@@ -120,6 +127,8 @@ class TokenBlockingExperiment:
             start_layer: First layer to apply blocking (None = from beginning)
             end_layer: Last layer to apply blocking (None = to end)
             num_tokens_to_generate: Number of tokens to generate
+            max_memory_usage: Maximum fraction of GPU memory to use before moving to CPU
+            save_hidden_states: Whether to save hidden states (memory intensive)
             
         Returns:
             Dictionary with experiment results
@@ -146,12 +155,15 @@ class TokenBlockingExperiment:
         if end_layer < start_layer or end_layer >= len(self.all_layers):
             return {"error": f"Invalid end_layer: {end_layer}. Must be between {start_layer} and {len(self.all_layers)-1}"}
         
+        # Clean up memory before starting experiment
+        self._clean_memory()
+        
         # Run baseline inference first (no blocking)
         print(f"Running baseline inference without blocking...")
         reference_results = self._run_model_inference(
             inputs, 
             num_tokens=num_tokens_to_generate,
-            include_hidden_states=True
+            include_hidden_states=save_hidden_states
         )
         
         # Format baseline results
@@ -159,6 +171,9 @@ class TokenBlockingExperiment:
         reference_text = reference_results["generated_text"]
         
         print(f"Baseline generated: '{reference_text}'")
+        
+        # Clean up memory again before running the blocking experiment
+        self._clean_memory()
         
         # Run blocking experiment
         blocking_range = f"layers {start_layer} to {end_layer}"
@@ -180,7 +195,8 @@ class TokenBlockingExperiment:
                 blocked_results = self._run_model_inference(
                     inputs, 
                     num_tokens=num_tokens_to_generate,
-                    include_hidden_states=True
+                    include_hidden_states=save_hidden_states,
+                    max_memory_usage=max_memory_usage
                 )
             
             # Format results
@@ -231,6 +247,46 @@ class TokenBlockingExperiment:
             
             # Reset call tracking
             self.hook_call_tracking = {}
+            
+            # Clean up memory after experiment
+            self._clean_memory()
+    
+    def _clean_memory(self):
+        """
+        Clean up memory by releasing CUDA cache and running garbage collector.
+        """
+        # Run garbage collection
+        gc.collect()
+        
+        # Clear CUDA cache if available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if self.debug_mode:
+                # Get current memory stats for debugging
+                allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+                max_allocated = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+                max_reserved = torch.cuda.max_memory_reserved() / (1024 ** 3)
+                print(f"  CUDA Memory - Allocated: {allocated:.2f}GB (Max: {max_allocated:.2f}GB), "
+                      f"Reserved: {reserved:.2f}GB (Max: {max_reserved:.2f}GB)")
+    
+    def _check_memory_usage(self, max_usage_fraction=0.95):
+        """
+        Check if GPU memory usage exceeds the threshold.
+        Returns True if memory should be offloaded to CPU.
+        """
+        if not torch.cuda.is_available() or not self.cpu_offloading:
+            return False
+        
+        # Get current memory usage
+        allocated = torch.cuda.memory_allocated()
+        total = torch.cuda.get_device_properties(0).total_memory
+        usage_fraction = allocated / total
+        
+        if self.debug_mode and usage_fraction > 0.7:  # Alert if over 70%
+            print(f"  Memory usage: {usage_fraction:.2%} of GPU memory")
+            
+        return usage_fraction > max_usage_fraction
     
     def _register_blocking_hooks(
         self,
@@ -514,12 +570,28 @@ class TokenBlockingExperiment:
         
         return hook_fn
     
-    def _run_model_inference(self, inputs, num_tokens=1, include_hidden_states=False):
-        """Run model inference, potentially generating multiple tokens."""
+    def _run_model_inference(self, inputs, num_tokens=1, include_hidden_states=False, max_memory_usage=0.95):
+        """
+        Run model inference, potentially generating multiple tokens.
+        
+        Memory-optimized version with CPU offloading and batched generation.
+        
+        Args:
+            inputs: Model inputs dictionary
+            num_tokens: Number of tokens to generate
+            include_hidden_states: Whether to include hidden states in output (memory intensive)
+            max_memory_usage: Maximum fraction of GPU memory to use before offloading
+            
+        Returns:
+            Dictionary with generation results
+        """
         model_kwargs = {
             "output_hidden_states": include_hidden_states,
             "output_attentions": include_hidden_states
         }
+        
+        # Make sure model is in eval mode
+        self.model.eval()
         
         # For generation with multiple tokens
         if num_tokens > 1:
@@ -532,72 +604,155 @@ class TokenBlockingExperiment:
             # Track generated tokens
             all_tokens = []
             
-            # Generate tokens one by one to ensure hooks apply to each step
-            for i in range(num_tokens):
-                # Run model
-                outputs = self.model(
-                    **{k: v for k, v in current_inputs.items() if k != "token_type_ids"},
-                    **model_kwargs
-                )
-                
-                # Get prediction for next token
-                logits = outputs.logits[:, -1, :]
-                next_token_id = torch.argmax(logits, dim=-1, keepdim=True)
-                
-                # Add token to tracking
-                token_text = self.processor.tokenizer.decode([next_token_id.item()])
-                all_tokens.append({
-                    "id": next_token_id.item(),
-                    "text": token_text,
-                    "position": original_length + i,
-                    "logits": logits.detach().cpu() if self.debug_mode else None
-                })
-                
-                # Update inputs for next iteration
-                current_inputs["input_ids"] = torch.cat([current_inputs["input_ids"], next_token_id], dim=1)
-                if "attention_mask" in current_inputs:
-                    current_inputs["attention_mask"] = torch.cat([
-                        current_inputs["attention_mask"], 
-                        torch.ones_like(next_token_id)
-                    ], dim=1)
+            # Determine batch size for generation (can be adjusted based on memory)
+            batch_size = min(self.batch_size, num_tokens)
+            num_batches = (num_tokens + batch_size - 1) // batch_size
+            
+            for batch_idx in range(num_batches):
+                batch_start = batch_idx * batch_size
+                batch_end = min((batch_idx + 1) * batch_size, num_tokens)
+                batch_size_actual = batch_end - batch_start
                 
                 if self.debug_mode:
-                    print(f"  Generated token {i+1}/{num_tokens}: '{token_text}'")
+                    print(f"  Processing token batch {batch_idx+1}/{num_batches} (tokens {batch_start+1}-{batch_end})")
+                
+                # Process tokens in this batch
+                for i in range(batch_size_actual):
+                    token_idx = batch_start + i
+                    
+                    # Check if we need to offload to CPU to save memory
+                    if self._check_memory_usage(max_memory_usage):
+                        if self.debug_mode:
+                            print(f"  Memory usage high - offloading tensors to CPU")
+                        # Move tensors to CPU
+                        for k, v in current_inputs.items():
+                            if torch.is_tensor(v) and v.device.type == 'cuda':
+                                current_inputs[k] = v.cpu()
+                        # Clean memory
+                        self._clean_memory()
+                        # Move back to GPU for inference
+                        for k, v in current_inputs.items():
+                            if torch.is_tensor(v) and v.device.type == 'cpu':
+                                current_inputs[k] = v.to(self.model.device)
+                    
+                    # Run model with no gradients
+                    with torch.no_grad():
+                        # Handle potential OOM by reducing batch size or retrying
+                        try:
+                            # Remove 'token_type_ids' if present (not needed by some models)
+                            model_inputs = {k: v for k, v in current_inputs.items() if k != "token_type_ids"}
+                            outputs = self.model(**model_inputs, **model_kwargs)
+                        except RuntimeError as e:
+                            if "out of memory" in str(e).lower():
+                                print(f"  CUDA OOM detected - attempting recovery")
+                                # Clean up memory
+                                self._clean_memory()
+                                # Retry with reduced features
+                                reduced_kwargs = {k: v for k, v in model_kwargs.items()}
+                                reduced_kwargs["output_hidden_states"] = False
+                                reduced_kwargs["output_attentions"] = False
+                                outputs = self.model(**model_inputs, **reduced_kwargs)
+                            else:
+                                raise
+                    
+                    # Get prediction for next token
+                    logits = outputs.logits[:, -1, :]
+                    next_token_id = torch.argmax(logits, dim=-1, keepdim=True)
+                    
+                    # Extract token text
+                    token_text = self.processor.tokenizer.decode([next_token_id.item()])
+                    
+                    # Check for EOS token to potentially stop early
+                    is_eos = next_token_id.item() == self.processor.tokenizer.eos_token_id
+                    
+                    # Store minimal token info to save memory
+                    token_info = {
+                        "id": next_token_id.item(),
+                        "text": token_text,
+                        "position": original_length + token_idx,
+                    }
+                    
+                    # Only store logits in debug mode (save memory)
+                    if self.debug_mode:
+                        # Store only top-k logits to save memory
+                        top_k = 5
+                        top_vals, top_idx = torch.topk(logits, top_k)
+                        token_info["top_logits"] = {
+                            "values": top_vals.detach().cpu().tolist()[0],
+                            "indices": top_idx.detach().cpu().tolist()[0]
+                        }
+                    
+                    all_tokens.append(token_info)
+                    
+                    # Update inputs for next iteration
+                    current_inputs["input_ids"] = torch.cat([current_inputs["input_ids"], next_token_id], dim=1)
+                    if "attention_mask" in current_inputs:
+                        current_inputs["attention_mask"] = torch.cat([
+                            current_inputs["attention_mask"], 
+                            torch.ones_like(next_token_id)
+                        ], dim=1)
+                    
+                    if self.debug_mode:
+                        print(f"  Generated token {token_idx+1}/{num_tokens}: '{token_text}'")
+                    
+                    # If generated EOS token, stop generation
+                    if is_eos and token_idx < num_tokens - 1:
+                        if self.debug_mode:
+                            print(f"  Stopping early at token {token_idx+1} - EOS token generated")
+                        break
+                    
+                    # Clean up for next token (if not last in batch)
+                    if i < batch_size_actual - 1:
+                        del outputs, logits, next_token_id
+                        gc.collect()
+                
+                # Clean up between batches
+                self._clean_memory()
             
             # Get full text
             all_ids = current_inputs["input_ids"][0, original_length:].tolist()
             generated_text = self.processor.tokenizer.decode(all_ids)
             
-            return {
+            # Prepare return data (minimizing memory usage)
+            result = {
                 "generated_tokens": all_tokens,
                 "generated_text": generated_text,
-                "full_sequence": current_inputs["input_ids"].tolist(),
-                "outputs": outputs if self.debug_mode else None
+                "token_ids": all_ids,
             }
+            
+            # Clean up before returning
+            del current_inputs
+            gc.collect()
+            
+            return result
         
-        # For single token generation
+        # For single token generation (simplified path)
         else:
-            # Run model
-            outputs = self.model(
-                **{k: v for k, v in inputs.items() if k != "token_type_ids"},
-                **model_kwargs
-            )
+            # Run model with no gradients
+            with torch.no_grad():
+                model_inputs = {k: v for k, v in inputs.items() if k != "token_type_ids"}
+                outputs = self.model(**model_inputs, **model_kwargs)
             
             # Get prediction for next token
             logits = outputs.logits[:, -1, :]
             next_token_id = torch.argmax(logits, dim=-1).item()
             token_text = self.processor.tokenizer.decode([next_token_id])
             
-            return {
+            result = {
                 "generated_tokens": [{
                     "id": next_token_id,
                     "text": token_text,
                     "position": inputs["input_ids"].shape[1],
-                    "logits": logits.detach().cpu() if self.debug_mode else None
                 }],
                 "generated_text": token_text,
-                "outputs": outputs if self.debug_mode else None
+                "token_ids": [next_token_id],
             }
+            
+            # Clean up
+            del outputs, logits
+            gc.collect()
+            
+            return result
     
     def _compare_token_sequences(self, reference_tokens, blocked_tokens):
         """Compare token sequences between reference and blocked runs."""
