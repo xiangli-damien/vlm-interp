@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image
 from typing import Dict, Any, Optional, Union, List, Tuple
 from analyzer.heatmap_visualizer import HeatmapVisualizer
+from analyzer.token_blocker import TokenBlockingExperiment
 
 # Import analyzing components
 from analyzer.logit_lens import LLaVANextLogitLensAnalyzer
@@ -1426,634 +1427,695 @@ def run_token_analysis(
         import traceback
         traceback.print_exc()
         return {"error": str(e)}
-        
-def run_enhanced_ablation_experiments(
-    model: torch.nn.Module,
-    processor: Any,
-    image_source: Union[str, Image.Image],
-    prompt_text: str,
-    critical_tokens: Optional[List[Dict[str, Any]]] = None,
-    trace_data_path: Optional[str] = None,
-    metadata_path: Optional[str] = None,
-    output_dir: str = "enhanced_ablation_results",
-    methods: List[str] = ["zero_out"],
-    attention_strategies: List[str] = ["none", "block"],
-    include_individual_tests: bool = True,
-    run_layer_impact_analysis: bool = True,
-    layer_tests: bool = False,
-    num_layer_samples: int = 5,
-    debug_mode: bool = False
-) -> Dict[str, Any]:
-    """
-    Enhanced ablation experiments with multiple blocking strategies and visualizations.
-    
-    This function coordinates comprehensive token blocking experiments to measure 
-    how different tokens and blocking strategies affect model predictions.
-    
-    Args:
-        model: The loaded VLM model instance
-        processor: The corresponding processor instance
-        image_source: PIL image, URL string, or local file path
-        prompt_text: The text prompt for the model
-        critical_tokens: List of critical tokens to block (if None, they will be automatically identified)
-        trace_data_path: Path to pre-existing trace CSV
-        metadata_path: Path to trace metadata JSON
-        output_dir: Directory path to save analysis outputs
-        methods: List of blocking methods to test ("zero_out", "average", "noise", "interpolate", "reduce")
-        attention_strategies: List of attention mask strategies ("none", "block", "reduce")
-        include_individual_tests: Whether to test each token individually
-        run_layer_impact_analysis: Whether to run layer-wise impact analysis
-        layer_tests: Whether to run layer-specific ablation tests
-        num_layer_samples: Number of layer samples to test if layer_tests is True
-        debug_mode: Whether to print detailed debug information
-        
-    Returns:
-        Dict containing ablation experiment results
-    """
-    import os
-    import json
-    import torch
-    import traceback
-    from typing import Dict, List, Any, Optional, Union
-    from PIL import Image
-    import matplotlib.pyplot as plt
-    import numpy as np
-    
-    print("\n=== Starting Enhanced Token Ablation Experiments ===")
-    print(f"Output directory: {output_dir}")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Create directory for visualizations
-    viz_dir = os.path.join(output_dir, "visualizations")
-    os.makedirs(viz_dir, exist_ok=True)
-    
-    overall_results = {
-        "experiment_config": {
-            "methods": methods,
-            "attention_strategies": attention_strategies,
-            "include_individual_tests": include_individual_tests,
-            "run_layer_impact_analysis": run_layer_impact_analysis,
-            "layer_tests": layer_tests,
-            "prompt_text": prompt_text
-        },
-        "token_analysis": {},
-        "ablation_results": {},
-        "layer_impact_analysis": {},
-        "visualizations": {}
-    }
 
-    try:
-        # If no critical tokens provided, we need to identify them first
-        if critical_tokens is None:
-            print("No critical tokens provided. Running token analysis first...")
-            
-            # Run token analysis to identify critical tokens
-            from analyzer.semantic_tracing import run_token_analysis
-            
-            analysis_results = run_token_analysis(
-                model=model,
-                processor=processor,
-                image_source=image_source,
-                prompt_text=prompt_text,
-                trace_data_path=trace_data_path,
-                metadata_path=metadata_path,
-                output_dir=output_dir,
-                identify_critical_tokens=True,
-                debug_mode=debug_mode
-            )
-            
-            if "critical_tokens" not in analysis_results:
-                print("Error: Failed to identify critical tokens")
-                return {"error": "Failed to identify critical tokens"}
-            
-            critical_tokens = analysis_results["critical_tokens"]
-            overall_results["token_analysis"] = analysis_results
-        
-        # Prepare input data
-        from analyzer.semantic_tracing import EnhancedSemanticTracer
-        
-        tracer = EnhancedSemanticTracer(
-            model=model,
-            processor=processor,
-            output_dir=output_dir,
-            debug=debug_mode
-        )
-        
-        input_data = tracer.prepare_inputs(image_source, prompt_text)
-        
-        # Initialize token analyzer for ablation
-        from analyzer.token_analyzer import TokenAnalyzer
-        
-        analyzer = TokenAnalyzer(
-            output_dir=output_dir,
-            debug_mode=debug_mode
-        )
-        
-        # Run reference inference to get baseline
-        print("Running reference inference...")
-        with torch.no_grad():
-            reference_outputs = model(**{k: v for k, v in input_data["inputs"].items() if k != "token_type_ids"})
-            
-            # Get reference output token
-            reference_logits = reference_outputs.logits
-            
-            # Handle different logits shapes
-            if reference_logits.dim() == 2:  # [batch, vocab]
-                pred_logits = reference_logits
-            else:  # [batch, seq, vocab]
-                pred_logits = reference_logits[:, -1, :]
-                
-            reference_ids = torch.argmax(pred_logits, dim=-1).unsqueeze(0)
-            reference_text = processor.tokenizer.decode(reference_ids[0].tolist())
-            
-            # Get reference probabilities
-            reference_probs = torch.softmax(pred_logits, dim=-1)
-            
-            reference_result = {
-                "output_ids": reference_ids,
-                "output_text": reference_text,
-                "logits": pred_logits,
-                "probabilities": reference_probs
-            }
-        
-        overall_results["reference_output"] = {
-            "text": reference_text,
-            "token_id": reference_ids[0].item(),
-            "probability": reference_probs[0, reference_ids[0]].item()
-        }
-        
-        print(f"Reference output: '{reference_text}'")
-        
-        # Extract token indices
-        token_indices = [token["token_index"] for token in critical_tokens]
-        
-        # Run ablation tests with all combinations of methods and attention strategies
-        all_ablation_results = {}
-        
-        for method in methods:
-            all_ablation_results[method] = {}
-            
-            for attention_strategy in attention_strategies:
-                print(f"\nTesting method: {method}, attention strategy: {attention_strategy}")
-                
-                strategy_key = f"{method}_{attention_strategy}"
-                all_ablation_results[method][attention_strategy] = {}
-                
-                # Individual token tests if requested
-                individual_results = {}
-                if include_individual_tests:
-                    for token in critical_tokens:
-                        token_idx = token["token_index"]
-                        token_text = token["token_text"]
-                        print(f"  Testing ablation of token {token_idx} ('{token_text}')...")
-                        
-                        sim_result = analyzer.simulate_token_blocking(
-                            model=model,
-                            processor=processor,
-                            input_data=input_data,
-                            tokens_to_block=[token_idx],
-                            method=method,
-                            reference_output=reference_result,
-                            attention_mask_strategy=attention_strategy
-                        )
-                        
-                        individual_results[f"token_{token_idx}"] = sim_result
-                
-                # All tokens test
-                print(f"  Testing ablation of all {len(token_indices)} critical tokens together...")
-                
-                all_tokens_result = analyzer.simulate_token_blocking(
-                    model=model,
-                    processor=processor,
-                    input_data=input_data,
-                    tokens_to_block=token_indices,
-                    method=method,
-                    reference_output=reference_result,
-                    attention_mask_strategy=attention_strategy
-                )
-                
-                # Store results
-                all_ablation_results[method][attention_strategy] = {
-                    "individual_ablations": individual_results,
-                    "all_critical_tokens_ablation": all_tokens_result
-                }
-        
-        overall_results["ablation_results"] = all_ablation_results
-        
-        # Run layer impact analysis if requested
-        if run_layer_impact_analysis:
-            layer_impact_results = {}
-            for method in methods:
-                layer_impact_results[method] = {}
-                
-                for attention_strategy in attention_strategies:
-                    print(f"\nRunning layer impact analysis for method: {method}, attention strategy: {attention_strategy}")
-                    
-                    layer_result = TokenAnalyzer.analyze_layer_impact(
-                        model=model,
-                        processor=processor,
-                        input_data=input_data,
-                        critical_tokens=critical_tokens,
-                        output_dir=output_dir,
-                        method=method,
-                        attention_mask_strategy=attention_strategy,
-                        debug_mode=debug_mode
-                    )
-                    
-                    layer_impact_results[method][attention_strategy] = layer_result
-            
-            overall_results["layer_impact_analysis"] = layer_impact_results
-        
-        # Layer-specific tests if requested
-        if layer_tests:
-            layer_specific_results = {}
-            
-            # Only test one combination for layer tests to save time
-            method = methods[0]
-            attention_strategy = attention_strategies[0]
-            
-            print(f"\nRunning layer-specific tests with method: {method}, attention strategy: {attention_strategy}")
-            
-            ablation_results = analyzer.run_ablation_tests(
-                model=model,
-                processor=processor,
-                input_data=input_data,
-                critical_tokens=critical_tokens,
-                method=method,
-                include_individual_tests=False,  # Skip individual tests to save time
-                layer_tests=True,
-                num_layer_samples=num_layer_samples
-            )
-            
-            layer_specific_results[f"{method}_{attention_strategy}"] = ablation_results
-            overall_results["layer_specific_results"] = layer_specific_results
-        
-        # Create comparative visualizations of different strategies
-        print("\nCreating comparative visualizations...")
-        
-        # 1. Compare impact scores across methods and attention strategies
-        method_impacts = {}
-        for method in methods:
-            strategy_impacts = {}
-            for attention_strategy in attention_strategies:
-                result = all_ablation_results[method][attention_strategy]["all_critical_tokens_ablation"]
-                impact = result.get("comparison", {}).get("impact_score", 0)
-                strategy_impacts[attention_strategy] = impact
-            method_impacts[method] = strategy_impacts
-        
-        # Plot comparison bar chart
-        plt.figure(figsize=(12, 6))
-        bar_width = 0.8 / len(attention_strategies)
-        
-        for i, method in enumerate(methods):
-            x = np.arange(len(attention_strategies))
-            impacts = [method_impacts[method][strategy] for strategy in attention_strategies]
-            plt.bar(x + i*bar_width, impacts, width=bar_width, 
-                    label=f"{method}", alpha=0.7)
-        
-        plt.xlabel('Attention Mask Strategy')
-        plt.ylabel('Impact Score')
-        plt.title('Comparison of Blocking Methods and Attention Strategies')
-        plt.xticks(np.arange(len(attention_strategies)) + bar_width*(len(methods)-1)/2, attention_strategies)
-        plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.3)
-        
-        strategies_plot_path = os.path.join(viz_dir, 'strategy_comparison.png')
-        plt.savefig(strategies_plot_path)
-        
-        overall_results["visualizations"]["strategy_comparison"] = strategies_plot_path
-        
-        # 2. If we have individual token results, compare their impacts
-        if include_individual_tests and critical_tokens:
-            # Use the first method and strategy
-            method = methods[0]
-            attention_strategy = attention_strategies[0]
-            
-            token_impacts = {}
-            for token in critical_tokens:
-                token_idx = token["token_index"]
-                result_key = f"token_{token_idx}"
-                
-                if result_key in all_ablation_results[method][attention_strategy]["individual_ablations"]:
-                    result = all_ablation_results[method][attention_strategy]["individual_ablations"][result_key]
-                    impact = result.get("comparison", {}).get("impact_score", 0)
-                    token_impacts[token_idx] = {
-                        "impact": impact,
-                        "text": token["token_text"]
-                    }
-            
-            # Sort tokens by impact
-            sorted_tokens = sorted(token_impacts.items(), key=lambda x: x[1]["impact"], reverse=True)
-            
-            # Plot token impacts
-            plt.figure(figsize=(12, 6))
-            token_indices = [t[0] for t in sorted_tokens]
-            token_impact_values = [t[1]["impact"] for t in sorted_tokens]
-            token_texts = [t[1]["text"] for t in sorted_tokens]
-            
-            plt.bar(range(len(token_indices)), token_impact_values, alpha=0.7)
-            plt.xlabel('Token')
-            plt.ylabel('Impact Score')
-            plt.title(f'Impact of Individual Token Blocking\nMethod: {method}, Strategy: {attention_strategy}')
-            plt.xticks(range(len(token_indices)), [f"{idx}\n'{text}'" for idx, text in zip(token_indices, token_texts)], 
-                       rotation=45, ha='right')
-            plt.grid(True, linestyle='--', alpha=0.3)
-            plt.tight_layout()
-            
-            tokens_plot_path = os.path.join(viz_dir, 'token_impacts.png')
-            plt.savefig(tokens_plot_path)
-            
-            overall_results["visualizations"]["token_impacts"] = tokens_plot_path
-        
-        # Save overall results
-        results_path = os.path.join(output_dir, "enhanced_ablation_results.json")
-        try:
-            with open(results_path, 'w') as f:
-                # Convert to serializable format
-                serializable_results = analyzer._make_serializable(overall_results)
-                json.dump(serializable_results, f, indent=2)
-            print(f"\nSaved comprehensive results to: {results_path}")
-        except Exception as e:
-            print(f"Error saving results: {e}")
-        
-        print(f"\n=== Enhanced Token Ablation Experiments Complete ===")
-        print(f"Visualizations saved to: {viz_dir}")
-        
-        return overall_results
-
-    except Exception as e:
-        print(f"Error during enhanced ablation experiments: {e}")
-        traceback.print_exc()
-        return {"error": str(e), "traceback": traceback.format_exc()}
-
-
-def run_specific_layer_blocking_experiment(
+def run_token_blocking_experiment(
     model,
     processor,
-    image_source: Union[str, Image.Image],
+    image_source,
     prompt_text: str,
-    token_index: int,
-    token_text: str = "",
-    output_dir: str = "layer_specific_blocking_results",
+    token_indices: List[int],
+    output_dir: str = "blocking_experiments",
     method: str = "zero_out",
-    attention_mask_strategy: str = "block",
-    start_block_layer: int = 13,
-    end_block_layer: Optional[int] = None,
+    attention_strategy: str = "none",
+    start_layer: Optional[int] = None,
+    end_layer: Optional[int] = None,
+    num_tokens_to_generate: int = 1,
     debug_mode: bool = False
 ) -> Dict[str, Any]:
     """
-    Run a blocking experiment for a specific token and layer range.
-    
-    This function focuses on examining the impact of blocking a specific token
-    starting from a particular layer.
+    Run a single token blocking experiment with visualization.
     
     Args:
-        model: Model instance
-        processor: Processor instance
-        image_source: Image source (PIL image, URL, or local file path)
+        model: Model to use for experiments
+        processor: Model processor/tokenizer
+        image_source: Source image (PIL, file path, or URL)
         prompt_text: Text prompt for the model
-        token_index: Index of the token to block
-        token_text: Text representation of the token (optional, for logging)
-        output_dir: Directory path to save analysis outputs
-        method: Blocking method ("zero_out", "average", "noise", "interpolate")
-        attention_mask_strategy: Attention mask strategy ("none", "block", "reduce")
-        start_block_layer: First layer to apply blocking
-        end_block_layer: Last layer to apply blocking (None = to the last layer)
-        debug_mode: Whether to print detailed debug information
+        token_indices: List of token indices to block
+        output_dir: Directory to save results
+        method: Blocking method ("zero_out", "average", "noise", "interpolate", "reduce")
+        attention_strategy: Attention masking strategy ("none", "block", "reduce")
+        start_layer: First layer to apply blocking (None = from beginning)
+        end_layer: Last layer to apply blocking (None = to end)
+        num_tokens_to_generate: Number of tokens to generate
+        debug_mode: Enable detailed debug logging
         
     Returns:
         Dictionary with experiment results
     """
-    import os
-    import json
-    import torch
-    import traceback
-    from typing import Dict, List, Any, Optional, Union
-    from PIL import Image
-    import matplotlib.pyplot as plt
+    # Create experiment runner
+    experiment = TokenBlockingExperiment(
+        model=model,
+        processor=processor,
+        output_dir=output_dir,
+        debug_mode=debug_mode
+    )
     
-    print(f"\n--- Running experiment blocking token {token_index} ({token_text}) from layer {start_block_layer} {'to layer ' + str(end_block_layer) if end_block_layer else 'to the end'} ---")
-    print(f"Blocking method: {method}, Attention mask strategy: {attention_mask_strategy}")
-    
-    # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
-    try:
-        # Prepare input data
-        from analyzer.semantic_tracing import EnhancedSemanticTracer
-        
-        tracer = EnhancedSemanticTracer(
-            model=model,
-            processor=processor,
-            output_dir=output_dir,
-            debug=debug_mode
-        )
-        
-        input_data = tracer.prepare_inputs(image_source, prompt_text)
-        
-        # Initialize TokenAnalyzer
-        from analyzer.token_analyzer import TokenAnalyzer
-        
-        analyzer = TokenAnalyzer(
-            output_dir=output_dir,
-            debug_mode=debug_mode
-        )
-        
-        # Run reference inference to get baseline
-        print("Running reference inference...")
-        with torch.no_grad():
-            reference_outputs = model(**{k: v for k, v in input_data["inputs"].items() if k != "token_type_ids"})
-            
-            # Get reference output token
-            reference_logits = reference_outputs.logits
-            
-            # Handle different logits shapes
-            if reference_logits.dim() == 2:  # [batch, vocab]
-                pred_logits = reference_logits
-            else:  # [batch, seq, vocab]
-                pred_logits = reference_logits[:, -1, :]
-                
-            reference_ids = torch.argmax(pred_logits, dim=-1).unsqueeze(0)
-            reference_text = processor.tokenizer.decode(reference_ids[0].tolist())
-            
-            # Get reference probabilities
-            reference_probs = torch.softmax(pred_logits, dim=-1)
-            
-            reference_result = {
-                "output_ids": reference_ids,
-                "output_text": reference_text,
-                "logits": pred_logits,
-                "probabilities": reference_probs
-            }
-        
-        print(f"Reference output: '{reference_text}'")
-        print(f"Reference token ID: {reference_ids[0].item()}")
-        print(f"Reference probability: {reference_probs[0, reference_ids[0]].item():.4f}")
-        
-        # Perform specific layer blocking experiment
-        print(f"\nPerforming blocking from layer {start_block_layer} {'to layer ' + str(end_block_layer) if end_block_layer else 'to the end'}...")
-        
-        block_result = analyzer.simulate_token_blocking(
-            model=model,
-            processor=processor,
-            input_data=input_data,
-            tokens_to_block=[token_index],
-            method=method,
-            reference_output=reference_result,
-            start_block_layer=start_block_layer,
-            end_block_layer=end_block_layer,
-            attention_mask_strategy=attention_mask_strategy,
-            debug_logging=debug_mode
-        )
-        
-        # Calculate total layers count (for visualization)
-        total_layers = 0
-        for name, _ in model.named_modules():
-            if any(pattern in name for pattern in ['layers.', 'layer.', 'h.']):
-                total_layers += 1
-        
-        if total_layers == 0:
-            if hasattr(model, 'config') and hasattr(model.config, 'num_hidden_layers'):
-                total_layers = model.config.num_hidden_layers
-            else:
-                total_layers = 32  # Common default for large LLMs
-        
-        # Create blocking range visualization
-        plt.figure(figsize=(12, 3))
-        plt.barh(["Blocking Range"], [end_block_layer - start_block_layer + 1 if end_block_layer else total_layers - start_block_layer], 
-                 left=[start_block_layer], color='red', alpha=0.6)
-        plt.xlim(0, total_layers)
-        plt.xlabel('Model Layers')
-        plt.title(f'Blocking Range Visualization for Token {token_index} ({token_text})')
-        
-        # Add legend
-        plt.axvline(x=start_block_layer, color='black', linestyle='--', label=f'Start Layer ({start_block_layer})')
-        if end_block_layer:
-            plt.axvline(x=end_block_layer, color='gray', linestyle='--', label=f'End Layer ({end_block_layer})')
+    # Process image and text
+    if isinstance(image_source, str):
+        from PIL import Image
+        if image_source.startswith(('http://', 'https://')):
+            import requests
+            from io import BytesIO
+            response = requests.get(image_source)
+            image = Image.open(BytesIO(response.content))
         else:
-            plt.axvline(x=total_layers-1, color='gray', linestyle=':', label=f'Last Layer ({total_layers-1})')
+            image = Image.open(image_source)
+    else:
+        image = image_source
+    
+    # Process input
+    print(f"Processing input: image + prompt: '{prompt_text}'")
+    
+    # Prepare conversation format
+    if hasattr(processor, 'apply_chat_template'):
+        conversation = [{"role": "user", "content": [{"type": "text", "text": prompt_text}, {"type": "image"}]}]
+        formatted_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
+    else:
+        # Fallback for processors without chat template
+        formatted_prompt = prompt_text
+    
+    # Process inputs
+    inputs = processor(images=image, text=formatted_prompt, return_tensors="pt")
+    inputs = {k: v.to(model.device) for k, v in inputs.items() if torch.is_tensor(v)}
+    
+    # Run experiment
+    print(f"Running blocking experiment...")
+    results = experiment.run_blocking_experiment(
+        inputs=inputs,
+        tokens_to_block=token_indices,
+        method=method,
+        attention_strategy=attention_strategy,
+        start_layer=start_layer,
+        end_layer=end_layer,
+        num_tokens_to_generate=num_tokens_to_generate
+    )
+    
+    # Create visualization
+    viz_path = os.path.join(output_dir, "experiment_visualization.png")
+    experiment.visualize_results(results, save_path=viz_path)
+    results["visualization_path"] = viz_path
+    
+    # Save results
+    results_path = os.path.join(output_dir, "experiment_results.json")
+    with open(results_path, 'w') as f:
+        import json
+        # Convert tensors to lists for JSON serialization
+        serializable_results = _make_serializable(results)
+        json.dump(serializable_results, f, indent=2)
+    
+    print(f"Experiment complete! Results saved to {results_path}")
+    return results
+
+
+def run_comparative_experiments(
+    model,
+    processor,
+    image_source,
+    prompt_text: str,
+    token_indices: List[int],
+    output_dir: str = "comparative_experiments",
+    methods: List[str] = ["zero_out", "average", "noise"],
+    attention_strategies: List[str] = ["none", "block"],
+    start_layer: Optional[int] = None,
+    end_layer: Optional[int] = None,
+    num_tokens_to_generate: int = 1,
+    debug_mode: bool = False
+) -> Dict[str, Any]:
+    """
+    Run multiple experiments with different blocking methods and attention strategies.
+    
+    Args:
+        model: Model to use for experiments
+        processor: Model processor/tokenizer
+        image_source: Source image (PIL, file path, or URL)
+        prompt_text: Text prompt for the model
+        token_indices: List of token indices to block
+        output_dir: Directory to save results
+        methods: List of blocking methods to test
+        attention_strategies: List of attention strategies to test
+        start_layer: First layer to apply blocking (None = from beginning)
+        end_layer: Last layer to apply blocking (None = to end)
+        num_tokens_to_generate: Number of tokens to generate
+        debug_mode: Enable detailed debug logging
         
-        plt.legend()
-        plt.tight_layout()
+    Returns:
+        Dictionary with comparative experiment results
+    """
+    print(f"\n=== Running Comparative Experiments ===")
+    print(f"Testing {len(methods)} methods × {len(attention_strategies)} strategies = {len(methods) * len(attention_strategies)} experiments")
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create experiment runner
+    experiment = TokenBlockingExperiment(
+        model=model,
+        processor=processor,
+        output_dir=output_dir,
+        debug_mode=debug_mode
+    )
+    
+    # Process image and text (same as in run_token_blocking_experiment)
+    if isinstance(image_source, str):
+        from PIL import Image
+        if image_source.startswith(('http://', 'https://')):
+            import requests
+            from io import BytesIO
+            response = requests.get(image_source)
+            image = Image.open(BytesIO(response.content))
+        else:
+            image = Image.open(image_source)
+    else:
+        image = image_source
+    
+    # Prepare conversation format
+    if hasattr(processor, 'apply_chat_template'):
+        conversation = [{"role": "user", "content": [{"type": "text", "text": prompt_text}, {"type": "image"}]}]
+        formatted_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
+    else:
+        # Fallback for processors without chat template
+        formatted_prompt = prompt_text
+    
+    # Process inputs
+    inputs = processor(images=image, text=formatted_prompt, return_tensors="pt")
+    inputs = {k: v.to(model.device) for k, v in inputs.items() if torch.is_tensor(v)}
+    
+    # Run experiments
+    all_results = {
+        "config": {
+            "image_source": str(image_source),
+            "prompt_text": prompt_text,
+            "token_indices": token_indices,
+            "methods": methods,
+            "attention_strategies": attention_strategies,
+            "start_layer": start_layer,
+            "end_layer": end_layer,
+            "num_tokens_to_generate": num_tokens_to_generate
+        },
+        "experiments": {},
+        "comparison": {}
+    }
+    
+    # Get baseline results first
+    print("Running baseline inference without blocking...")
+    baseline_results = experiment._run_model_inference(
+        inputs, 
+        num_tokens=num_tokens_to_generate
+    )
+    all_results["baseline"] = {
+        "tokens": baseline_results["generated_tokens"],
+        "text": baseline_results["generated_text"]
+    }
+    
+    baseline_text = baseline_results["generated_text"]
+    print(f"Baseline generated: '{baseline_text}'")
+    
+    # Run each experiment
+    for method in methods:
+        all_results["experiments"][method] = {}
         
-        # Save visualization
-        block_range_viz_path = os.path.join(output_dir, f'token_{token_index}_block_range.png')
-        plt.savefig(block_range_viz_path)
-        plt.close()
-        
-        # Get experiment results
-        print("\nBlocking Experiment Results:")
-        
-        if "error" in block_result:
-            print(f"Error: {block_result['error']}")
-            return block_result
-        
-        generated_text = block_result.get("generated_text", "")
-        comparison = block_result.get("comparison", {})
-        
-        impact_score = comparison.get("impact_score", 0)
-        token_match = comparison.get("token_match", False)
-        ref_token_prob = comparison.get("ref_token_prob", 0)
-        
-        print(f"Reference output: '{reference_text}'")
-        print(f"Blocked output: '{generated_text}'")
-        print(f"Impact score: {impact_score:.4f}")
-        print(f"Reference token probability: {ref_token_prob:.4f}")
-        print(f"Matches original output: {token_match}")
-        
-        # If we have top tokens information, display it
-        if "ref_top_tokens" in comparison and "sim_top_tokens" in comparison:
-            print("\nTop Tokens Comparison:")
-            print("  Reference Model Top-5:")
-            for i, token in enumerate(comparison["ref_top_tokens"]):
-                print(f"    {i+1}. '{token['text']}' (ID: {token['id']}, Prob: {token['prob']:.4f})")
-                
-            print("  Blocked Model Top-5:")
-            for i, token in enumerate(comparison["sim_top_tokens"]):
-                print(f"    {i+1}. '{token['text']}' (ID: {token['id']}, Prob: {token['prob']:.4f})")
-        
-        # Create probability change visualization
-        if "ref_top_tokens" in comparison and "sim_top_tokens" in comparison:
-            ref_top = comparison["ref_top_tokens"]
-            sim_top = comparison["sim_top_tokens"]
+        for attention_strategy in attention_strategies:
+            experiment_key = f"{method}_{attention_strategy}"
+            print(f"\nRunning experiment: method={method}, attention={attention_strategy}")
             
-            # Collect all unique tokens
-            all_tokens = {}
-            for t in ref_top:
-                all_tokens[t["id"]] = {"text": t["text"], "ref_prob": t["prob"], "sim_prob": 0}
-            for t in sim_top:
-                if t["id"] in all_tokens:
-                    all_tokens[t["id"]]["sim_prob"] = t["prob"]
-                else:
-                    all_tokens[t["id"]] = {"text": t["text"], "ref_prob": 0, "sim_prob": t["prob"]}
+            # Run experiment
+            results = experiment.run_blocking_experiment(
+                inputs=inputs,
+                tokens_to_block=token_indices,
+                method=method,
+                attention_strategy=attention_strategy,
+                start_layer=start_layer,
+                end_layer=end_layer,
+                num_tokens_to_generate=num_tokens_to_generate
+            )
             
-            # Get sorted list of all tokens
-            tokens_list = sorted(all_tokens.items(), key=lambda x: max(x[1]["ref_prob"], x[1]["sim_prob"]), reverse=True)
+            # Save experiment results
+            all_results["experiments"][method][attention_strategy] = results
             
-            # Chart data
-            token_ids = [t[0] for t in tokens_list[:8]]  # Limit to top 8
-            token_texts = [t[1]["text"] for t in tokens_list[:8]]
-            ref_probs = [t[1]["ref_prob"] for t in tokens_list[:8]]
-            sim_probs = [t[1]["sim_prob"] for t in tokens_list[:8]]
+            # Create visualization
+            viz_path = os.path.join(output_dir, f"experiment_{experiment_key}.png")
+            experiment.visualize_results(results, save_path=viz_path)
+            results["visualization_path"] = viz_path
+    
+    # Create comparative visualization
+    print("\nGenerating comparative visualization...")
+    impact_scores = {}
+    for method in methods:
+        impact_scores[method] = {}
+        for attention_strategy in attention_strategies:
+            result = all_results["experiments"][method][attention_strategy]
+            impact_scores[method][attention_strategy] = result["comparison"]["impact_score"]
+    
+    # Create bar chart
+    plt.figure(figsize=(12, 6))
+    x = np.arange(len(attention_strategies))
+    width = 0.8 / len(methods)
+    
+    for i, method in enumerate(methods):
+        impacts = [impact_scores[method][strategy] for strategy in attention_strategies]
+        plt.bar(x + i*width - 0.4 + width/2, impacts, width=width, 
+                label=method, alpha=0.7)
+    
+    plt.xlabel('Attention Strategy')
+    plt.ylabel('Impact Score (0-1)')
+    plt.title('Comparison of Blocking Methods and Attention Strategies')
+    plt.xticks(x, attention_strategies)
+    plt.ylim(0, 1.1)
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.3)
+    
+    # Add text with tokens info
+    tokens_str = ", ".join(str(t) for t in token_indices)
+    plt.figtext(0.5, 0.01, f"Tokens blocked: [{tokens_str}]", ha='center')
+    
+    # Save comparison chart
+    comparison_path = os.path.join(output_dir, "methods_comparison.png")
+    plt.savefig(comparison_path, bbox_inches='tight', dpi=150)
+    plt.close()
+    
+    all_results["comparison"]["visualization_path"] = comparison_path
+    all_results["comparison"]["impact_scores"] = impact_scores
+    
+    # Save all results
+    results_path = os.path.join(output_dir, "comparative_results.json")
+    with open(results_path, 'w') as f:
+        import json
+        # Convert tensors to lists for JSON serialization
+        serializable_results = _make_serializable(all_results)
+        json.dump(serializable_results, f, indent=2)
+    
+    print(f"\nComparative experiments complete! Results saved to {results_path}")
+    return all_results
+
+
+def run_layer_specific_experiment(
+    model,
+    processor,
+    image_source,
+    prompt_text: str,
+    token_indices: List[int],
+    output_dir: str = "layer_specific_experiments",
+    method: str = "zero_out",
+    attention_strategy: str = "none",
+    layer_ranges: Optional[List[Tuple[int, int]]] = None,
+    num_tokens_to_generate: int = 1,
+    debug_mode: bool = False
+) -> Dict[str, Any]:
+    """
+    Run experiments with different layer ranges to analyze layer-specific impacts.
+    
+    Args:
+        model: Model to use for experiments
+        processor: Model processor/tokenizer
+        image_source: Source image (PIL, file path, or URL)
+        prompt_text: Text prompt for the model
+        token_indices: List of token indices to block
+        output_dir: Directory to save results
+        method: Blocking method
+        attention_strategy: Attention masking strategy
+        layer_ranges: List of (start_layer, end_layer) tuples to test; if None, auto-create ranges
+        num_tokens_to_generate: Number of tokens to generate
+        debug_mode: Enable detailed debug logging
+        
+    Returns:
+        Dictionary with layer-specific experiment results
+    """
+    print(f"\n=== Running Layer-Specific Experiments ===")
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create experiment runner
+    experiment = TokenBlockingExperiment(
+        model=model,
+        processor=processor,
+        output_dir=output_dir,
+        debug_mode=debug_mode
+    )
+    
+    # Get total number of layers
+    num_layers = len(experiment.all_layers)
+    print(f"Model has {num_layers} layers")
+    
+    # Create layer ranges if not provided
+    if layer_ranges is None:
+        # Create early, middle, and late layer ranges
+        third = num_layers // 3
+        layer_ranges = [
+            (0, num_layers-1),          # All layers
+            (0, third-1),               # Early layers
+            (third, 2*third-1),         # Middle layers
+            (2*third, num_layers-1),    # Late layers
+            (0, 0),                     # Just first layer
+            (num_layers-1, num_layers-1), # Just last layer
+        ]
+    
+    # Process image and text (similar to previous functions)
+    if isinstance(image_source, str):
+        from PIL import Image
+        if image_source.startswith(('http://', 'https://')):
+            import requests
+            from io import BytesIO
+            response = requests.get(image_source)
+            image = Image.open(BytesIO(response.content))
+        else:
+            image = Image.open(image_source)
+    else:
+        image = image_source
+    
+    # Prepare conversation format
+    if hasattr(processor, 'apply_chat_template'):
+        conversation = [{"role": "user", "content": [{"type": "text", "text": prompt_text}, {"type": "image"}]}]
+        formatted_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
+    else:
+        # Fallback for processors without chat template
+        formatted_prompt = prompt_text
+    
+    # Process inputs
+    inputs = processor(images=image, text=formatted_prompt, return_tensors="pt")
+    inputs = {k: v.to(model.device) for k, v in inputs.items() if torch.is_tensor(v)}
+    
+    # Get baseline results first
+    print("Running baseline inference without blocking...")
+    baseline_results = experiment._run_model_inference(
+        inputs, 
+        num_tokens=num_tokens_to_generate
+    )
+    
+    baseline_text = baseline_results["generated_text"]
+    print(f"Baseline generated: '{baseline_text}'")
+    
+    # Run experiments for each layer range
+    layer_results = {
+        "config": {
+            "image_source": str(image_source),
+            "prompt_text": prompt_text,
+            "token_indices": token_indices,
+            "method": method,
+            "attention_strategy": attention_strategy,
+            "num_tokens_to_generate": num_tokens_to_generate,
+            "total_layers": num_layers
+        },
+        "baseline": {
+            "tokens": baseline_results["generated_tokens"],
+            "text": baseline_results["generated_text"]
+        },
+        "layer_ranges": {},
+        "impact_by_layer": {}
+    }
+    
+    # Store impact scores by start layer (for visualization)
+    start_layer_impacts = []
+    
+    # Run experiment for each layer range
+    for start, end in layer_ranges:
+        range_key = f"layers_{start}_to_{end}"
+        print(f"\nTesting layer range: {start} to {end}")
+        
+        # Run experiment
+        results = experiment.run_blocking_experiment(
+            inputs=inputs,
+            tokens_to_block=token_indices,
+            method=method,
+            attention_strategy=attention_strategy,
+            start_layer=start,
+            end_layer=end,
+            num_tokens_to_generate=num_tokens_to_generate
+        )
+        
+        # Save experiment results
+        layer_results["layer_ranges"][range_key] = results
+        
+        # Create visualization
+        viz_path = os.path.join(output_dir, f"range_{range_key}.png")
+        experiment.visualize_results(results, save_path=viz_path)
+        results["visualization_path"] = viz_path
+        
+        # Track impact by start layer
+        if start == end:
+            start_layer_impacts.append((start, results["comparison"]["impact_score"]))
+    
+    # Additional experiments: test each layer individually to create heatmap
+    if num_layers <= 20 or debug_mode:  # Only for smaller models or debug mode
+        print("\nTesting individual layers...")
+        layer_results["individual_layers"] = {}
+        
+        for layer in range(num_layers):
+            print(f"Testing layer {layer}...")
             
-            # Create comparative bar chart
-            plt.figure(figsize=(12, 6))
-            x = range(len(token_ids))
-            width = 0.35
+            # Run experiment
+            results = experiment.run_blocking_experiment(
+                inputs=inputs,
+                tokens_to_block=token_indices,
+                method=method,
+                attention_strategy=attention_strategy,
+                start_layer=layer,
+                end_layer=layer,
+                num_tokens_to_generate=num_tokens_to_generate
+            )
             
-            plt.bar([i - width/2 for i in x], ref_probs, width, label='Reference Model', color='blue', alpha=0.7)
-            plt.bar([i + width/2 for i in x], sim_probs, width, label='Blocked Model', color='red', alpha=0.7)
+            # Save experiment results
+            layer_results["individual_layers"][f"layer_{layer}"] = results
             
-            plt.xlabel('Tokens')
-            plt.ylabel('Probability')
-            plt.title(f'Top Token Probability Changes After Blocking Token {token_index}\nFrom Layer {start_block_layer} {"to Layer " + str(end_block_layer) if end_block_layer else "to the End"}')
-            plt.xticks(x, [f"{txt}\n(ID: {id})" for txt, id in zip(token_texts, token_ids)], rotation=45, ha='right')
-            plt.legend()
-            plt.grid(True, linestyle='--', alpha=0.3)
-            plt.tight_layout()
-            
-            probs_viz_path = os.path.join(output_dir, f'token_{token_index}_probability_changes.png')
-            plt.savefig(probs_viz_path)
-            plt.close()
+            # Track impact
+            start_layer_impacts.append((layer, results["comparison"]["impact_score"]))
+    
+    # Create layer impact visualization
+    print("\nGenerating layer impact visualization...")
+    
+    # Sort by layer index
+    start_layer_impacts.sort(key=lambda x: x[0])
+    layers = [x[0] for x in start_layer_impacts]
+    impacts = [x[1] for x in start_layer_impacts]
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(layers, impacts, 'o-', linewidth=2, markersize=8)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.xlabel('Layer', fontsize=12)
+    plt.ylabel('Impact Score', fontsize=12)
+    plt.title(f'Impact of Blocking Tokens in Individual Layers\nMethod: {method}, Attention: {attention_strategy}', fontsize=14)
+    plt.xticks(range(0, num_layers, max(1, num_layers // 10)))
+    plt.ylim(0, max(1.0, max(impacts) * 1.1))
+    
+    # Add high, medium, low impact regions
+    plt.axhspan(0.7, 1.0, alpha=0.2, color='red', label='High Impact')
+    plt.axhspan(0.3, 0.7, alpha=0.2, color='yellow', label='Medium Impact')
+    plt.axhspan(0.0, 0.3, alpha=0.2, color='green', label='Low Impact')
+    
+    # Add text with tokens info
+    tokens_str = ", ".join(str(t) for t in token_indices)
+    plt.figtext(0.5, 0.01, f"Tokens blocked: [{tokens_str}]", ha='center')
+    
+    plt.legend()
+    plt.tight_layout()
+    
+    # Save layer impact chart
+    impact_path = os.path.join(output_dir, "layer_impact.png")
+    plt.savefig(impact_path, bbox_inches='tight', dpi=150)
+    plt.close()
+    
+    layer_results["impact_by_layer"]["visualization_path"] = impact_path
+    layer_results["impact_by_layer"]["data"] = start_layer_impacts
+    
+    # Save all results
+    results_path = os.path.join(output_dir, "layer_specific_results.json")
+    with open(results_path, 'w') as f:
+        import json
+        # Convert tensors to lists for JSON serialization
+        serializable_results = _make_serializable(layer_results)
+        json.dump(serializable_results, f, indent=2)
+    
+    print(f"\nLayer-specific experiments complete! Results saved to {results_path}")
+    return layer_results
+
+
+def analyze_token_importance(
+    model,
+    processor,
+    image_source,
+    prompt_text: str,
+    token_indices: List[int],
+    output_dir: str = "token_importance_analysis",
+    method: str = "zero_out",
+    attention_strategy: str = "none",
+    num_tokens_to_generate: int = 3,
+    debug_mode: bool = False
+) -> Dict[str, Any]:
+    """
+    Analyze each token's importance by measuring its impact on multiple generated tokens.
+    
+    Args:
+        model: Model to use for experiments
+        processor: Model processor/tokenizer
+        image_source: Source image (PIL, file path, or URL)
+        prompt_text: Text prompt for the model
+        token_indices: List of token indices to individually test
+        output_dir: Directory to save results
+        method: Blocking method
+        attention_strategy: Attention masking strategy
+        num_tokens_to_generate: Number of tokens to generate
+        debug_mode: Enable detailed debug logging
         
-        # Save detailed results
-        results = {
-            "experiment_config": {
-                "token_index": token_index,
-                "token_text": token_text,
-                "method": method,
-                "attention_mask_strategy": attention_mask_strategy,
-                "start_block_layer": start_block_layer,
-                "end_block_layer": end_block_layer,
-                "total_layers": total_layers
-            },
-            "reference_output": {
-                "text": reference_text,
-                "token_id": reference_ids[0].item(),
-                "probability": reference_probs[0, reference_ids[0]].item()
-            },
-            "blocking_results": block_result,
-            "visualizations": {
-                "block_range": block_range_viz_path
-            }
-        }
+    Returns:
+        Dictionary with token importance analysis results
+    """
+    print(f"\n=== Running Token Importance Analysis ===")
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create experiment runner
+    experiment = TokenBlockingExperiment(
+        model=model,
+        processor=processor,
+        output_dir=output_dir,
+        debug_mode=debug_mode
+    )
+    
+    # Process image and text (similar to previous functions)
+    if isinstance(image_source, str):
+        from PIL import Image
+        if image_source.startswith(('http://', 'https://')):
+            import requests
+            from io import BytesIO
+            response = requests.get(image_source)
+            image = Image.open(BytesIO(response.content))
+        else:
+            image = Image.open(image_source)
+    else:
+        image = image_source
+    
+    # Prepare conversation format
+    if hasattr(processor, 'apply_chat_template'):
+        conversation = [{"role": "user", "content": [{"type": "text", "text": prompt_text}, {"type": "image"}]}]
+        formatted_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
+    else:
+        # Fallback for processors without chat template
+        formatted_prompt = prompt_text
+    
+    # Process inputs
+    inputs = processor(images=image, text=formatted_prompt, return_tensors="pt")
+    inputs = {k: v.to(model.device) for k, v in inputs.items() if torch.is_tensor(v)}
+    
+    # Get baseline results first
+    print(f"Running baseline inference ({num_tokens_to_generate} tokens)...")
+    baseline_results = experiment._run_model_inference(
+        inputs, 
+        num_tokens=num_tokens_to_generate
+    )
+    
+    baseline_text = baseline_results["generated_text"]
+    print(f"Baseline generated: '{baseline_text}'")
+    
+    # Initialize results structure
+    importance_results = {
+        "config": {
+            "image_source": str(image_source),
+            "prompt_text": prompt_text,
+            "token_indices": token_indices,
+            "method": method,
+            "attention_strategy": attention_strategy,
+            "num_tokens_to_generate": num_tokens_to_generate
+        },
+        "baseline": {
+            "tokens": baseline_results["generated_tokens"],
+            "text": baseline_results["generated_text"]
+        },
+        "token_results": {},
+        "token_importance": {}
+    }
+    
+    # Test each token individually
+    token_impact_scores = {}
+    
+    for token_idx in token_indices:
+        print(f"\nTesting token {token_idx}...")
         
-        if "probs_viz_path" in locals():
-            results["visualizations"]["probability_changes"] = probs_viz_path
+        # Run experiment
+        results = experiment.run_blocking_experiment(
+            inputs=inputs,
+            tokens_to_block=[token_idx],  # Test just this token
+            method=method,
+            attention_strategy=attention_strategy,
+            start_layer=None,  # All layers
+            end_layer=None,
+            num_tokens_to_generate=num_tokens_to_generate
+        )
         
-        # Save results to JSON
-        results_path = os.path.join(output_dir, f"token_{token_index}_layer_{start_block_layer}_results.json")
-        with open(results_path, 'w') as f:
-            # Convert to serializable format
-            serializable_results = analyzer._make_serializable(results)
-            json.dump(serializable_results, f, indent=2)
+        # Save experiment results
+        importance_results["token_results"][f"token_{token_idx}"] = results
         
-        print(f"\nExperiment results saved to: {results_path}")
-        print(f"Visualizations saved to: {output_dir}")
+        # Extract impact score
+        impact_score = results["comparison"]["impact_score"]
+        token_impact_scores[token_idx] = impact_score
         
-        return results
-        
-    except Exception as e:
-        print(f"Error during experiment: {e}")
-        traceback.print_exc()
-        return {"error": str(e), "traceback": traceback.format_exc()}
+        # Create visualization
+        viz_path = os.path.join(output_dir, f"token_{token_idx}_impact.png")
+        experiment.visualize_results(results, save_path=viz_path)
+        results["visualization_path"] = viz_path
+    
+    # Calculate importance rankings
+    sorted_tokens = sorted(token_impact_scores.items(), key=lambda x: x[1], reverse=True)
+    importance_results["token_importance"]["rankings"] = [
+        {"token_idx": t[0], "impact_score": t[1]}
+        for t in sorted_tokens
+    ]
+    
+    # Create importance visualization
+    print("\nGenerating token importance visualization...")
+    
+    plt.figure(figsize=(12, 6))
+    
+    # Extract data for visualization
+    token_idxs = [t[0] for t in sorted_tokens]
+    impacts = [t[1] for t in sorted_tokens]
+    
+    # Create bar chart
+    plt.bar(range(len(token_idxs)), impacts, alpha=0.7)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.xlabel('Token Index', fontsize=12)
+    plt.ylabel('Impact Score', fontsize=12)
+    plt.title(f'Token Importance Analysis\nMethod: {method}, Attention: {attention_strategy}', fontsize=14)
+    plt.xticks(range(len(token_idxs)), [str(idx) for idx in token_idxs])
+    plt.ylim(0, max(1.0, max(impacts) * 1.1))
+    
+    # Add high, medium, low impact regions
+    plt.axhspan(0.7, 1.0, alpha=0.2, color='red', label='High Importance')
+    plt.axhspan(0.3, 0.7, alpha=0.2, color='yellow', label='Medium Importance')
+    plt.axhspan(0.0, 0.3, alpha=0.2, color='green', label='Low Importance')
+    
+    plt.legend()
+    plt.tight_layout()
+    
+    # Save importance chart
+    importance_path = os.path.join(output_dir, "token_importance.png")
+    plt.savefig(importance_path, bbox_inches='tight', dpi=150)
+    plt.close()
+    
+    importance_results["token_importance"]["visualization_path"] = importance_path
+    
+    # Save all results
+    results_path = os.path.join(output_dir, "token_importance_results.json")
+    with open(results_path, 'w') as f:
+        import json
+        # Convert tensors to lists for JSON serialization
+        serializable_results = _make_serializable(importance_results)
+        json.dump(serializable_results, f, indent=2)
+    
+    print(f"\nToken importance analysis complete! Results saved to {results_path}")
+    return importance_results
+
+
+def _make_serializable(obj):
+    """Convert tensors and other non-serializable objects to lists for JSON."""
+    if isinstance(obj, torch.Tensor):
+        return obj.cpu().tolist()
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (list, tuple)):
+        return [_make_serializable(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: _make_serializable(value) for key, value in obj.items()}
+    elif hasattr(obj, 'item'):  # For scalar tensors or numpy values
+        return obj.item()
+    else:
+        return obj

@@ -36,6 +36,7 @@ from analyzer.semantic_tracing import EnhancedSemanticTracer
 from analyzer.semantic_tracing_visualizer import EnhancedSemanticTracingVisualizer
 from analyzer.heatmap_visualizer import HeatmapVisualizer
 from analyzer.token_analyzer import TokenAnalyzer
+from analyzer.token_blocker import TokenBlockingExperiment
 
 __all__ = [
     # Analyzers & Components
@@ -47,6 +48,7 @@ __all__ = [
     "EnhancedSemanticTracingVisualizer",
     "HeatmapVisualizer",
     "TokenAnalyzer",
+    "TokenBlockingExperiment",
     
     # Workflows
     "run_logit_lens_workflow",
