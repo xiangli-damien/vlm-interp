@@ -238,170 +238,106 @@ class HeatmapVisualizer:
         show_values: bool = True
     ) -> List[str]:
         """
-        Create comprehensive heatmaps showing all token types across separate visualizations.
-        
-        For each layer, creates a visualization with 5 distinct components:
-        1. Text tokens heatmap - Shows all text tokens in the sequence
-        2. Image base tokens heatmap - Shows base image features
-        3. Image patch tokens heatmap - Shows patch image features  
-        4. Generated tokens heatmap - Shows all generated tokens
-        5. Token distribution graph - Shows relative importance weights
-        
-        All token types are displayed in their own grid with consistent formatting, ensuring
-        that even tokens with zero weights are represented in the spatial layout.
-        
-        Args:
-            df: DataFrame containing trace data
-            feature_mapping: Dictionary with feature mapping information
-            original_image: Original image for background
-            target_idx: Target token index
-            target_text: Text of the target token
-            output_dir: Directory to save output files
-            unified_colorscale: Whether to use unified color scale across all token types
-            show_values: Whether to show values in cells
-            
-        Returns:
-            List of saved file paths
+        Draw 5-panel heatmap (text / base / patch / generated / distribution)
+        for **each layer**. Key modifications:
+        1. Calculate max value for each token-type separately to avoid domination by high-value tokens
+        2. When unified_colorscale=True, still use global_max but apply stretch_factor to smaller token types
+        3. Pass type_maxes and stretch factors to child functions through kwargs for consistent normalization
         """
         import matplotlib.pyplot as plt
         import numpy as np
         import os
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
-        
+
         saved_paths = []
-        
-        # Create output directory
         combined_dir = os.path.join(output_dir, "combined_heatmaps")
         os.makedirs(combined_dir, exist_ok=True)
-        
-        # Get unique layers
-        layers = sorted(df["layer"].unique())
-        
-        # Process each layer
-        for layer_idx in layers:
-            # Filter data for this layer
+
+        for layer_idx in sorted(df["layer"].unique()):
             layer_df = df[df["layer"] == layer_idx]
-            
-            # Skip if no data for this layer
             if layer_df.empty:
-                print(f"No data for layer {layer_idx}. Skipping.")
                 continue
-                
-            print(f"Creating comprehensive combined heatmap for layer {layer_idx}")
-            
-            # Divide tokens by their types
-            text_tokens = layer_df[layer_df["token_type"] == 1]
-            image_tokens = layer_df[layer_df["token_type"] == 2]
-            generated_tokens = layer_df[layer_df["token_type"] == 0]
-            
-            # Determine global max value for unified color scale if requested
+
+            # ------- 1️⃣ Calculate max values for each token type --------
+            # This is critical for proper normalization and visualization
+            text_max = layer_df.query("token_type==1")["importance_weight"].max()
+            img_max  = layer_df.query("token_type==2")["importance_weight"].max()
+            gen_max  = layer_df.query("token_type==0")["importance_weight"].max()
+            global_max = layer_df["importance_weight"].max()
+
+            # Avoid NaN values and ensure at least a small positive value
+            text_max = 1e-9 if pd.isna(text_max) else max(text_max, 1e-9)
+            img_max  = 1e-9 if pd.isna(img_max)  else max(img_max,  1e-9)
+            gen_max  = 1e-9 if pd.isna(gen_max)  else max(gen_max,  1e-9)
+
+            # Store all max values in a dictionary for easy access by token_type
+            type_maxes = {
+                0: gen_max,
+                1: text_max,
+                2: img_max
+            }
+
+            # For unified scale, calculate stretch factors (limit to 5x max enhancement)
+            # This prevents text/generated tokens from being too faint when their max values
+            # are much smaller than image tokens
             if unified_colorscale:
-                all_importance = layer_df["importance_weight"].values
-                global_max = all_importance.max() if len(all_importance) > 0 else 1.0
-                print(f"Using unified color scale with global maximum: {global_max:.4f}")
+                stretch = {k: min(global_max / v, 5.0) for k, v in type_maxes.items()}
             else:
-                # Use separate max values for each token type
-                img_max = image_tokens["importance_weight"].max() if not image_tokens.empty else 0.0
-                text_max = text_tokens["importance_weight"].max() if not text_tokens.empty else 0.0
-                gen_max = generated_tokens["importance_weight"].max() if not generated_tokens.empty else 0.0
-                global_max = None
-                print(f"Using separate scales - Image max: {img_max:.4f}, Text max: {text_max:.4f}, Generated max: {gen_max:.4f}")
-            
-            # Create figure with a grid layout for the 5 components
-            # Taller figure to accommodate all 5 panels
-            fig = Figure(figsize=(20, 30), dpi=100, facecolor='white')
+                # For independent scales, no stretching needed
+                stretch = {k: 1.0 for k in type_maxes}
+
+            # ------- 2️⃣ Create 5 subplot rows ------
+            fig = Figure(figsize=(20, 30), dpi=110)
             canvas = FigureCanvas(fig)
-            
-            # Create a 5-row grid
-            grid = fig.add_gridspec(5, 1, height_ratios=[2, 2, 2, 2, 1])
-            
-            # 1. Text tokens heatmap
-            ax_text = fig.add_subplot(grid[0])
+            grids = fig.add_gridspec(5, 1, height_ratios=[2, 2, 2, 2, 1])
+
+            # Text Tokens Panel
+            ax_text = fig.add_subplot(grids[0])
             self._create_specific_token_heatmap(
-                layer_df=layer_df,
-                feature_mapping=feature_mapping,
-                original_image=original_image,
-                ax=ax_text,
-                layer_idx=layer_idx,
-                global_max=global_max,
-                show_values=show_values,
-                token_type=1,  # Text tokens
-                title="Text Tokens"
-            )
-            
-            # 2. Image base tokens heatmap
-            ax_base = fig.add_subplot(grid[1])
-            self._create_specific_token_heatmap(
-                layer_df=layer_df,
-                feature_mapping=feature_mapping,
-                original_image=original_image,
-                ax=ax_base,
-                layer_idx=layer_idx,
-                global_max=global_max,
-                show_values=show_values,
-                token_type=2,  # Image tokens
-                is_patch=False,  # Base features
-                title="Image Base Tokens"
-            )
-            
-            # 3. Image patch tokens heatmap
-            ax_patch = fig.add_subplot(grid[2])
-            self._create_specific_token_heatmap(
-                layer_df=layer_df,
-                feature_mapping=feature_mapping,
-                original_image=original_image,
-                ax=ax_patch,
-                layer_idx=layer_idx,
-                global_max=global_max,
-                show_values=show_values,
-                token_type=2,  # Image tokens
-                is_patch=True,  # Patch features
-                title="Image Patch Tokens"
-            )
-            
-            # 4. Generated tokens heatmap
-            ax_generated = fig.add_subplot(grid[3])
-            self._create_specific_token_heatmap(
-                layer_df=layer_df,
-                feature_mapping=feature_mapping,
-                original_image=original_image,
-                ax=ax_generated,
-                layer_idx=layer_idx,
-                global_max=global_max,
-                show_values=show_values,
-                token_type=0,  # Generated tokens
-                title="Generated Tokens"
-            )
-            
-            # 5. Token distribution analysis
-            ax_dist = fig.add_subplot(grid[4])
-            self._create_token_distribution_for_layer(
-                layer_df=layer_df,
-                ax=ax_dist,
-                layer_idx=layer_idx,
-                global_max=global_max
+                layer_df, feature_mapping, original_image, ax_text,
+                layer_idx, type_maxes, stretch, show_values,
+                token_type=1, title="Text Tokens"
             )
 
-            
-            # Set overall title
-            scale_note = " (Unified Scale)" if unified_colorscale else " (Independent Scales)"
-            fig.suptitle(
-                f"Layer {layer_idx} - Complete Token Influence Map{scale_note}\n"
-                f"Target: '{target_text}' (idx: {target_idx})", 
-                fontsize=20
+            # Image-Base Tokens Panel
+            ax_base = fig.add_subplot(grids[1])
+            self._create_specific_token_heatmap(
+                layer_df, feature_mapping, original_image, ax_base,
+                layer_idx, type_maxes, stretch, show_values,
+                token_type=2, is_patch=False, title="Image Base Tokens"
             )
-            
-            # Save the figure
-            out_path = os.path.join(combined_dir, f"combined_all_tokens_layer{layer_idx}.png")
-            fig.tight_layout(rect=[0, 0, 1, 0.98])  # Adjust for the title
-            canvas.draw()
-            fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor='white')
+
+            # Image-Patch Tokens Panel
+            ax_patch = fig.add_subplot(grids[2])
+            self._create_specific_token_heatmap(
+                layer_df, feature_mapping, original_image, ax_patch,
+                layer_idx, type_maxes, stretch, show_values,
+                token_type=2, is_patch=True, title="Image Patch Tokens"
+            )
+
+            # Generated Tokens Panel
+            ax_gen = fig.add_subplot(grids[3])
+            self._create_specific_token_heatmap(
+                layer_df, feature_mapping, original_image, ax_gen,
+                layer_idx, type_maxes, stretch, show_values,
+                token_type=0, title="Generated Tokens"
+            )
+
+            # Distribution Analysis Panel
+            ax_dist = fig.add_subplot(grids[4])
+            self._create_token_distribution_for_layer(layer_df, ax_dist, layer_idx, global_max)
+
+            # ---- Save the complete visualization ----
+            scale_note = "(Unified Scale)" if unified_colorscale else "(Independent Scale)"
+            fig.suptitle(f"Layer {layer_idx} – Complete Token Map {scale_note}\nTarget '{target_text}' (idx:{target_idx})", fontsize=20)
+            out_path = os.path.join(combined_dir, f"combined_L{layer_idx}.png")
+            fig.tight_layout(rect=[0, 0, 1, 0.97])
+            canvas.draw(); fig.savefig(out_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
-            
             saved_paths.append(out_path)
-            print(f"Created combined heatmap for layer {layer_idx} at {out_path}")
-        
+            print(f"✓ combined heatmap saved: {out_path}")
+
         return saved_paths
 
     def _create_token_distribution_for_layer(
@@ -416,19 +352,11 @@ class HeatmapVisualizer:
         
         This function generates a bar chart that visualizes how importance weights are distributed
         across different token types (text, image base, image patch, generated) within a specific layer.
-        The visualization provides insights into the relative influence of different token categories
-        and their importance weight patterns, helping to understand which token types contribute most
-        to the model's processing at this layer.
         
-        Args:
-            layer_df: DataFrame containing layer-specific trace data with token information
-            ax: Matplotlib axis object for plotting the visualization
-            layer_idx: The index of the layer being visualized
-            global_max: Optional maximum value for normalizing weights across visualizations.
-                    If provided, weights are normalized against this value for consistent scaling.
-        
-        Returns:
-            None - The visualization is plotted directly on the provided axis
+        Key improvements:
+        1. Better handling of global_max normalization references
+        2. More informative labels and statistics
+        3. Improved visual design for better readability
         """
         import matplotlib.pyplot as plt
         import numpy as np
@@ -445,35 +373,31 @@ class HeatmapVisualizer:
         image_tokens = layer_df[layer_df["token_type"] == 2]
         generated_tokens = layer_df[layer_df["token_type"] == 0]
         
-        # Further divide image tokens into base and patch (if possible)
+        # Try to divide image tokens into base and patch using feature mapping
         base_tokens = pd.DataFrame()
         patch_tokens = pd.DataFrame()
         
-        if not image_tokens.empty:
-            # Attempt to identify base vs patch tokens based on feature mapping
-            # This implementation depends on the specific structure of your data
-            if hasattr(self, 'feature_mapping') and self.feature_mapping:
-                base_indices = set()
-                patch_indices = set()
-                
-                # Extract base token indices from feature mapping
-                if ("base_feature" in self.feature_mapping and 
-                    "positions" in self.feature_mapping["base_feature"]):
-                    base_indices = set(int(idx) for idx in self.feature_mapping["base_feature"]["positions"].keys())
-                    
-                # Extract patch token indices from feature mapping
-                if ("patch_feature" in self.feature_mapping and 
-                    "positions" in self.feature_mapping["patch_feature"]):
-                    patch_indices = set(int(idx) for idx in self.feature_mapping["patch_feature"]["positions"].keys())
-                
-                # Filter tokens by these indices
-                base_tokens = image_tokens[image_tokens["token_index"].isin(base_indices)]
-                patch_tokens = image_tokens[image_tokens["token_index"].isin(patch_indices)]
+        if not image_tokens.empty and hasattr(self, 'feature_mapping') and self.feature_mapping:
+            base_indices = set()
+            patch_indices = set()
             
-            # Fallback if we couldn't separate base/patch using feature mapping
-            if base_tokens.empty and patch_tokens.empty:
-                # Just treat all image tokens as a single category
-                base_tokens = image_tokens
+            # Extract base token indices from feature mapping
+            if ("base_feature" in self.feature_mapping and 
+                "positions" in self.feature_mapping["base_feature"]):
+                base_indices = set(int(idx) for idx in self.feature_mapping["base_feature"]["positions"].keys())
+                
+            # Extract patch token indices from feature mapping
+            if ("patch_feature" in self.feature_mapping and 
+                "positions" in self.feature_mapping["patch_feature"]):
+                patch_indices = set(int(idx) for idx in self.feature_mapping["patch_feature"]["positions"].keys())
+            
+            # Filter tokens by these indices
+            base_tokens = image_tokens[image_tokens["token_index"].isin(base_indices)]
+            patch_tokens = image_tokens[image_tokens["token_index"].isin(patch_indices)]
+        
+        # Fallback if we couldn't separate base/patch
+        if base_tokens.empty and patch_tokens.empty:
+            base_tokens = image_tokens
         
         # Prepare data for visualization
         token_categories = []
@@ -600,173 +524,144 @@ class HeatmapVisualizer:
         
         # If global_max is provided, add an annotation about normalization
         if global_max is not None and global_max > 0:
-            norm_text = f"Note: Weights normalized against global max: {global_max:.3f}"
+            norm_text = f"Note: Global max weight: {global_max:.3f}"
             ax.text(0.02, 0.98, norm_text, transform=ax.transAxes, fontsize=8,
                     verticalalignment='top', horizontalalignment='left', 
                     bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.3))
 
     def _create_specific_token_heatmap(
-        self,
-        layer_df: pd.DataFrame,
-        feature_mapping: Dict[str, Any],
-        original_image: Image.Image,
+        self, 
+        layer_df, 
+        feature_mapping, 
+        original_image, 
         ax,
         layer_idx: int,
-        global_max: Optional[float] = None,
+        type_maxes: Dict[int, float],         # NEW: maximum values by token type
+        stretch: Dict[int, float],            # NEW: stretch factors for unified scale
         show_values: bool = True,
-        token_type: int = 2,  # Default: image tokens
-        is_patch: bool = None,  # None=auto, True=patch, False=base
+        token_type: int = 2,
+        is_patch: bool = None,
         title: Optional[str] = None
     ) -> bool:
         """
-        Create a heatmap for a specific token type, ensuring complete grid visualization.
+        Draw one token-type heatmap. Unified or independent scale is determined 
+        by the parameters passed through type_maxes/stretch.
         
-        This function creates a grid visualization where each token is shown in its proper position,
-        regardless of whether it has a significant weight. This ensures all tokens of the specified
-        type are visualized in their spatial layout.
-        
-        Different token types are handled differently:
-        - Image tokens (type=2): These can be visualized as base or patch features with image background
-        - Text tokens (type=1): These are shown as a sequential grid
-        - Generated tokens (type=0): These are shown as a sequential grid
-        
-        Args:
-            layer_df: DataFrame with layer-specific trace data
-            feature_mapping: Dictionary with feature mapping information
-            original_image: Original image for background
-            ax: Matplotlib axis for plotting
-            layer_idx: Layer index
-            global_max: Maximum value for colormap normalization (for unified scale)
-            show_values: Whether to show values in cells
-            token_type: Token type to display (0=generated, 1=text, 2=image)
-            is_patch: For image tokens, whether to use patch features (True) or base features (False)
-            title: Optional title override
-            
-        Returns:
-            True if successful, False otherwise
+        Key improvements:
+        1. Use separate max values for each token type to avoid dominated visualizations
+        2. Apply stretch factors when using unified colorscale
+        3. Ensure minimum alpha of 0.3 for better visibility of low-weight tokens
+        4. Remove gamma correction (val**0.5) for more accurate representation
         """
         import matplotlib.pyplot as plt
         import numpy as np
         
-        # Filter by token type
+        # Filter to only tokens of the requested type
         type_df = layer_df[layer_df["token_type"] == token_type]
-        
-        # Set color map based on token type
-        if token_type == 0:  # Generated
-            cmap = plt.get_cmap('Greens') 
-            token_type_name = "Generated"
-        elif token_type == 1:  # Text
-            cmap = plt.get_cmap('Blues')
-            token_type_name = "Text"
-        else:  # Image
-            cmap = plt.get_cmap('hot')
-            token_type_name = "Image"
-        
-        # Check if we have data
         if type_df.empty:
-            ax.text(0.5, 0.5, f"No {token_type_name} tokens in layer {layer_idx}", 
-                    ha='center', va='center', fontsize=14)
-            ax.axis('off')
+            ax.axis('off'); 
             return False
+
+        # ---------- Normalization ----------
+        # Get the max value for this token type
+        max_w = type_maxes[token_type]
         
-        # For text and generated tokens, create a sequential representation
-        if token_type in [0, 1]:
-            return self._create_sequential_token_heatmap(
-                type_df=type_df,
-                ax=ax,
-                layer_idx=layer_idx,
-                global_max=global_max,
-                show_values=show_values,
-                token_type=token_type,
-                cmap=cmap,
-                title=title
-            )
+        # Create a copy to avoid modifying the original DataFrame
+        type_df = type_df.copy()
         
-        # For image tokens, determine if we should use base or patch visualization
-        if token_type == 2:
-            # Auto-detect if not specified
-            if is_patch is None:
-                # Check if patch feature info exists
-                if "patch_feature" in feature_mapping and "positions" in feature_mapping["patch_feature"]:
-                    is_patch = True
-                else:
-                    is_patch = False
+        # Apply normalization with stretch factor
+        # The stretch factor allows smaller token types to be more visible in unified scale mode
+        type_df["norm_w"] = (type_df["importance_weight"] / max_w) * stretch[token_type]
+        
+        # Cap at 1.0 to maintain consistent color scale
+        type_df["norm_w"] = type_df["norm_w"].clip(upper=1.0)
+
+        # --------- Configure colormap based on token type ----------
+        cmap = plt.get_cmap('hot') if token_type == 2 else \
+            plt.get_cmap('Blues') if token_type == 1 else \
+            plt.get_cmap('Greens')
             
-            # Use appropriate feature mapping based on patch/base selection
+        # For image tokens, use spatial visualization; for text/generated use sequential layout
+        if token_type == 2:  # Image tokens
+            # Determine if we should use patch or base visualization
+            if is_patch is None:
+                is_patch = "patch_feature" in feature_mapping
+                
+            # Use appropriate feature mapping
             feature_type = "patch_feature" if is_patch else "base_feature"
             feature_info = feature_mapping.get(feature_type, {})
             
-            # Check if feature mapping exists
             if not feature_info or "positions" not in feature_info:
                 ax.text(0.5, 0.5, f"No {feature_type} mapping available", 
-                        ha='center', va='center', fontsize=14)
+                        ha='center', va='center', fontsize=12)
                 ax.axis('off')
                 return False
-            
-            # Get grid dimensions and positions
+                
+            # Get grid dimensions
             if is_patch:
-                grid_h, grid_w = feature_info.get("grid_unpadded", (0, 0))
-                grid_name = "grid_unpadded"
+                grid_dims = feature_info.get("grid_unpadded", (0, 0))
             else:
-                grid_h, grid_w = feature_info.get("grid", (0, 0))
-                grid_name = "grid"
-            
+                grid_dims = feature_info.get("grid", (0, 0))
+                
+            if not all(grid_dims):
+                ax.text(0.5, 0.5, f"Invalid grid dimensions", 
+                        ha='center', va='center', fontsize=12)
+                ax.axis('off')
+                return False
+                
+            grid_h, grid_w = grid_dims
             positions = feature_info.get("positions", {})
             
-            if grid_h == 0 or grid_w == 0 or not positions:
-                ax.text(0.5, 0.5, f"Invalid {feature_type} dimensions or positions", 
-                        ha='center', va='center', fontsize=14)
-                ax.axis('off')
-                return False
-            
-            # Initialize background image based on feature type
-            if is_patch:
-                # For patch features
+            # Prepare image background
+            if is_patch:  # Patch visualization
                 preview = original_image.copy()
                 if "resized_dimensions" in feature_mapping:
                     w, h = feature_mapping["resized_dimensions"]
                     preview = preview.resize((w, h), Image.LANCZOS)
-                
+                    
                 preview_w, preview_h = preview.size
                 background_np = np.array(preview)
                 
-                # Calculate padding
-                resized_dims_wh = feature_mapping.get("resized_dimensions", (0, 0))
-                if resized_dims_wh == (0, 0):
-                    resized_w_actual, resized_h_actual = preview_w, preview_h
+                # Calculate content area and padding
+                resized_dims = feature_mapping.get("resized_dimensions", (0, 0))
+                if resized_dims == (0, 0):
+                    resized_w, resized_h = preview_w, preview_h
                 else:
-                    resized_w_actual, resized_h_actual = resized_dims_wh
+                    resized_w, resized_h = resized_dims
+                    
+                pad_h_total = preview_h - resized_h
+                pad_w_total = preview_w - resized_w
+                pad_top = pad_h_total // 2 if pad_h_total > 0 else 0
+                pad_left = pad_w_total // 2 if pad_w_total > 0 else 0
                 
-                pad_h_total = preview_h - resized_h_actual
-                pad_w_total = preview_w - resized_w_actual
-                pad_top = max(0, pad_h_total // 2)
-                pad_left = max(0, pad_w_total // 2)
-                
-                # Calculate cell dimensions
-                cell_height = resized_h_actual / grid_h
-                cell_width = resized_w_actual / grid_w
-                
-                # Display background
+                # Slightly darken background for better contrast with heatmap
                 darkened_bg = background_np.astype(float) * 0.45
                 darkened_bg = np.clip(darkened_bg, 0, 255).astype(np.uint8)
                 
+                # Display background with appropriate extent
                 ax.imshow(
                     darkened_bg,
                     extent=(0, preview_w, preview_h, 0),
                     aspect='equal',
                     origin='upper'
                 )
-            else:
-                # For base features
+                
+                # Calculate cell dimensions
+                cell_height = resized_h / grid_h
+                cell_width = resized_w / grid_w
+            else:  # Base visualization
+                # Use consistent size for base features
                 target_size = (336, 336)
                 
                 # Resize image for background
                 if original_image.mode != 'RGB':
-                    resized_background = original_image.convert('RGB').resize(target_size, Image.LANCZOS)
+                    resized_bg = original_image.convert('RGB').resize(target_size, Image.LANCZOS)
                 else:
-                    resized_background = original_image.resize(target_size, Image.LANCZOS)
+                    resized_bg = original_image.resize(target_size, Image.LANCZOS)
+                    
+                background_np = np.array(resized_bg)
                 
-                background_np = np.array(resized_background)
+                # Darken background for better contrast
                 darkened_bg = background_np.astype(float) * 0.45
                 darkened_bg = np.clip(darkened_bg, 0, 255).astype(np.uint8)
                 
@@ -784,185 +679,150 @@ class HeatmapVisualizer:
                 cell_height = target_size[1] / grid_h
                 cell_width = target_size[0] / grid_w
             
-            # Initialize token position and weight maps
-            token_positions = {}  # Maps token indices to grid positions
-            token_weights = {}    # Maps token indices to weights
+            # Create dictionaries to map token indices to positions and weights
+            token_positions = {}
+            token_weights = {}
             
-            # CRITICAL: Create full grid with all possible token positions from mapping
-            # This ensures we show ALL possible image token locations, not just ones with data
+            # Convert positions from string keys to integers if needed
             for token_idx_str, pos in positions.items():
                 try:
-                    # Convert string key to integer if needed
                     token_idx = int(token_idx_str) if isinstance(token_idx_str, str) else token_idx_str
                     r, c = pos
                     
-                    # Only add if position is within grid bounds
+                    # Only add valid positions
                     if 0 <= r < grid_h and 0 <= c < grid_w:
                         token_positions[token_idx] = (r, c)
-                        token_weights[token_idx] = 0.0  # Default weight is zero
+                        token_weights[token_idx] = 0.0  # Default to zero
                 except (ValueError, TypeError):
                     continue
-            
-            # Now update with actual data from DataFrame
+                    
+            # Update weights from DataFrame
             for _, row in type_df.iterrows():
                 token_idx = row["token_index"]
                 weight = row["importance_weight"]
+                norm_weight = row["norm_w"]
                 
-                # Check if this token has a position mapping
                 if token_idx in token_positions:
-                    # If token appears multiple times, use max weight
-                    if token_idx in token_weights:
-                        token_weights[token_idx] = max(token_weights[token_idx], weight)
-                    else:
-                        token_weights[token_idx] = weight
-            
-            # Get stats
-            active_tokens = sum(1 for w in token_weights.values() if w > 0.01)
+                    token_weights[token_idx] = weight
+                    
+            # Get stats for title
             max_weight = max(token_weights.values()) if token_weights else 0.0
-            
-            # If using unified scale, normalize weights
-            if global_max is not None and global_max > 0:
-                for token_idx in token_weights:
-                    token_weights[token_idx] = token_weights[token_idx] / global_max
-            
-            # Draw token positions regardless of weight, ensuring complete grid visualization
+            active_tokens = sum(1 for w in token_weights.values() if w > 0.01)
+                    
+            # Draw each token cell
             for token_idx, (r, c) in token_positions.items():
-                # Get token weight
+                # Get weight and calculate normalized value
                 weight = token_weights.get(token_idx, 0.0)
                 
-                # Calculate cell position based on feature type
-                if is_patch:
-                    x_start = pad_left + c * cell_width
-                    y_start = pad_top + r * cell_height
-                else:
-                    x_start = c * cell_width
-                    y_start = r * cell_height
+                # IMPROVED: Calculate normalized value with stretch factor
+                norm_val = weight / max_w * stretch[token_type]
+                norm_val = min(norm_val, 1.0)  # Cap at 1.0
                 
-                # Apply gamma correction for better contrast
-                contrast_val = weight ** 0.5
+                # Calculate cell position
+                x_start = pad_left + c * cell_width
+                y_start = pad_top + r * cell_height
                 
-                # Determine alpha and edge properties based on weight
-                if weight > 0.01:
-                    # Significant weight
-                    alpha = min(0.8, contrast_val + 0.3)
-                    edgecolor = 'white'
-                    linewidth = 0.5 if weight > 0.5 else 0
-                else:
-                    # Very low or zero weight - show as faint grid outline
-                    alpha = 0.15
-                    edgecolor = 'gray'
-                    linewidth = 0.5
+                # IMPROVED: Use alpha that ensures low weights are still visible
+                # Minimum alpha of 0.3 ensures all cells have some visibility
+                alpha = 0.3 + 0.7 * norm_val
                 
-                # Create colored rectangle for this token
+                # Create cell rectangle
                 rect = plt.Rectangle(
-                    (x_start, y_start),
+                    (x_start, y_start), 
                     cell_width, cell_height,
-                    facecolor=cmap(max(0.1, contrast_val)),  # Use at least 0.1 for visibility
-                    edgecolor=edgecolor,
-                    linewidth=linewidth,
+                    facecolor=cmap(norm_val),  # NO gamma correction (removed val**0.5)
+                    edgecolor='white' if norm_val > 0.5 else 'gray',
+                    linewidth=0.5,
                     alpha=alpha
                 )
                 ax.add_patch(rect)
                 
-                # Show weight value if requested and weight is significant
-                if show_values and weight > 0.2:
-                    cell_center_x = x_start + cell_width / 2
-                    cell_center_y = y_start + cell_height / 2
+                # Show weight value if requested and significant
+                if show_values and weight > 0.01:
                     ax.text(
-                        cell_center_x, cell_center_y,
-                        f"{weight:.2f}",
+                        x_start + cell_width/2, 
+                        y_start + cell_height/2,
+                        f"{weight:.2f}", 
                         ha='center', va='center',
-                        fontsize=7,
-                        color='white' if weight > 0.4 else 'black',
-                        weight='bold'
+                        fontsize=7, 
+                        color='white' if norm_val > 0.6 else 'black'
                     )
-            
-            # Add grid lines to show the full grid structure
+                    
+            # Add grid lines for better visualization
             for i in range(grid_h + 1):
-                y = pad_top + i * cell_height if is_patch else i * cell_height
+                y = pad_top + i * cell_height
                 ax.axhline(y=y, color='white', linestyle='-', linewidth=0.5, alpha=0.5)
-            
+                
             for i in range(grid_w + 1):
-                x = pad_left + i * cell_width if is_patch else i * cell_width
+                x = pad_left + i * cell_width
                 ax.axvline(x=x, color='white', linestyle='-', linewidth=0.5, alpha=0.5)
-            
+                
             # For patch features, add content area border
             if is_patch:
                 content_rect = plt.Rectangle(
                     (pad_left, pad_top),
-                    resized_w_actual, resized_h_actual,
+                    resized_w, resized_h,
                     fill=False,
                     edgecolor='cyan',
                     linestyle='--',
                     linewidth=1.5
                 )
                 ax.add_patch(content_rect)
-            
-            # Add legend with stats
+                
+            # Add legend with statistics
             import matplotlib.patches as mpatches
             
-            if global_max is not None:
-                # Using unified scale, need to show original max
-                orig_max = type_df["importance_weight"].max() if not type_df.empty else 0.0
-                norm_max = orig_max / global_max if global_max > 0 else 0.0
-                legend_text = f"Image Tokens ({active_tokens} active of {len(token_positions)}) - " \
-                            f"Max: {orig_max:.3f}, Norm: {norm_max:.3f}"
-            else:
-                # Using type-specific scale
-                legend_text = f"Image Tokens ({active_tokens} active of {len(token_positions)}) - " \
-                            f"Max: {max_weight:.3f}"
-            
+            # IMPROVED: Show original max value rather than normalized value
+            legend_text = f"Image Tokens ({active_tokens} active of {len(token_positions)}) - " \
+                        f"Max(orig): {max_w:.3f}"
+                        
             legend_handles = [mpatches.Patch(color=cmap(0.7), label=legend_text)]
             
-            # Add legend to plot
             ax.legend(
                 handles=legend_handles,
-                loc='upper center',
-                bbox_to_anchor=(0.5, -0.05),
+                loc='upper right',
                 fancybox=True,
                 shadow=True
             )
+        else:
+            # For text and generated tokens, use sequential visualization
+            return self._create_sequential_token_heatmap(
+                layer_df, type_df, feature_mapping, ax,
+                layer_idx, type_maxes, stretch, show_values,
+                token_type=token_type, title=title
+            )
             
-            # Set title
-            if title:
-                ax.set_title(title, fontsize=14)
-            else:
-                feature_name = "Patch" if is_patch else "Base"
-                ax.set_title(f"Image {feature_name} Tokens - Layer {layer_idx}", fontsize=14)
+        # Set title if provided, or create a default one
+        if title:
+            ax.set_title(title, fontsize=14)
+        else:
+            feature_name = "Patch" if is_patch else "Base"
+            ax.set_title(f"Image {feature_name} Tokens - Layer {layer_idx}", fontsize=14)
             
-            ax.axis('off')
-            return True
+        ax.axis('off')
+        return True
 
     def _create_sequential_token_heatmap(
         self,
-        type_df: pd.DataFrame,
+        layer_df,
+        type_df,
+        feature_mapping,
         ax,
         layer_idx: int,
-        global_max: Optional[float] = None,
+        type_maxes: Dict[int, float],    # NEW: maximum values by token type
+        stretch: Dict[int, float],       # NEW: stretch factors for unified scale
         show_values: bool = True,
-        token_type: int = 1,  # 1=text, 0=generated
-        cmap = None,
+        token_type: int = 1,             # 1=text, 0=generated
         title: Optional[str] = None
     ) -> bool:
         """
-        Create a sequential heatmap visualization for text or generated tokens.
+        Create a grid-based visualization for text or generated tokens in a sequential layout.
         
-        Unlike image tokens that have a 2D spatial arrangement, text and generated tokens
-        are displayed in a more sequential layout, but still with a grid structure to 
-        maintain consistency with the image visualizations.
-        
-        Args:
-            type_df: DataFrame with tokens of a specific type
-            ax: Matplotlib axis for plotting
-            layer_idx: Layer index
-            global_max: Maximum value for colormap normalization (for unified scale)
-            show_values: Whether to show values in cells
-            token_type: Token type (1=text, 0=generated)
-            cmap: Colormap to use
-            title: Optional title override
-            
-        Returns:
-            True if successful, False otherwise
+        Key improvements:
+        1. Use fixed grid width based on token count to avoid too many rows
+        2. Ensure minimum alpha of 0.2 for better visibility of low-weight tokens
+        3. Display token text, index, and weight on separate lines for clarity
+        4. Apply stretch factors when using unified colorscale
         """
         import matplotlib.pyplot as plt
         import numpy as np
@@ -975,64 +835,32 @@ class HeatmapVisualizer:
             ax.axis('off')
             return False
         
-        # Get token data
+        # Sort tokens by index for sequential ordering
         tokens = type_df.sort_values("token_index")
-        
-        # Get max importance weight
-        max_weight = tokens["importance_weight"].max()
-        
-        # If using unified scale, normalize weights
-        if global_max is not None and global_max > 0:
-            tokens["normalized_weight"] = tokens["importance_weight"] / global_max
-            weight_column = "normalized_weight"
-        else:
-            weight_column = "importance_weight"
-        
-        # Create a grid layout for the tokens
         num_tokens = len(tokens)
         
-        # Determine grid dimensions - aim for roughly square layout
-        grid_width = math.ceil(math.sqrt(num_tokens))
+        # ---- Normalization ----
+        # Get max value for this token type
+        max_w = type_maxes[token_type]
+        
+        # IMPROVED: Apply normalization with stretch factor
+        tokens = tokens.assign(norm_w = (tokens["importance_weight"] / max_w) * stretch[token_type])
+        tokens["norm_w"] = tokens["norm_w"].clip(upper=1.0)  # Cap at 1.0
+        
+        # IMPROVED: Fixed grid width based on token count
+        # This ensures better token layout with reasonable row counts
+        grid_width = 12 if num_tokens > 120 else \
+                    8  if num_tokens > 64  else \
+                    math.ceil(math.sqrt(num_tokens))
         grid_height = math.ceil(num_tokens / grid_width)
         
-        # Create a background with neutral color
-        background_color = "#f0f0f0" if token_type == 1 else "#f0fff0"  # Light gray or light green
+        # Set colormap based on token type
+        cmap = plt.get_cmap('Blues') if token_type == 1 else plt.get_cmap('Greens')
         
-        # Determine token positions in the grid
-        positions = {}
-        row_heights = []
-        col_widths = []
-        
-        # Fill in positions row by row
-        token_iter = tokens.iterrows()
-        for row in range(grid_height):
-            row_tokens = []
-            for col in range(grid_width):
-                try:
-                    idx, token = next(token_iter)
-                    positions[(row, col)] = token
-                    row_tokens.append(token)
-                except StopIteration:
-                    # No more tokens
-                    break
-            
-            # Calculate row height - based on largest token text
-            max_len = max([len(str(t["token_text"])) for t in row_tokens]) if row_tokens else 1
-            row_heights.append(max(1.0, max_len / 10))  # Scale based on text length
-        
-        # Ensure all rows have a minimum height
-        row_heights = [max(0.8, h) for h in row_heights]
-        
-        # Create a more functional grid visualization
-        import matplotlib.gridspec as gridspec
-        
-        # Create figure with grid layout
-        grid = gridspec.GridSpec(grid_height, grid_width)
-        
-        # Draw background
+        # Create a neutral background
+        background_color = "#f0f0f0" if token_type == 1 else "#f0fff0"
         rect = plt.Rectangle(
-            (0, 0),
-            1, 1,
+            (0, 0), 1, 1,
             facecolor=background_color,
             edgecolor='none',
             alpha=0.3,
@@ -1040,104 +868,100 @@ class HeatmapVisualizer:
         )
         ax.add_patch(rect)
         
+        # Arrange tokens in a grid layout
+        positions = {}
+        idx = 0
+        for i in range(grid_height):
+            for j in range(grid_width):
+                if idx < num_tokens:
+                    positions[(i, j)] = tokens.iloc[idx]
+                    idx += 1
+        
         # Draw tokens in the grid
-        for pos, token in positions.items():
-            row, col = pos
-            
+        for (row, col), token in positions.items():
             # Get token info
             token_idx = token["token_index"]
-            token_text = token["token_text"]
-            weight = token[weight_column]
+            token_text = str(token["token_text"]).replace('\n', '⏎')[:15]  # Truncate for display
+            weight = token["importance_weight"]
+            norm_val = token["norm_w"]
             
-            # Calculate cell position (normalized coordinates)
+            # Calculate cell position in normalized coordinates
             x_start = col / grid_width
             y_start = row / grid_height
             width = 1 / grid_width
             height = 1 / grid_height
             
-            # Apply gamma correction for better contrast
-            contrast_val = weight ** 0.5
+            # IMPROVED: Ensure minimum alpha for better visibility
+            # Alpha ranges from 0.2 to 1.0 based on normalized value
+            alpha = 0.2 + 0.8 * norm_val
             
-            # Determine alpha based on weight
-            alpha = min(0.9, contrast_val + 0.3) if weight > 0.01 else 0.15
-            
-            # Create colored rectangle
+            # Create cell rectangle
             rect = plt.Rectangle(
                 (x_start, y_start),
                 width, height,
-                facecolor=cmap(contrast_val),
+                facecolor=cmap(norm_val),  # NO gamma correction (removed val**0.5)
                 edgecolor='black',
-                linewidth=0.5,
+                linewidth=0.3,
                 alpha=alpha,
                 transform=ax.transAxes
             )
             ax.add_patch(rect)
             
-            # Add token text and index
-            if show_values:
-                # Add token_text centered in the cell
-                ax.text(
-                    x_start + width/2,
-                    y_start + height*0.7,  # Positioned near the top
-                    str(token_text),
-                    ha='center', va='center',
-                    fontsize=8,
-                    transform=ax.transAxes,
-                    color='black'
-                )
-                
-                # Add token index below the text
-                ax.text(
-                    x_start + width/2,
-                    y_start + height*0.5,  # Middle
-                    f"idx:{token_idx}",
-                    ha='center', va='center',
-                    fontsize=7,
-                    transform=ax.transAxes,
-                    color='darkblue'
-                )
-                
-                # Add weight value at the bottom
-                ax.text(
-                    x_start + width/2,
-                    y_start + height*0.3,  # Near the bottom
-                    f"{weight:.3f}",
-                    ha='center', va='center',
-                    fontsize=7,
-                    transform=ax.transAxes,
-                    color='white' if weight > 0.4 else 'black',
-                    weight='bold'
-                )
+            # IMPROVED: Display token information on separate lines for clarity
+            # Line 1: Token text
+            ax.text(
+                x_start + width/2,
+                y_start + height*0.75,  # Upper portion
+                token_text,
+                ha='center', va='center',
+                fontsize=8,
+                transform=ax.transAxes,
+                color='black'
+            )
+            
+            # Line 2: Token index
+            ax.text(
+                x_start + width/2,
+                y_start + height*0.5,  # Middle
+                f"idx:{token_idx}",
+                ha='center', va='center',
+                fontsize=7,
+                transform=ax.transAxes,
+                color='darkblue'
+            )
+            
+            # Line 3: Weight value
+            ax.text(
+                x_start + width/2,
+                y_start + height*0.25,  # Lower portion
+                f"{weight:.2f}",
+                ha='center', va='center',
+                fontsize=7,
+                transform=ax.transAxes,
+                color='white' if norm_val > 0.5 else 'black',
+                weight='bold'
+            )
         
-        # Add legend with stats
+        # Add legend with statistics
         import matplotlib.patches as mpatches
         
         token_type_name = "Text" if token_type == 1 else "Generated"
         active_tokens = sum(1 for _, t in tokens.iterrows() if t["importance_weight"] > 0.01)
         
-        if global_max is not None:
-            # Using unified scale, need to show original max
-            orig_max = max_weight
-            norm_max = orig_max / global_max if global_max > 0 else 0.0
-            legend_text = f"{token_type_name} Tokens ({active_tokens} active of {num_tokens}) - " \
-                        f"Max: {orig_max:.3f}, Norm: {norm_max:.3f}"
-        else:
-            # Using type-specific scale
-            legend_text = f"{token_type_name} Tokens ({active_tokens} active of {num_tokens}) - " \
-                        f"Max: {max_weight:.3f}"
-        
+        # IMPROVED: Show original max rather than normalized value
+        legend_text = f"{token_type_name} Tokens ({active_tokens} active of {num_tokens}) - " \
+                    f"Max(orig): {max_w:.3f}"
+                    
         legend_handles = [mpatches.Patch(color=cmap(0.7), label=legend_text)]
         
-        # Add legend to plot
         ax.legend(
             handles=legend_handles,
-            loc='upper center',
-            bbox_to_anchor=(0.5, -0.05),
+            loc='upper right',
             fancybox=True,
             shadow=True
         )
         
-        # Set title
+        # Set title if provided, or create a default one
         if title:
             ax.set_title(title, fontsize=14)
         else:

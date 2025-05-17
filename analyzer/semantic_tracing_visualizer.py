@@ -797,7 +797,7 @@ class EnhancedSemanticTracingVisualizer:
                     origin='upper',
                     interpolation='bilinear',
                     vmin=0,
-                    vmax=vmax if vmax is not None else max(0.01, np.max(heatmap))
+                    vmax=vmax if vmax is not None else np.max(heatmap)
                 )
             
             # Add grid lines with improved visibility
@@ -826,7 +826,7 @@ class EnhancedSemanticTracingVisualizer:
             # Better colorbar
             norm = mpl.colors.Normalize(
                 vmin=0, 
-                vmax=vmax if vmax is not None else max(0.01, np.max(heatmap))
+                vmax=vmax if vmax is not None else np.max(heatmap)
             )
             sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm)
             sm.set_array([])
@@ -889,26 +889,6 @@ class EnhancedSemanticTracingVisualizer:
         show_values: bool = True,
         unified_colorscale: bool = False
     ) -> Optional[str]:
-        """
-        Arrange each layer's 2D heatmap array into a grid with improved layout, consistent colorscale,
-        and accurate max value display.
-        
-        This function creates a composite visualization that shows heatmaps for all specified layers
-        in a grid layout. It ensures that layer max values are displayed correctly and consistently
-        whether using a unified color scale or not.
-        
-        Args:
-            heatmap_maps: Dictionary mapping layer index to 2D heatmap array
-            layers: List of layer indices to include (each gets its own subplot)
-            title: Title for the figure
-            save_path: Path to save the composite image
-            cmap: Colormap to use
-            show_values: Whether to show cell values
-            unified_colorscale: Whether to use same colorscale across all layers
-                
-        Returns:
-            Path to saved image or None if failed
-        """
         try:
             import matplotlib.pyplot as plt
             import matplotlib as mpl
@@ -939,20 +919,15 @@ class EnhancedSemanticTracingVisualizer:
                 ncols = math.ceil(math.sqrt(n))
                 nrows = math.ceil(n / ncols)
             
-            # Determine global max value if using unified colorscale
-            global_max = 0
-            original_max_values = {}  # Store original max values for all layers
-            
+            # Store original max values for display, but don't normalize again
+            original_max_values = {}
             for L in valid_layers:
                 hm = heatmap_maps[L]
                 if hm is not None:
-                    layer_max = np.max(hm)
-                    original_max_values[L] = layer_max  # Store original max
-                    global_max = max(global_max, layer_max)
+                    original_max_values[L] = np.max(hm)
             
-            # For visualization with unified colorscale, we'll use vmax=1.0
-            # For non-unified, we'll use vmax=None to let each heatmap use its own scale
-            vmax_display = 1.0 if unified_colorscale else None
+            # Critical fix: Set vmax based on scale type without re-normalizing data
+            vmax_for_imshow = 1.0 if unified_colorscale else None
             
             # Create figure with better size calculation based on layout
             subplot_size = 2.5  # Base size of each subplot
@@ -994,22 +969,16 @@ class EnhancedSemanticTracingVisualizer:
                     ax.axis("off")
                     continue
                 
-                # If using unified colorscale, normalize the heatmap values
-                display_hm = hm.copy()
-                if unified_colorscale and global_max > 0:
-                    display_hm = display_hm / global_max  # Normalize to [0,1]
+                # CRITICAL FIX: Use heatmap directly without re-normalizing
+                # Data is already appropriately normalized by the tracer
+                display_hm = hm
                 
-                # Use consistent vmin/vmax when unified_colorscale is True
-                im = ax.imshow(display_hm, vmin=0, vmax=vmax_display, cmap=cmap_inst)
+                # Use consistent vmin/vmax appropriate for the data
+                im = ax.imshow(display_hm, vmin=0, vmax=vmax_for_imshow, cmap=cmap_inst)
                 
                 # Add layer title with appropriate statistics
-                # Show original max and normalized max (if using unified scale)
                 orig_max = original_max_values.get(L, 0)
-                if unified_colorscale and global_max > 0:
-                    normalized_max = orig_max / global_max
-                    ax_title = f"Layer {L} (max: {orig_max:.2f}, norm: {normalized_max:.2f})"
-                else:
-                    ax_title = f"Layer {L} (max: {orig_max:.2f})"
+                ax_title = f"Layer {L} (max: {orig_max:.2f})"
                     
                 ax.set_title(ax_title, fontsize=10)
                 
@@ -1066,7 +1035,6 @@ class EnhancedSemanticTracingVisualizer:
             traceback.print_exc()
             return None
 
-
     def _create_enhanced_composite_with_background(
         self,
         heatmap_maps: Dict[int, Optional[np.ndarray]],
@@ -1081,30 +1049,6 @@ class EnhancedSemanticTracingVisualizer:
         alpha: float = 0.9,
         unified_colorscale: bool = False
     ) -> Optional[str]:
-        """
-        Create a composite visualization with backgrounds for each layer, ensuring consistent
-        and accurate display of layer max values.
-        
-        This function creates a composite visualization with the original image as background
-        for each layer's heatmap. It ensures that max values are displayed accurately whether
-        using a unified color scale or layer-specific scales.
-        
-        Args:
-            heatmap_maps: Dictionary mapping layer indices to heatmap arrays
-            layers: List of layer indices to include
-            original_image: Original image for background
-            feature_mapping: Feature mapping information
-            is_patch: Whether this is a patch visualization (True) or base (False)
-            target_idx: Target token index
-            title: Title for the visualization
-            save_path: Path to save the output
-            colormap: Colormap to use
-            alpha: Alpha value for overlays
-            unified_colorscale: Whether to use unified color scale across layers
-                
-        Returns:
-            Path to saved visualization or None if failed
-        """
         try:
             import matplotlib.pyplot as plt
             import matplotlib as mpl
@@ -1135,20 +1079,15 @@ class EnhancedSemanticTracingVisualizer:
                 ncols = math.ceil(math.sqrt(n))
                 nrows = math.ceil(n / ncols)
             
-            # Store both original and normalized max values
+            # Store original max values for display, no re-normalization
             original_max_values = {}
-            global_max = 0
-            
-            # Determine global max value if using unified colorscale
             for L in valid_layers:
                 hm = heatmap_maps[L]
                 if hm is not None:
-                    layer_max = np.max(hm)
-                    original_max_values[L] = layer_max  # Store original max
-                    global_max = max(global_max, layer_max)
+                    original_max_values[L] = np.max(hm)
             
-            # For unified colorscale, use normalized values [0,1]
-            # For non-unified, use original values with layer-specific scales
+            # CRITICAL FIX: Set vmax based on unified scale without re-normalizing data
+            v_max = 1.0 if unified_colorscale else None
             
             # Create figure with better size calculation based on layout
             subplot_size = 3.5  # Larger size for better visibility of details
@@ -1175,15 +1114,12 @@ class EnhancedSemanticTracingVisualizer:
                 # Create subplot
                 ax = fig.add_subplot(grid[row, col])
                 
-                # If using unified colorscale, normalize values
-                if unified_colorscale and global_max > 0:
-                    # Create a normalized copy for display
-                    display_heatmap = heatmap / global_max
-                    norm_max = original_max_values[layer_idx] / global_max
-                    layer_title = f"Layer {layer_idx} (max: {original_max_values[layer_idx]:.2f}, norm: {norm_max:.2f})"
-                else:
-                    display_heatmap = heatmap  # Use original values
-                    layer_title = f"Layer {layer_idx} (max: {original_max_values[layer_idx]:.2f})"
+                # CRITICAL FIX: Use heatmap directly without re-normalizing
+                # Set display properties based on unified scale
+                display_heatmap = heatmap  # Already appropriately normalized
+                
+                # Create appropriate title with layer info
+                layer_title = f"Layer {layer_idx} (max: {original_max_values[layer_idx]:.2f})"
                 
                 # Determine if working with base or patch features
                 if is_patch:
@@ -1351,10 +1287,10 @@ class EnhancedSemanticTracingVisualizer:
                 ax.set_title(layer_title, fontsize=10)
                 ax.axis("off")
             
-            # Add colormap legend
+            # CRITICAL FIX: Use proper vmax for colorbar
             # Create a new axis for the colorbar
             cax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
-            norm = mpl.colors.Normalize(vmin=0, vmax=1.0 if unified_colorscale else None)
+            norm = mpl.colors.Normalize(vmin=0, vmax=v_max)
             cb = mpl.colorbar.ColorbarBase(cax, cmap=plt.get_cmap(colormap), norm=norm)
             if unified_colorscale:
                 cb.set_label("Normalized Influence (0-1 scale)")

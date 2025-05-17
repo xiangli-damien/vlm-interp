@@ -892,15 +892,7 @@ class EnhancedSemanticTracer:
                         }
 
                         # Add importance weight for heatmap visualization
-                        # For a source token, we find its scaled_weight in relation to any target
-                        # If it's a source for multiple targets, we use the maximum weight
-                        importance_weight = 0.0
-                        for t in layer_results["target_tokens"]:
-                            for s in t["sources"]:
-                                if s["index"] == token_idx:
-                                    # In attention mode, we use scaled_weight which combines attention_score with target weight
-                                    importance_weight = max(importance_weight, s["scaled_weight"])
-                        record["importance_weight"] = importance_weight
+                        record["importance_weight"] = source_totals.get(token_idx, 0.0)
                         
                         # Add source-target relationship (needed for flow graph visualization)
                         if is_target:
@@ -960,6 +952,9 @@ class EnhancedSemanticTracer:
                 
                 # Create a set of remaining source indices after pruning
                 remaining_source_indices = set(s["index"] for s in pruned_sources)
+
+                # Calculate total importance for each source
+                source_totals = {s["index"]: s["scaled_weight"] for s in pruned_sources}
                 
                 # Update target_to_sources to only include remaining sources
                 for target_idx in target_to_sources:
@@ -1482,15 +1477,7 @@ class EnhancedSemanticTracer:
                             "trace_id": trace_id,
                         }
 
-                        importance_weight = 0.0
-                        for t in layer_results["target_tokens"]:
-                            for s in t["sources"]:
-                                if s["index"] == token_idx:
-                                    # Use scaled_weight as it combines local and global importance
-                                    importance_weight = max(importance_weight, s["scaled_weight"])
-                        
-                        # Add importance weight to record
-                        record["importance_weight"] = importance_weight
+                        record["importance_weight"] = source_totals.get(token_idx, 0.0)
                         
                         # Add source-target relationship (needed for flow graph visualization)
                         if is_target:
@@ -1550,6 +1537,9 @@ class EnhancedSemanticTracer:
                 
                 # Create a set of remaining source indices after pruning
                 remaining_source_indices = set(s["index"] for s in pruned_sources)
+
+                # Calculate total importance for each source
+                source_totals = {s["index"]: s["scaled_weight"] for s in pruned_sources}
                 
                 # Update target_to_sources to only include remaining sources
                 for target_idx in target_to_sources:

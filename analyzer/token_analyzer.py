@@ -1437,22 +1437,26 @@ class TokenAnalyzer:
         reference_output: Optional[Dict[str, Any]] = None,
         start_block_layer: Optional[int] = None,
         end_block_layer: Optional[int] = None,
-        cache_hidden_states: bool = True
+        attention_mask_strategy: str = "none",  # New parameter: 'none', 'block', 'reduce'
+        cache_hidden_states: bool = True,
+        debug_logging: bool = False
     ) -> Dict[str, Any]:
         """
         Simulate blocking specific tokens to analyze their impact on model reasoning.
-        Supports specifying which layers to apply token blocking to.
+        Enhanced version with attention masking and improved layer control.
         
         Args:
             model: Model to use for simulation
             processor: Processor for the model
             input_data: Prepared input data
             tokens_to_block: List of token indices to block
-            method: Blocking method ("zero_out", "average", or "noise")
+            method: Blocking method ("zero_out", "average", "noise", "interpolate")
             reference_output: Optional reference output for comparison
             start_block_layer: First layer to apply blocking (None = all layers)
             end_block_layer: Last layer to apply blocking (None = all layers)
+            attention_mask_strategy: How to modify attention ("none", "block", "reduce")
             cache_hidden_states: Whether to cache hidden states for faster computation
+            debug_logging: Whether to print detailed debug logs
             
         Returns:
             Dictionary with simulation results
@@ -1471,14 +1475,18 @@ class TokenAnalyzer:
                 blocking_layers = f"layers up to {end_block_layer}"
         
         print(f"Simulating token blocking for {len(tokens_to_block)} tokens using method: {method} on {blocking_layers}")
+        print(f"Attention mask strategy: {attention_mask_strategy}")
         
         # Initialize hidden states cache if enabled
         hidden_states_cache = {}
         
+        # Map to track which hooks have been called (for debugging)
+        hook_call_tracking = {}
+        
         # Define hook to modify hidden states
         def blocking_hook(name):
             def hook_fn(module, input_tensors, output_tensors):
-                # Extract layer index from name (can be customized based on model)
+                # Extract layer index from name
                 layer_idx = -1
                 
                 # Try to extract layer index from name patterns like "layer.10" or "layers.5"
@@ -1487,11 +1495,17 @@ class TokenAnalyzer:
                 if match:
                     layer_idx = int(match.group(1))
                 else:
-                    # Try to get index from module name
-                    for attr_name in dir(module):
-                        if attr_name.startswith('layer_idx') and hasattr(module, attr_name):
-                            layer_idx = getattr(module, attr_name)
-                            break
+                    # Try alternative patterns, e.g., for BERT-type models
+                    match = re.search(r'h\.(\d+)', name)
+                    if match:
+                        layer_idx = int(match.group(1))
+                    # Try to get index from module name/attributes
+                    elif hasattr(module, 'layer_idx'):
+                        layer_idx = module.layer_idx
+                
+                # Track hook call for debugging
+                if debug_logging:
+                    hook_call_tracking[name] = hook_call_tracking.get(name, 0) + 1
                 
                 # Check if we should apply blocking to this layer
                 apply_blocking = True
@@ -1532,10 +1546,92 @@ class TokenAnalyzer:
                                     prev_token = hidden_states[:, token_idx-1, :]
                                     next_token = hidden_states[:, token_idx+1, :]
                                     modified[:, token_idx, :] = (prev_token + next_token) / 2
+                            elif method == "reduce":
+                                # Reduce token representation to 10% of original value
+                                modified[:, token_idx, :] *= 0.1
                     
                     return modified
                 
                 return output_tensors
+            return hook_fn
+        
+        # Define hook for attention modules to modify attention masks
+        def attention_hook(name):
+            def hook_fn(module, input_tensors, output_tensors):
+                # Don't apply attention masking if it's disabled
+                if attention_mask_strategy == "none":
+                    return output_tensors
+                
+                # Extract layer index from name
+                layer_idx = -1
+                import re
+                match = re.search(r'layer[s]?\.(\d+)', name)
+                if match:
+                    layer_idx = int(match.group(1))
+                else:
+                    match = re.search(r'h\.(\d+)', name)
+                    if match:
+                        layer_idx = int(match.group(1))
+                    elif hasattr(module, 'layer_idx'):
+                        layer_idx = module.layer_idx
+                
+                # Check if we should apply blocking to this layer
+                apply_blocking = True
+                if start_block_layer is not None and layer_idx < start_block_layer:
+                    apply_blocking = False
+                if end_block_layer is not None and layer_idx > end_block_layer:
+                    apply_blocking = False
+                
+                if not apply_blocking:
+                    return output_tensors
+                
+                # For attention outputs (typically a tuple with attention probs)
+                if isinstance(output_tensors, tuple) and len(output_tensors) > 0:
+                    # First element is typically the output, second might be attention weights
+                    if len(output_tensors) > 1 and isinstance(output_tensors[1], torch.Tensor):
+                        attention_weights = output_tensors[1].clone()
+                        
+                        # Modify attention weights based on strategy
+                        for token_idx in tokens_to_block:
+                            if token_idx < attention_weights.shape[2]:  # Check if token idx is valid
+                                if attention_mask_strategy == "block":
+                                    # Block this token from receiving attention (column)
+                                    attention_weights[:, :, token_idx, :] = 0
+                                    # Block this token from providing attention (row)
+                                    attention_weights[:, :, :, token_idx] = 0
+                                elif attention_mask_strategy == "reduce":
+                                    # Reduce attention to/from this token by 90%
+                                    attention_weights[:, :, token_idx, :] *= 0.1
+                                    attention_weights[:, :, :, token_idx] *= 0.1
+                        
+                        # Create new output tuple with modified attention weights
+                        new_outputs = list(output_tensors)
+                        new_outputs[1] = attention_weights
+                        return tuple(new_outputs)
+                
+                # For inputs to attention (typically q, k, v tensors and attention mask)
+                if isinstance(input_tensors, tuple) and len(input_tensors) >= 2:
+                    # Look for attention mask in inputs (typically position 3)
+                    for i in range(len(input_tensors)):
+                        if isinstance(input_tensors[i], torch.Tensor) and input_tensors[i].dtype == torch.bool:
+                            attention_mask = input_tensors[i].clone()
+                            
+                            # Modify attention mask based on strategy
+                            for token_idx in tokens_to_block:
+                                if token_idx < attention_mask.shape[1]:  # Check if token idx is valid
+                                    if attention_mask_strategy == "block":
+                                        # Set attention mask to False (0) for blocked token
+                                        attention_mask[:, token_idx] = False
+                                    elif attention_mask_strategy == "reduce":
+                                        # Can't partially mask with boolean, handled at attention weights
+                                        pass
+                            
+                            # Create new input tuple with modified attention mask
+                            new_inputs = list(input_tensors)
+                            new_inputs[i] = attention_mask
+                            return tuple(new_inputs)
+                
+                return input_tensors
             return hook_fn
         
         # Get base LLM module to attach hooks
@@ -1545,22 +1641,27 @@ class TokenAnalyzer:
         try:
             # Register hooks for each layer
             hook_handles = []
+            attn_hook_handles = []
             
             # Find all transformer layers in the model
-            # This pattern matches most HuggingFace models but may need adaptation
             for name, module in llm_module.named_modules():
                 # Look for transformer blocks/layers
                 if any(pattern in name for pattern in ['layers.', 'layer.', 'h.']):
                     # Register hook for this module
                     hook_handles.append(module.register_forward_hook(blocking_hook(name)))
+                
+                # Look for attention modules
+                if attention_mask_strategy != "none" and any(pattern in name for pattern in ['attention', 'attn']):
+                    # Register attention hook
+                    attn_hook_handles.append(module.register_forward_hook(attention_hook(name)))
+                    # Also try to hook attention input 
+                    if hasattr(module, 'register_forward_pre_hook'):
+                        attn_hook_handles.append(module.register_forward_pre_hook(attention_hook(f"{name}_input")))
             
-            print(f"Registered {len(hook_handles)} hooks for blocking")
+            print(f"Registered {len(hook_handles)} layer hooks and {len(attn_hook_handles)} attention hooks")
             
             # Run model with blocked tokens
             inputs = input_data["inputs"]
-            
-            # To avoid OOM issues, use half precision and CPU offloading where possible
-            run_dtype = inputs["input_ids"].dtype
             
             # Check if we should use reference output's logits shape
             ref_logits_dim = 2
@@ -1569,12 +1670,16 @@ class TokenAnalyzer:
             
             with torch.no_grad():
                 # Run the model with hooks active
-                outputs = model(**{k: v for k, v in inputs.items() if k != "token_type_ids"},
-                            output_hidden_states=True,
-                            output_attentions=False)  # Don't need attention, saves memory
+                outputs = model(
+                    **{k: v for k, v in inputs.items() if k != "token_type_ids"},
+                    output_hidden_states=True,
+                    output_attentions=True  # Get attention matrices
+                )
             
             # Remove hooks
             for handle in hook_handles:
+                handle.remove()
+            for handle in attn_hook_handles:
                 handle.remove()
             
             # Clean up hidden states cache to save memory
@@ -1631,14 +1736,20 @@ class TokenAnalyzer:
                 ref_probs = torch.softmax(ref_logits, dim=-1)
                 sim_probs = torch.softmax(pred_logits, dim=-1)
                 
-                # KL Divergence as distribution distance
+                # KL Divergence as distribution distance with numerical stability
                 try:
+                    # Add small epsilon to avoid log(0)
+                    epsilon = 1e-8
                     kl_div = torch.nn.functional.kl_div(
-                        sim_probs.log(), ref_probs, reduction="batchmean"
+                        (sim_probs + epsilon).log(),
+                        ref_probs + epsilon,
+                        reduction="batchmean"
                     ).item()
-                except:
-                    # Fallback if KL divergence fails
-                    kl_div = torch.sum((sim_probs - ref_probs) ** 2).item()
+                except Exception as e:
+                    if debug_logging:
+                        print(f"KL divergence calculation failed: {e}")
+                    # Fallback to L2 distance if KL fails
+                    kl_div = torch.mean((sim_probs - ref_probs) ** 2).item()
                 
                 # Token match - whether prediction is the same
                 token_match = (generated_ids == ref_ids).all().item()
@@ -1647,11 +1758,51 @@ class TokenAnalyzer:
                 ref_token_id = ref_ids[0].item()
                 ref_token_prob = sim_probs[0, ref_token_id].item() if ref_token_id < sim_probs.shape[1] else 0.0
                 
+                # Get top-5 tokens from reference and simulation
+                top_k = 5
+                ref_top_tokens = torch.topk(ref_probs, k=min(top_k, ref_probs.shape[1]), dim=1)
+                sim_top_tokens = torch.topk(sim_probs, k=min(top_k, sim_probs.shape[1]), dim=1)
+                
+                ref_top_ids = ref_top_tokens.indices[0].tolist()
+                ref_top_probs = ref_top_tokens.values[0].tolist()
+                sim_top_ids = sim_top_tokens.indices[0].tolist()
+                sim_top_probs = sim_top_tokens.values[0].tolist()
+                
+                # Convert token IDs to text for better interpretability
+                ref_top_text = [processor.tokenizer.decode([idx]) for idx in ref_top_ids]
+                sim_top_text = [processor.tokenizer.decode([idx]) for idx in sim_top_ids]
+                
+                # Calculate entropy of both distributions as a measure of uncertainty
+                ref_entropy = -torch.sum(ref_probs * torch.log(ref_probs + epsilon)).item()
+                sim_entropy = -torch.sum(sim_probs * torch.log(sim_probs + epsilon)).item()
+                
+                # Calculate impact metrics
+                if ref_token_prob > 0:
+                    # Probability decrease for reference token
+                    prob_impact = 1.0 - (ref_token_prob / ref_probs[0, ref_token_id].item())
+                else:
+                    prob_impact = 1.0  # Maximum impact
+                
+                # Change in uncertainty (entropy)
+                entropy_change = (sim_entropy - ref_entropy) / max(ref_entropy, 1e-8)
+                
+                # Final impact score (weighted combination)
+                impact_score = 0.7 * prob_impact + 0.3 * min(1.0, max(0.0, entropy_change))
+                
                 comparison = {
                     "kl_divergence": kl_div,
                     "token_match": token_match,
                     "ref_token_prob": ref_token_prob,
-                    "impact_score": 1.0 - ref_token_prob if ref_token_prob > 0 else 1.0
+                    "impact_score": impact_score,
+                    "entropy_change": entropy_change,
+                    "ref_top_tokens": [
+                        {"id": id, "text": text, "prob": prob} 
+                        for id, text, prob in zip(ref_top_ids, ref_top_text, ref_top_probs)
+                    ],
+                    "sim_top_tokens": [
+                        {"id": id, "text": text, "prob": prob} 
+                        for id, text, prob in zip(sim_top_ids, sim_top_text, sim_top_probs)
+                    ]
                 }
             
             # Return results
@@ -1661,11 +1812,21 @@ class TokenAnalyzer:
                 "blocking_layers": blocking_layers,
                 "start_block_layer": start_block_layer,
                 "end_block_layer": end_block_layer,
+                "attention_mask_strategy": attention_mask_strategy,
                 "generated_text": generated_text,
                 "comparison": comparison
             }
             
-            print(f"Blocking simulation complete. Token match: {comparison.get('token_match', 'N/A')}")
+            if debug_logging:
+                results["debug"] = {
+                    "hook_calls": hook_call_tracking,
+                }
+            
+            print(f"Blocking simulation complete.")
+            if "comparison" in results:
+                token_match = results["comparison"].get("token_match", "N/A")
+                impact = results["comparison"].get("impact_score", "N/A")
+                print(f"  Token match: {token_match}, Impact score: {impact}")
             
             return results
             
@@ -1679,7 +1840,8 @@ class TokenAnalyzer:
                 "traceback": traceback.format_exc(),
                 "method": method,
                 "tokens_blocked": tokens_to_block,
-                "blocking_layers": blocking_layers
+                "blocking_layers": blocking_layers,
+                "attention_mask_strategy": attention_mask_strategy
             }
 
     @staticmethod
@@ -1741,3 +1903,284 @@ class TokenAnalyzer:
             print(f"Error optimizing trace data: {e}")
             # Return the original DataFrame
             return pd.read_csv(csv_path)
+
+    @staticmethod
+    def analyze_layer_impact(
+        model,
+        processor,
+        input_data: Dict[str, Any],
+        critical_tokens: List[Dict[str, Any]],
+        output_dir: str = "token_analysis_results",
+        method: str = "zero_out",
+        attention_mask_strategy: str = "none",
+        layer_count: Optional[int] = None,
+        debug_mode: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Analyze the impact of blocking tokens at different layers.
+        This function tests blocking tokens starting from each layer up to the last layer,
+        and visualizes how the impact changes as blocking progresses through the model.
+        
+        Args:
+            model: Model to use for simulation
+            processor: Processor for the model
+            input_data: Prepared input data
+            critical_tokens: List of critical tokens to block
+            output_dir: Directory to save analysis results
+            method: Blocking method ("zero_out", "average", "noise", or "interpolate")
+            attention_mask_strategy: How to modify attention ("none", "block", "reduce")
+            layer_count: Total number of model layers (if None, tries to detect automatically)
+            debug_mode: Whether to print detailed debug information
+            
+        Returns:
+            Dictionary with layer impact analysis results and visualization paths
+        """
+        import os
+        import json
+        import torch
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from typing import Dict, List, Any, Optional, Union
+        from matplotlib.colors import LinearSegmentedColormap
+        
+        print("\n--- Analyzing Layer-wise Impact of Token Blocking ---")
+        
+        # Initialize TokenAnalyzer for token blocking
+        from analyzer.token_analyzer import TokenAnalyzer
+        analyzer = TokenAnalyzer(output_dir=output_dir, debug_mode=debug_mode)
+        
+        # Create output directory for visualizations
+        viz_dir = os.path.join(output_dir, "layer_impact_visualizations")
+        os.makedirs(viz_dir, exist_ok=True)
+        
+        # Determine model layer count if not provided
+        if layer_count is None:
+            layer_count = 0
+            # Count layers based on common model layer naming patterns
+            for name, _ in model.named_modules():
+                if any(pattern in name for pattern in ['layers.', 'layer.', 'h.']):
+                    layer_count += 1
+            
+            # Fallback estimation for common model architectures
+            if layer_count == 0:
+                if hasattr(model, 'config') and hasattr(model.config, 'num_hidden_layers'):
+                    layer_count = model.config.num_hidden_layers
+                else:
+                    layer_count = 24  # Common default for large LLMs
+        
+        print(f"Model has {layer_count} layers")
+        
+        # First run normal inference as reference
+        inputs = input_data["inputs"]
+        
+        try:
+            with torch.no_grad():
+                reference_outputs = model(**{k: v for k, v in inputs.items() if k != "token_type_ids"})
+                
+                # Get reference output token
+                reference_logits = reference_outputs.logits
+                
+                # Handle different logits shapes
+                if reference_logits.dim() == 2:  # [batch, vocab]
+                    pred_logits = reference_logits
+                else:  # [batch, seq, vocab]
+                    pred_logits = reference_logits[:, -1, :]
+                    
+                reference_ids = torch.argmax(pred_logits, dim=-1).unsqueeze(0)
+                reference_text = processor.tokenizer.decode(reference_ids[0].tolist())
+                
+                # Get probabilities
+                reference_probs = torch.softmax(pred_logits, dim=-1)
+                
+                reference_result = {
+                    "output_ids": reference_ids,
+                    "output_text": reference_text,
+                    "logits": pred_logits,
+                    "probabilities": reference_probs
+                }
+        except Exception as e:
+            print(f"Error during reference inference: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"error": f"Reference inference failed: {str(e)}"}
+        
+        # Extract token indices from critical tokens
+        token_indices = [token["token_index"] for token in critical_tokens]
+        
+        # Test blocking from each layer to the end
+        layer_results = []
+        
+        print(f"Testing blocking from each layer to the end...")
+        for start_layer in range(layer_count):
+            print(f"  Testing blocking from layer {start_layer} to the end...")
+            
+            # Run blocking simulation
+            result = analyzer.simulate_token_blocking(
+                model=model,
+                processor=processor,
+                input_data=input_data,
+                tokens_to_block=token_indices,
+                method=method,
+                reference_output=reference_result,
+                start_block_layer=start_layer,
+                end_block_layer=None,
+                attention_mask_strategy=attention_mask_strategy
+            )
+            
+            # Extract key metrics
+            impact = result.get("comparison", {}).get("impact_score", 0)
+            token_match = result.get("comparison", {}).get("token_match", False)
+            ref_token_prob = result.get("comparison", {}).get("ref_token_prob", 0)
+            
+            # Store result
+            layer_results.append({
+                "start_layer": start_layer,
+                "end_layer": layer_count - 1,
+                "impact_score": impact,
+                "token_match": token_match,
+                "ref_token_prob": ref_token_prob,
+                "generated_text": result.get("generated_text", "")
+            })
+        
+        # Collect metrics for visualization
+        layers = [r["start_layer"] for r in layer_results]
+        impact_scores = [r["impact_score"] for r in layer_results]
+        ref_token_probs = [r["ref_token_prob"] for r in layer_results]
+        
+        # Create visualizations
+        
+        # 1. Impact score vs layer plot
+        plt.figure(figsize=(10, 6))
+        plt.plot(layers, impact_scores, 'o-', linewidth=2, markersize=8)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.xlabel('Starting Layer for Blocking', fontsize=12)
+        plt.ylabel('Impact Score', fontsize=12)
+        plt.title(f'Impact of Blocking Tokens from Different Layers\nMethod: {method}, Attention Mask: {attention_mask_strategy}', fontsize=14)
+        plt.xticks(range(0, layer_count, max(1, layer_count // 10)))
+        plt.ylim(0, max(1.0, max(impact_scores) * 1.1))
+        
+        # Add high, medium, low impact regions
+        plt.axhspan(0.7, 1.0, alpha=0.2, color='red', label='High Impact')
+        plt.axhspan(0.3, 0.7, alpha=0.2, color='yellow', label='Medium Impact')
+        plt.axhspan(0.0, 0.3, alpha=0.2, color='green', label='Low Impact')
+        
+        plt.legend()
+        plt.tight_layout()
+        impact_plot_path = os.path.join(viz_dir, f'impact_by_layer_{method}_{attention_mask_strategy}.png')
+        plt.savefig(impact_plot_path)
+        
+        # 2. Reference token probability vs layer plot
+        plt.figure(figsize=(10, 6))
+        plt.plot(layers, ref_token_probs, 'o-', linewidth=2, markersize=8, color='green')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.xlabel('Starting Layer for Blocking', fontsize=12)
+        plt.ylabel('Reference Token Probability', fontsize=12)
+        plt.title(f'Probability of Reference Token After Blocking\nMethod: {method}, Attention Mask: {attention_mask_strategy}', fontsize=14)
+        plt.xticks(range(0, layer_count, max(1, layer_count // 10)))
+        
+        # Add original reference probability line
+        ref_prob = reference_probs[0, reference_ids[0]].item()
+        plt.axhline(y=ref_prob, color='r', linestyle='--', label=f'Original Probability ({ref_prob:.3f})')
+        
+        plt.legend()
+        plt.tight_layout()
+        prob_plot_path = os.path.join(viz_dir, f'reference_prob_by_layer_{method}_{attention_mask_strategy}.png')
+        plt.savefig(prob_plot_path)
+        
+        # 3. Heatmap of impact for all critical tokens individually
+        if len(critical_tokens) <= 10:  # Only for a reasonable number of tokens
+            all_token_results = []
+            for token in critical_tokens:
+                token_idx = token["token_index"]
+                token_text = token["token_text"]
+                print(f"  Analyzing layer impact for token {token_idx} ('{token_text}')...")
+                
+                token_layer_impact = []
+                for start_layer in range(0, layer_count, max(1, layer_count // 10)):  # Sample fewer layers for speed
+                    result = analyzer.simulate_token_blocking(
+                        model=model,
+                        processor=processor,
+                        input_data=input_data,
+                        tokens_to_block=[token_idx],
+                        method=method,
+                        reference_output=reference_result,
+                        start_block_layer=start_layer,
+                        end_block_layer=None,
+                        attention_mask_strategy=attention_mask_strategy
+                    )
+                    
+                    impact = result.get("comparison", {}).get("impact_score", 0)
+                    token_layer_impact.append({
+                        "start_layer": start_layer,
+                        "impact_score": impact
+                    })
+                
+                all_token_results.append({
+                    "token_index": token_idx,
+                    "token_text": token_text,
+                    "layer_impacts": token_layer_impact
+                })
+            
+            # Create heatmap
+            if all_token_results:
+                # Extract data for heatmap
+                token_texts = [t["token_text"] for t in all_token_results]
+                sample_layers = [r["start_layer"] for r in all_token_results[0]["layer_impacts"]]
+                
+                impact_matrix = np.zeros((len(all_token_results), len(sample_layers)))
+                for i, token_result in enumerate(all_token_results):
+                    for j, layer_impact in enumerate(token_result["layer_impacts"]):
+                        impact_matrix[i, j] = layer_impact["impact_score"]
+                
+                plt.figure(figsize=(12, len(all_token_results) * 0.8 + 2))
+                
+                # Custom colormap: green (low impact) to yellow to red (high impact)
+                cmap = LinearSegmentedColormap.from_list('impact_cmap', 
+                                                    [(0, 'green'), (0.5, 'yellow'), (1, 'red')])
+                
+                # Plot heatmap
+                im = plt.imshow(impact_matrix, cmap=cmap, aspect='auto', vmin=0, vmax=1)
+                plt.colorbar(im, label='Impact Score')
+                
+                plt.xlabel('Starting Layer for Blocking')
+                plt.ylabel('Token')
+                plt.title(f'Impact of Blocking Individual Tokens at Different Layers\nMethod: {method}, Attention Mask: {attention_mask_strategy}')
+                
+                # Set tick labels
+                plt.yticks(range(len(token_texts)), token_texts)
+                plt.xticks(range(len(sample_layers)), sample_layers)
+                
+                plt.tight_layout()
+                heatmap_path = os.path.join(viz_dir, f'token_impact_heatmap_{method}_{attention_mask_strategy}.png')
+                plt.savefig(heatmap_path)
+        
+        # Save detailed results to file
+        results = {
+            "reference_output": reference_text,
+            "reference_token_id": reference_ids[0].item(),
+            "reference_token_probability": ref_prob,
+            "method": method,
+            "attention_mask_strategy": attention_mask_strategy,
+            "layer_count": layer_count,
+            "layer_results": layer_results,
+            "visualization_paths": {
+                "impact_plot": impact_plot_path,
+                "probability_plot": prob_plot_path
+            }
+        }
+        
+        if "heatmap_path" in locals():
+            results["visualization_paths"]["token_heatmap"] = heatmap_path
+        
+        results_path = os.path.join(output_dir, f"layer_impact_analysis_{method}_{attention_mask_strategy}.json")
+        with open(results_path, 'w') as f:
+            # Convert to serializable format (handle numpy data types)
+            serializable_results = analyzer._make_serializable(results)
+            json.dump(serializable_results, f, indent=2)
+        
+        print(f"Layer impact analysis complete. Results saved to: {results_path}")
+        print(f"Visualizations saved to: {viz_dir}")
+        
+        plt.close('all')  # Close all plots
+        
+        return results

@@ -1427,7 +1427,7 @@ def run_token_analysis(
         traceback.print_exc()
         return {"error": str(e)}
         
-def run_ablation_experiments(
+def run_enhanced_ablation_experiments(
     model: torch.nn.Module,
     processor: Any,
     image_source: Union[str, Image.Image],
@@ -1435,18 +1435,20 @@ def run_ablation_experiments(
     critical_tokens: Optional[List[Dict[str, Any]]] = None,
     trace_data_path: Optional[str] = None,
     metadata_path: Optional[str] = None,
-    output_dir: str = "token_ablation_results",
-    method: str = "zero_out",
+    output_dir: str = "enhanced_ablation_results",
+    methods: List[str] = ["zero_out"],
+    attention_strategies: List[str] = ["none", "block"],
     include_individual_tests: bool = True,
+    run_layer_impact_analysis: bool = True,
     layer_tests: bool = False,
     num_layer_samples: int = 5,
-    start_block_layer: Optional[int] = None,
-    end_block_layer: Optional[int] = None,
     debug_mode: bool = False
 ) -> Dict[str, Any]:
     """
-    Performs ablation experiments on critical tokens to measure their impact,
-    with enhanced controls for layer-specific blocking.
+    Enhanced ablation experiments with multiple blocking strategies and visualizations.
+    
+    This function coordinates comprehensive token blocking experiments to measure 
+    how different tokens and blocking strategies affect model predictions.
     
     Args:
         model: The loaded VLM model instance
@@ -1454,16 +1456,15 @@ def run_ablation_experiments(
         image_source: PIL image, URL string, or local file path
         prompt_text: The text prompt for the model
         critical_tokens: List of critical tokens to block (if None, they will be automatically identified)
-        trace_data_path: Path to pre-existing trace CSV (if None and critical_tokens is None, 
-                        new trace will be run)
+        trace_data_path: Path to pre-existing trace CSV
         metadata_path: Path to trace metadata JSON
         output_dir: Directory path to save analysis outputs
-        method: Blocking method ("zero_out", "average", "noise", or "interpolate")
+        methods: List of blocking methods to test ("zero_out", "average", "noise", "interpolate", "reduce")
+        attention_strategies: List of attention mask strategies ("none", "block", "reduce")
         include_individual_tests: Whether to test each token individually
+        run_layer_impact_analysis: Whether to run layer-wise impact analysis
         layer_tests: Whether to run layer-specific ablation tests
         num_layer_samples: Number of layer samples to test if layer_tests is True
-        start_block_layer: First layer to apply blocking (None = all layers)
-        end_block_layer: Last layer to apply blocking (None = all layers)
         debug_mode: Whether to print detailed debug information
         
     Returns:
@@ -1474,11 +1475,32 @@ def run_ablation_experiments(
     import torch
     import traceback
     from typing import Dict, List, Any, Optional, Union
+    from PIL import Image
+    import matplotlib.pyplot as plt
+    import numpy as np
     
-    print("\n--- Starting Enhanced Token Ablation Experiments ---")
-    print(f"  Output directory: {output_dir}")
+    print("\n=== Starting Enhanced Token Ablation Experiments ===")
+    print(f"Output directory: {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
-    results = {}
+    
+    # Create directory for visualizations
+    viz_dir = os.path.join(output_dir, "visualizations")
+    os.makedirs(viz_dir, exist_ok=True)
+    
+    overall_results = {
+        "experiment_config": {
+            "methods": methods,
+            "attention_strategies": attention_strategies,
+            "include_individual_tests": include_individual_tests,
+            "run_layer_impact_analysis": run_layer_impact_analysis,
+            "layer_tests": layer_tests,
+            "prompt_text": prompt_text
+        },
+        "token_analysis": {},
+        "ablation_results": {},
+        "layer_impact_analysis": {},
+        "visualizations": {}
+    }
 
     try:
         # If no critical tokens provided, we need to identify them first
@@ -1486,6 +1508,8 @@ def run_ablation_experiments(
             print("No critical tokens provided. Running token analysis first...")
             
             # Run token analysis to identify critical tokens
+            from analyzer.semantic_tracing import run_token_analysis
+            
             analysis_results = run_token_analysis(
                 model=model,
                 processor=processor,
@@ -1503,18 +1527,7 @@ def run_ablation_experiments(
                 return {"error": "Failed to identify critical tokens"}
             
             critical_tokens = analysis_results["critical_tokens"]
-            results["token_analysis"] = analysis_results
-        
-        # Print layer blocking configuration
-        layer_info = "all layers"
-        if start_block_layer is not None or end_block_layer is not None:
-            if start_block_layer is not None and end_block_layer is not None:
-                layer_info = f"layers {start_block_layer} to {end_block_layer}"
-            elif start_block_layer is not None:
-                layer_info = f"layers {start_block_layer} and above"
-            else:
-                layer_info = f"layers up to {end_block_layer}"
-        print(f"  Blocking tokens in {layer_info}")
+            overall_results["token_analysis"] = analysis_results
         
         # Prepare input data
         from analyzer.semantic_tracing import EnhancedSemanticTracer
@@ -1536,145 +1549,239 @@ def run_ablation_experiments(
             debug_mode=debug_mode
         )
         
-        # Run ablation tests with enhanced parameters
-        if layer_tests:
-            # Run comprehensive layer-specific tests
-            ablation_results = analyzer.run_ablation_tests(
-                model=model,
-                processor=processor,
-                input_data=input_data,
-                critical_tokens=critical_tokens,
-                method=method,
-                include_individual_tests=include_individual_tests,
-                layer_tests=True,
-                num_layer_samples=num_layer_samples
-            )
-        elif start_block_layer is not None or end_block_layer is not None:
-            # Run tests with specified layer range
-            # First run reference inference
-            with torch.no_grad():
-                reference_outputs = model(**{k: v for k, v in input_data["inputs"].items() if k != "token_type_ids"})
-                
-                # Get reference output token
-                reference_logits = reference_outputs.logits
-                
-                # Handle different logits shapes
-                if reference_logits.dim() == 2:  # [batch, vocab]
-                    pred_logits = reference_logits
-                else:  # [batch, seq, vocab]
-                    pred_logits = reference_logits[:, -1, :]
-                    
-                reference_ids = torch.argmax(pred_logits, dim=-1).unsqueeze(0)
-                reference_text = processor.tokenizer.decode(reference_ids[0].tolist())
-                
-                reference_result = {
-                    "output_ids": reference_ids,
-                    "output_text": reference_text,
-                    "logits": pred_logits
-                }
+        # Run reference inference to get baseline
+        print("Running reference inference...")
+        with torch.no_grad():
+            reference_outputs = model(**{k: v for k, v in input_data["inputs"].items() if k != "token_type_ids"})
             
-            # Run ablation with specific layer range
-            token_indices = [token["token_index"] for token in critical_tokens]
+            # Get reference output token
+            reference_logits = reference_outputs.logits
             
-            ablation_results = {
-                "reference_output": reference_text,
-                "individual_ablations": {},
-                "all_critical_tokens_ablation": {}
+            # Handle different logits shapes
+            if reference_logits.dim() == 2:  # [batch, vocab]
+                pred_logits = reference_logits
+            else:  # [batch, seq, vocab]
+                pred_logits = reference_logits[:, -1, :]
+                
+            reference_ids = torch.argmax(pred_logits, dim=-1).unsqueeze(0)
+            reference_text = processor.tokenizer.decode(reference_ids[0].tolist())
+            
+            # Get reference probabilities
+            reference_probs = torch.softmax(pred_logits, dim=-1)
+            
+            reference_result = {
+                "output_ids": reference_ids,
+                "output_text": reference_text,
+                "logits": pred_logits,
+                "probabilities": reference_probs
             }
+        
+        overall_results["reference_output"] = {
+            "text": reference_text,
+            "token_id": reference_ids[0].item(),
+            "probability": reference_probs[0, reference_ids[0]].item()
+        }
+        
+        print(f"Reference output: '{reference_text}'")
+        
+        # Extract token indices
+        token_indices = [token["token_index"] for token in critical_tokens]
+        
+        # Run ablation tests with all combinations of methods and attention strategies
+        all_ablation_results = {}
+        
+        for method in methods:
+            all_ablation_results[method] = {}
             
-            # Individual token tests
-            if include_individual_tests:
-                for token in critical_tokens:
-                    token_idx = token["token_index"]
-                    token_text = token["token_text"]
-                    print(f"Testing ablation of token {token_idx} ('{token_text}') in {layer_info}...")
+            for attention_strategy in attention_strategies:
+                print(f"\nTesting method: {method}, attention strategy: {attention_strategy}")
+                
+                strategy_key = f"{method}_{attention_strategy}"
+                all_ablation_results[method][attention_strategy] = {}
+                
+                # Individual token tests if requested
+                individual_results = {}
+                if include_individual_tests:
+                    for token in critical_tokens:
+                        token_idx = token["token_index"]
+                        token_text = token["token_text"]
+                        print(f"  Testing ablation of token {token_idx} ('{token_text}')...")
+                        
+                        sim_result = analyzer.simulate_token_blocking(
+                            model=model,
+                            processor=processor,
+                            input_data=input_data,
+                            tokens_to_block=[token_idx],
+                            method=method,
+                            reference_output=reference_result,
+                            attention_mask_strategy=attention_strategy
+                        )
+                        
+                        individual_results[f"token_{token_idx}"] = sim_result
+                
+                # All tokens test
+                print(f"  Testing ablation of all {len(token_indices)} critical tokens together...")
+                
+                all_tokens_result = analyzer.simulate_token_blocking(
+                    model=model,
+                    processor=processor,
+                    input_data=input_data,
+                    tokens_to_block=token_indices,
+                    method=method,
+                    reference_output=reference_result,
+                    attention_mask_strategy=attention_strategy
+                )
+                
+                # Store results
+                all_ablation_results[method][attention_strategy] = {
+                    "individual_ablations": individual_results,
+                    "all_critical_tokens_ablation": all_tokens_result
+                }
+        
+        overall_results["ablation_results"] = all_ablation_results
+        
+        # Run layer impact analysis if requested
+        if run_layer_impact_analysis:
+            layer_impact_results = {}
+            for method in methods:
+                layer_impact_results[method] = {}
+                
+                for attention_strategy in attention_strategies:
+                    print(f"\nRunning layer impact analysis for method: {method}, attention strategy: {attention_strategy}")
                     
-                    sim_result = analyzer.simulate_token_blocking(
+                    layer_result = TokenAnalyzer.analyze_layer_impact(
                         model=model,
                         processor=processor,
                         input_data=input_data,
-                        tokens_to_block=[token_idx],
+                        critical_tokens=critical_tokens,
+                        output_dir=output_dir,
                         method=method,
-                        reference_output=reference_result,
-                        start_block_layer=start_block_layer,
-                        end_block_layer=end_block_layer
+                        attention_mask_strategy=attention_strategy,
+                        debug_mode=debug_mode
                     )
                     
-                    ablation_results["individual_ablations"][f"token_{token_idx}"] = sim_result
+                    layer_impact_results[method][attention_strategy] = layer_result
             
-            # All tokens test
-            print(f"Testing ablation of all {len(token_indices)} critical tokens in {layer_info}...")
+            overall_results["layer_impact_analysis"] = layer_impact_results
+        
+        # Layer-specific tests if requested
+        if layer_tests:
+            layer_specific_results = {}
             
-            all_tokens_result = analyzer.simulate_token_blocking(
-                model=model,
-                processor=processor,
-                input_data=input_data,
-                tokens_to_block=token_indices,
-                method=method,
-                reference_output=reference_result,
-                start_block_layer=start_block_layer,
-                end_block_layer=end_block_layer
-            )
+            # Only test one combination for layer tests to save time
+            method = methods[0]
+            attention_strategy = attention_strategies[0]
             
-            ablation_results["all_critical_tokens_ablation"] = all_tokens_result
-        else:
-            # Run standard ablation tests
+            print(f"\nRunning layer-specific tests with method: {method}, attention strategy: {attention_strategy}")
+            
             ablation_results = analyzer.run_ablation_tests(
                 model=model,
                 processor=processor,
                 input_data=input_data,
                 critical_tokens=critical_tokens,
                 method=method,
-                include_individual_tests=include_individual_tests
+                include_individual_tests=False,  # Skip individual tests to save time
+                layer_tests=True,
+                num_layer_samples=num_layer_samples
             )
-        
-        # Store ablation results
-        results["ablation_results"] = ablation_results
-        
-        # Save results to file
-        ablation_path = os.path.join(output_dir, "ablation_results.json")
-        try:
-            with open(ablation_path, 'w') as f:
-                # Convert to serializable format
-                serializable_results = analyzer._make_serializable(ablation_results)
-                json.dump(serializable_results, f, indent=2)
-            print(f"Saved ablation results to: {ablation_path}")
-        except Exception as e:
-            print(f"Error saving ablation results: {e}")
-        
-        # Print summary information
-        if "reference_output" in ablation_results:
-            print(f"\nAblation Test Results Summary:")
-            print(f"Reference output: '{ablation_results['reference_output']}'")
             
-            # Individual token results
-            if include_individual_tests and "individual_ablations" in ablation_results:
-                print("\nIndividual Token Impact:")
-                for token in critical_tokens:
-                    token_idx = token["token_index"]
-                    result_key = f"token_{token_idx}"
-                    if result_key in ablation_results["individual_ablations"]:
-                        result = ablation_results["individual_ablations"][result_key]
-                        impact = result.get("comparison", {}).get("impact_score", 0)
-                        match = result.get("comparison", {}).get("token_match", False)
-                        output = result.get("generated_text", "")
-                        
-                        print(f"  Token {token_idx} ('{token['token_text']}'): Impact={impact:.3f}, "
-                              f"Match={match}, Output='{output}'")
+            layer_specific_results[f"{method}_{attention_strategy}"] = ablation_results
+            overall_results["layer_specific_results"] = layer_specific_results
+        
+        # Create comparative visualizations of different strategies
+        print("\nCreating comparative visualizations...")
+        
+        # 1. Compare impact scores across methods and attention strategies
+        method_impacts = {}
+        for method in methods:
+            strategy_impacts = {}
+            for attention_strategy in attention_strategies:
+                result = all_ablation_results[method][attention_strategy]["all_critical_tokens_ablation"]
+                impact = result.get("comparison", {}).get("impact_score", 0)
+                strategy_impacts[attention_strategy] = impact
+            method_impacts[method] = strategy_impacts
+        
+        # Plot comparison bar chart
+        plt.figure(figsize=(12, 6))
+        bar_width = 0.8 / len(attention_strategies)
+        
+        for i, method in enumerate(methods):
+            x = np.arange(len(attention_strategies))
+            impacts = [method_impacts[method][strategy] for strategy in attention_strategies]
+            plt.bar(x + i*bar_width, impacts, width=bar_width, 
+                    label=f"{method}", alpha=0.7)
+        
+        plt.xlabel('Attention Mask Strategy')
+        plt.ylabel('Impact Score')
+        plt.title('Comparison of Blocking Methods and Attention Strategies')
+        plt.xticks(np.arange(len(attention_strategies)) + bar_width*(len(methods)-1)/2, attention_strategies)
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.3)
+        
+        strategies_plot_path = os.path.join(viz_dir, 'strategy_comparison.png')
+        plt.savefig(strategies_plot_path)
+        
+        overall_results["visualizations"]["strategy_comparison"] = strategies_plot_path
+        
+        # 2. If we have individual token results, compare their impacts
+        if include_individual_tests and critical_tokens:
+            # Use the first method and strategy
+            method = methods[0]
+            attention_strategy = attention_strategies[0]
             
-            # All tokens result
-            if "all_critical_tokens_ablation" in ablation_results:
-                all_result = ablation_results["all_critical_tokens_ablation"]
-                all_impact = all_result.get("comparison", {}).get("impact_score", 0)
-                all_match = all_result.get("comparison", {}).get("token_match", False)
-                all_output = all_result.get("generated_text", "")
+            token_impacts = {}
+            for token in critical_tokens:
+                token_idx = token["token_index"]
+                result_key = f"token_{token_idx}"
                 
-                print(f"\nAll tokens ablation: Impact={all_impact:.3f}, Match={all_match}, Output='{all_output}'")
+                if result_key in all_ablation_results[method][attention_strategy]["individual_ablations"]:
+                    result = all_ablation_results[method][attention_strategy]["individual_ablations"][result_key]
+                    impact = result.get("comparison", {}).get("impact_score", 0)
+                    token_impacts[token_idx] = {
+                        "impact": impact,
+                        "text": token["token_text"]
+                    }
+            
+            # Sort tokens by impact
+            sorted_tokens = sorted(token_impacts.items(), key=lambda x: x[1]["impact"], reverse=True)
+            
+            # Plot token impacts
+            plt.figure(figsize=(12, 6))
+            token_indices = [t[0] for t in sorted_tokens]
+            token_impact_values = [t[1]["impact"] for t in sorted_tokens]
+            token_texts = [t[1]["text"] for t in sorted_tokens]
+            
+            plt.bar(range(len(token_indices)), token_impact_values, alpha=0.7)
+            plt.xlabel('Token')
+            plt.ylabel('Impact Score')
+            plt.title(f'Impact of Individual Token Blocking\nMethod: {method}, Strategy: {attention_strategy}')
+            plt.xticks(range(len(token_indices)), [f"{idx}\n'{text}'" for idx, text in zip(token_indices, token_texts)], 
+                       rotation=45, ha='right')
+            plt.grid(True, linestyle='--', alpha=0.3)
+            plt.tight_layout()
+            
+            tokens_plot_path = os.path.join(viz_dir, 'token_impacts.png')
+            plt.savefig(tokens_plot_path)
+            
+            overall_results["visualizations"]["token_impacts"] = tokens_plot_path
         
-        print(f"\n--- Token Ablation Experiments Complete ---")
-        return results
+        # Save overall results
+        results_path = os.path.join(output_dir, "enhanced_ablation_results.json")
+        try:
+            with open(results_path, 'w') as f:
+                # Convert to serializable format
+                serializable_results = analyzer._make_serializable(overall_results)
+                json.dump(serializable_results, f, indent=2)
+            print(f"\nSaved comprehensive results to: {results_path}")
+        except Exception as e:
+            print(f"Error saving results: {e}")
+        
+        print(f"\n=== Enhanced Token Ablation Experiments Complete ===")
+        print(f"Visualizations saved to: {viz_dir}")
+        
+        return overall_results
 
     except Exception as e:
-        print(f"Error during ablation experiments: {e}")
+        print(f"Error during enhanced ablation experiments: {e}")
         traceback.print_exc()
         return {"error": str(e), "traceback": traceback.format_exc()}
